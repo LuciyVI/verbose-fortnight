@@ -1,240 +1,368 @@
-// bybit_balance_ws_demo.go
+// bollinger_strategy_bybit.go
 //
-// Пример получения баланса через REST‑V5 и дальнейших обновлений по WebSocket‑V5
-// (demo‑сервер Bybit).  Полностью рабочий код с корректной подписью REST‑V5.
+// Реализация стратегии пробоя полос Боллинджера (лонг‑только) для демо‑сервера
+// Bybit. Добавлена поддержка опции командной строки --debug, которая включает
+// подробный вывод всех полученных/отправленных данных и промежуточных расчётов.
 //
-// go run bybit_balance_ws_demo.go
+// Запуск:
+//   go run bollinger_strategy_bybit.go           # обычный режим
+//   go run bollinger_strategy_bybit.go --debug   # подробные логи
 //
 package main
 
 import (
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
-	"fmt"
-	"io"
-	"log"
-	"net/http"
-	"net/url"
-	"strconv"
-	"time"
+    "bytes"
+    "crypto/hmac"
+    "crypto/sha256"
+    "encoding/hex"
+    "encoding/json"
+    "flag"
+    "fmt"
+    "io"
+    "log"
+    "math"
+    "net/http"
+    "net/url"
+    "strconv"
+    "time"
 
-	"github.com/gorilla/websocket"
-)
-
-const (
-	APIKey    = "iAk6FbPXdSri6jFU1J"
-	APISecret = "svqVf30XLzbaxmByb3qcMBBBUGN0NwXc2lSL"
-
-	// demo host / ws‑endpoint (используйте testnet или prod при необходимости)
-	demoRESTHost = "https://api-demo.bybit.com"
-	demoWSUrl    = "wss://stream-demo.bybit.com/v5/private"
-
-	// WebSocket ping/pong timing
-	pongWait   = 70 * time.Second
-	pingPeriod = 30 * time.Second
-	writeWait  = 10 * time.Second
-
-	// для REST‑V5
-	recvWindow  = "5000"   // мс
-	accountType = "UNIFIED" // или CONTRACT, SPOT …
+    "github.com/gorilla/websocket"
 )
 
 ////////////////////////////////////////////////////////////////////////////////
-// REST‑V5 подпись  —  HMAC_SHA256(timestamp + api_key + recvWindow + payload)
+// === Глобальные переменные ===
+////////////////////////////////////////////////////////////////////////////////
+var debug bool // устанавливается флагом --debug
+
+func dbg(format string, v ...interface{}) {
+    if debug {
+        log.Printf(format, v...)
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// === Конфигурация ===
+////////////////////////////////////////////////////////////////////////////////
+const (
+    APIKey    = "iAk6FbPXdSri6jFU1J"
+    APISecret = "svqVf30XLzbaxmByb3qcMBBBUGN0NwXc2lSL"
+
+    demoRESTHost       = "https://api-demo.bybit.com"
+    demoWSPrivateURL   = "wss://stream-demo.bybit.com/v5/private"
+    demoWSPublicURL    = "wss://stream.bybit.com/v5/public/linear" // публичный поток kline
+
+    pongWait   = 70 * time.Second
+    pingPeriod = 30 * time.Second
+    writeWait  = 10 * time.Second
+
+    recvWindow  = "5000"
+    accountType = "UNIFIED"
+
+    symbol     = "BTCUSDT"
+    interval   = "1"   // 1‑минутные свечи
+    windowSize = 20     // период SMA
+    bbMult     = 2.0    // множитель σ
+    orderQty   = 1.0    // количество контрактов
+)
+
+var (
+    closes []float64
+    inLong bool
+)
+
+////////////////////////////////////////////////////////////////////////////////
+// === Индикаторы ===
+////////////////////////////////////////////////////////////////////////////////
+func sma(data []float64) float64 {
+    sum := 0.0
+    for _, v := range data {
+        sum += v
+    }
+    return sum / float64(len(data))
+}
+
+func stddev(data []float64) float64 {
+    m := sma(data)
+    var sum float64
+    for _, v := range data {
+        diff := v - m
+        sum += diff * diff
+    }
+    return math.Sqrt(sum / float64(len(data)))
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// === REST подпись (v5) ===
 ////////////////////////////////////////////////////////////////////////////////
 func signV5(secret, timestamp, apiKey, recvWindow, payload string) string {
-	s := timestamp + apiKey + recvWindow + payload
-	mac := hmac.New(sha256.New, []byte(secret))
-	mac.Write([]byte(s))
-	return hex.EncodeToString(mac.Sum(nil))
+    s := timestamp + apiKey + recvWindow + payload
+    mac := hmac.New(sha256.New, []byte(secret))
+    mac.Write([]byte(s))
+    return hex.EncodeToString(mac.Sum(nil))
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// Получить баланс через REST‑V5
+// === REST: баланс ===
 ////////////////////////////////////////////////////////////////////////////////
 func getBalanceREST(coin string) (float64, error) {
-	ts := fmt.Sprintf("%d", time.Now().UnixMilli())
-	path := "/v5/account/wallet-balance"
+    ts := fmt.Sprintf("%d", time.Now().UnixMilli())
+    path := "/v5/account/wallet-balance"
+    q := url.Values{}
+    q.Set("accountType", accountType)
+    q.Set("coin", coin)
+    queryString := q.Encode()
 
-	// query‑string: ОБЯЗАТЕЛЬНО accountType
-	q := url.Values{}
-	q.Set("accountType", accountType)
-	q.Set("coin", coin)
-	queryString := q.Encode()
+    sig := signV5(APISecret, ts, APIKey, recvWindow, queryString)
 
-	// подпись
-	sig := signV5(APISecret, ts, APIKey, recvWindow, queryString)
+    req, err := http.NewRequest("GET", demoRESTHost+path+"?"+queryString, nil)
+    if err != nil {
+        return 0, err
+    }
+    req.Header.Set("X-BAPI-API-KEY", APIKey)
+    req.Header.Set("X-BAPI-TIMESTAMP", ts)
+    req.Header.Set("X-BAPI-RECV-WINDOW", recvWindow)
+    req.Header.Set("X-BAPI-SIGN-TYPE", "2")
+    req.Header.Set("X-BAPI-SIGN", sig)
 
-	req, err := http.NewRequest("GET", demoRESTHost+path+"?"+queryString, nil)
-	if err != nil {
-		return 0, err
-	}
-	req.Header.Set("X-BAPI-API-KEY", APIKey)
-	req.Header.Set("X-BAPI-TIMESTAMP", ts)
-	req.Header.Set("X-BAPI-RECV-WINDOW", recvWindow)
-	req.Header.Set("X-BAPI-SIGN-TYPE", "2") // HMAC_SHA256
-	req.Header.Set("X-BAPI-SIGN", sig)
+    resp, err := http.DefaultClient.Do(req)
+    if err != nil {
+        return 0, err
+    }
+    defer resp.Body.Close()
+    body, _ := io.ReadAll(resp.Body)
+    dbg("REST wallet-balance raw: %s", string(body))
 
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return 0, err
-	}
-
-	// разбор JSON‑ответа
-	var r struct {
-		RetCode int    `json:"retCode"`
-		RetMsg  string `json:"retMsg"`
-		Result  struct {
-			List []struct {
-				TotalAvailableBalance string `json:"totalAvailableBalance"`
-			} `json:"list"`
-		} `json:"result"`
-	}
-	if err := json.Unmarshal(body, &r); err != nil {
-		return 0, err
-	}
-	if r.RetCode != 0 {
-		return 0, fmt.Errorf("REST error %d: %s", r.RetCode, r.RetMsg)
-	}
-	if len(r.Result.List) == 0 {
-		return 0, fmt.Errorf("no balance data for %s", coin)
-	}
-
-	return strconv.ParseFloat(r.Result.List[0].TotalAvailableBalance, 64)
+    var r struct {
+        RetCode int    `json:"retCode"`
+        RetMsg  string `json:"retMsg"`
+        Result  struct {
+            List []struct {
+                TotalAvailableBalance string `json:"totalAvailableBalance"`
+            } `json:"list"`
+        } `json:"result"`
+    }
+    if err := json.Unmarshal(body, &r); err != nil {
+        return 0, err
+    }
+    if r.RetCode != 0 {
+        return 0, fmt.Errorf("REST error %d: %s", r.RetCode, r.RetMsg)
+    }
+    if len(r.Result.List) == 0 {
+        return 0, fmt.Errorf("no balance data for %s", coin)
+    }
+    return strconv.ParseFloat(r.Result.List[0].TotalAvailableBalance, 64)
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// Подпись для приватного WebSocket‑V5  —  HMAC_SHA256("GET/realtime" + expires)
+// === REST: рыночный ордер ===
 ////////////////////////////////////////////////////////////////////////////////
-func signWS(secret string, expires int64) string {
-	payload := fmt.Sprintf("GET/realtime%d", expires)
-	mac := hmac.New(sha256.New, []byte(secret))
-	mac.Write([]byte(payload))
-	return hex.EncodeToString(mac.Sum(nil))
+func placeOrderMarket(side string, qty float64, reduceOnly bool) error {
+    path := "/v5/order/create"
+    bodyMap := map[string]interface{}{
+        "category":    "linear",
+        "symbol":      symbol,
+        "side":        side,
+        "orderType":   "Market",
+        "qty":         fmt.Sprintf("%.0f", qty),
+        "reduceOnly":  reduceOnly,
+        "timeInForce": "GTC",
+    }
+    bodyBytes, _ := json.Marshal(bodyMap)
+    dbg("REST order body: %s", string(bodyBytes))
+
+    ts := fmt.Sprintf("%d", time.Now().UnixMilli())
+    sig := signV5(APISecret, ts, APIKey, recvWindow, string(bodyBytes))
+
+    req, err := http.NewRequest("POST", demoRESTHost+path, bytes.NewReader(bodyBytes))
+    if err != nil {
+        return err
+    }
+    req.Header.Set("Content-Type", "application/json")
+    req.Header.Set("X-BAPI-API-KEY", APIKey)
+    req.Header.Set("X-BAPI-TIMESTAMP", ts)
+    req.Header.Set("X-BAPI-RECV-WINDOW", recvWindow)
+    req.Header.Set("X-BAPI-SIGN-TYPE", "2")
+    req.Header.Set("X-BAPI-SIGN", sig)
+
+    resp, err := http.DefaultClient.Do(req)
+    if err != nil {
+        return err
+    }
+    defer resp.Body.Close()
+    body, _ := io.ReadAll(resp.Body)
+    dbg("REST order response: %s", string(body))
+
+    var r struct {
+        RetCode int    `json:"retCode"`
+        RetMsg  string `json:"retMsg"`
+    }
+    if err := json.Unmarshal(body, &r); err != nil {
+        return err
+    }
+    if r.RetCode != 0 {
+        return fmt.Errorf("order error %d: %s", r.RetCode, r.RetMsg)
+    }
+    log.Printf("Market order %s %.0f OK", side, qty)
+    return nil
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// MAIN
+// === Обработка закрытых свечей ===
+////////////////////////////////////////////////////////////////////////////////
+func onClosedCandle(closePrice float64) {
+    closes = append(closes, closePrice)
+    if len(closes) < windowSize {
+        dbg("Buffering close %.2f (%d/%d)", closePrice, len(closes), windowSize)
+        return
+    }
+    if len(closes) > windowSize {
+        closes = closes[1:]
+    }
+
+    smaVal := sma(closes)
+    stdVal := stddev(closes)
+    upper := smaVal + bbMult*stdVal
+    lower := smaVal - bbMult*stdVal
+
+    dbg("Candle close %.2f | SMA %.2f Upper %.2f Lower %.2f inLong=%v", closePrice, smaVal, upper, lower, inLong)
+
+    if !inLong && closePrice > upper {
+        log.Printf("BUY signal @%.2f (upper %.2f)", closePrice, upper)
+        if err := placeOrderMarket("Buy", orderQty, false); err == nil {
+            inLong = true
+        } else {
+            log.Printf("Buy error: %v", err)
+        }
+    }
+
+    if inLong && closePrice < lower {
+        log.Printf("SELL signal @%.2f (lower %.2f)", closePrice, lower)
+        if err := placeOrderMarket("Sell", orderQty, true); err == nil {
+            inLong = false
+        } else {
+            log.Printf("Sell error: %v", err)
+        }
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// === Структуры для kline ===
+////////////////////////////////////////////////////////////////////////////////
+
+type KlineMsg struct {
+    Topic string      `json:"topic"`
+    Data  []KlineData `json:"data"`
+}
+
+type KlineData struct {
+    Start   int64  `json:"start"`
+    End     int64  `json:"end"`
+    Open    string `json:"open"`
+    Close   string `json:"close"`
+    Confirm bool   `json:"confirm"`
+}
+
+func (k KlineData) CloseFloat() float64 {
+    f, _ := strconv.ParseFloat(k.Close, 64)
+    return f
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// === MAIN ===
 ////////////////////////////////////////////////////////////////////////////////
 func main() {
-	//-----------------------------------------------------------------------
-	// 0) REST‑запрос баланса при старте
-	//-----------------------------------------------------------------------
-	bal, err := getBalanceREST("USDT")
-	if err != nil {
-		log.Fatalf("Failed to get REST balance: %v", err)
-	}
-	log.Printf("Current totalAvailableBalance (REST): %.8f", bal)
+    flag.BoolVar(&debug, "debug", false, "enable debug logging")
+    flag.Parse()
 
-	//-----------------------------------------------------------------------
-	// 1) Подключаемся к WebSocket
-	//-----------------------------------------------------------------------
-	conn, _, err := websocket.DefaultDialer.Dial(demoWSUrl, nil)
-	if err != nil {
-		log.Fatalf("WebSocket dial error: %v", err)
-	}
-	defer conn.Close()
+    if debug {
+        log.Printf("Debug mode ON")
+    }
 
-	//-----------------------------------------------------------------------
-	// 2) Pong‑handler
-	//-----------------------------------------------------------------------
-	conn.SetReadDeadline(time.Now().Add(pongWait))
-	conn.SetPongHandler(func(string) error {
-		conn.SetReadDeadline(time.Now().Add(pongWait))
-		return nil
-	})
+    bal, err := getBalanceREST("USDT")
+    if err != nil {
+        log.Fatalf("Failed REST balance: %v", err)
+    }
+    log.Printf("Init balance (USDT): %.2f", bal)
 
-	//-----------------------------------------------------------------------
-	// 3) Аутентификация
-	//-----------------------------------------------------------------------
-	expires := time.Now().Add(5 * time.Second).UnixMilli()
-	auth := map[string]interface{}{
-		"op":   "auth",
-		"args": []interface{}{APIKey, expires, signWS(APISecret, expires)},
-	}
-	conn.SetWriteDeadline(time.Now().Add(writeWait))
-	if err := conn.WriteJSON(auth); err != nil {
-		log.Fatalf("Auth send error: %v", err)
-	}
-	// consume auth response
-	if _, _, err := conn.ReadMessage(); err != nil {
-		log.Fatalf("Auth response error: %v", err)
-	}
+    //------------------------ Приватный WS (баланс) ------------------------
+    privConn, _, err := websocket.DefaultDialer.Dial(demoWSPrivateURL, nil)
+    if err != nil {
+        log.Fatalf("Private WS dial error: %v", err)
+    }
+    defer privConn.Close()
+    privConn.SetReadDeadline(time.Now().Add(pongWait))
+    privConn.SetPongHandler(func(string) error {
+        privConn.SetReadDeadline(time.Now().Add(pongWait))
+        return nil
+    })
 
-	//-----------------------------------------------------------------------
-	// 4) Подписываемся на кошелёк
-	//-----------------------------------------------------------------------
-	sub := map[string]interface{}{"op": "subscribe", "args": []string{"wallet"}}
-	conn.SetWriteDeadline(time.Now().Add(writeWait))
-	if err := conn.WriteJSON(sub); err != nil {
-		log.Fatalf("Subscribe error: %v", err)
-	}
-	// consume subscribe response
-	if _, _, err := conn.ReadMessage(); err != nil {
-		log.Fatalf("Subscribe response error: %v", err)
-	}
+    expires := time.Now().Add(5 * time.Second).UnixMilli()
+    auth := map[string]interface{}{"op": "auth", "args": []interface{}{APIKey, expires, signV5(APISecret, fmt.Sprintf("%d", expires), APIKey, "", "")}}
+    privConn.WriteJSON(auth)
+    _, msg, _ := privConn.ReadMessage()
+    dbg("Private auth resp: %s", string(msg))
 
-	//-----------------------------------------------------------------------
-	// 5) Первое сообщение «snapshot» кошелька
-	//-----------------------------------------------------------------------
-	_, msg, err := conn.ReadMessage()
-	if err != nil {
-		log.Fatalf("Read initial wallet update error: %v", err)
-	}
-	var initial struct {
-		Data []struct {
-			TotalAvailableBalance string `json:"totalAvailableBalance"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(msg, &initial); err != nil {
-		log.Fatalf("Parse initial wallet JSON: %v", err)
-	}
-	if len(initial.Data) > 0 {
-		bal2, _ := strconv.ParseFloat(initial.Data[0].TotalAvailableBalance, 64)
-		log.Printf("Initial totalAvailableBalance (WS): %.8f", bal2)
-	}
+    privConn.WriteJSON(map[string]interface{}{"op": "subscribe", "args": []string{"wallet"}})
+    _, msg, _ = privConn.ReadMessage()
+    dbg("Private sub resp: %s", string(msg))
 
-	//-----------------------------------------------------------------------
-	// 6) Пинг‑гороутина для поддержания соединения
-	//-----------------------------------------------------------------------
-	ticker := time.NewTicker(pingPeriod)
-	defer ticker.Stop()
-	go func() {
-		for range ticker.C {
-			conn.SetWriteDeadline(time.Now().Add(writeWait))
-			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-				log.Printf("Ping error: %v", err)
-				return
-			}
-		}
-	}()
+    //------------------------ Публичный WS (kline) -------------------------
+    pubConn, _, err := websocket.DefaultDialer.Dial(demoWSPublicURL, nil)
+    if err != nil {
+        log.Fatalf("Public WS dial error: %v", err)
+    }
+    defer pubConn.Close()
+    pubConn.SetReadDeadline(time.Now().Add(pongWait))
+    pubConn.SetPongHandler(func(string) error {
+        pubConn.SetReadDeadline(time.Now().Add(pongWait))
+        return nil
+    })
 
-	//-----------------------------------------------------------------------
-	// 7) Основной цикл чтения обновлений
-	//-----------------------------------------------------------------------
-	for {
-		_, msg, err := conn.ReadMessage()
-		if err != nil {
-			log.Printf("Read error: %v", err)
-			break
-		}
-		var update struct {
-			Data []struct {
-				TotalAvailableBalance string `json:"totalAvailableBalance"`
-			} `json:"data"`
-		}
-		if err := json.Unmarshal(msg, &update); err == nil && len(update.Data) > 0 {
-			bal3, _ := strconv.ParseFloat(update.Data[0].TotalAvailableBalance, 64)
-			log.Printf("Wallet update — totalAvailableBalance: %.8f", bal3)
-		}
-	}
+    topic := fmt.Sprintf("kline.%s.%s", interval, symbol)
+    pubConn.WriteJSON(map[string]interface{}{"op": "subscribe", "args": []string{topic}})
+    _, msg, _ = pubConn.ReadMessage()
+    dbg("Public sub resp: %s", string(msg))
+
+    //------------------------ Пинг‑гороутины -------------------------------
+    ticker := time.NewTicker(pingPeriod)
+    defer ticker.Stop()
+    go func() {
+        for range ticker.C {
+            privConn.WriteMessage(websocket.PingMessage, nil)
+            pubConn.WriteMessage(websocket.PingMessage, nil)
+        }
+    }()
+
+    //------------------------ Основной цикл --------------------------------
+    for {
+        _, raw, err := pubConn.ReadMessage()
+        if err != nil {
+            log.Printf("Public read error: %v", err)
+            break
+        }
+        dbg("Public raw: %s", string(raw))
+        var km KlineMsg
+        if err := json.Unmarshal(raw, &km); err == nil && len(km.Data) > 0 {
+            k := km.Data[0]
+            if k.Confirm {
+                onClosedCandle(k.CloseFloat())
+            }
+        }
+
+        // читаем приватное WS non-blocking (только для debug/баланса)
+        privConn.SetReadDeadline(time.Now().Add(5 * time.Millisecond))
+        if _, pRaw, err := privConn.ReadMessage(); err == nil {
+            dbg("Private raw: %s", string(pRaw))
+            var up struct {
+                Topic string `json:"topic"`
+                Data  []struct {
+                    TotalAvailableBalance string `json:"totalAvailableBalance"`
+                } `json:"data"`
+            }
+            if json.Unmarshal(pRaw, &up) == nil && up.Topic == "wallet" && len(up.Data) > 0 {
+                bal, _ := strconv.ParseFloat(up.Data[0].TotalAvailableBalance, 64)
+                log.Printf("Balance update: %.2f", bal)
+            }
+        }
+    }
 }
