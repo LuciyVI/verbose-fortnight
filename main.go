@@ -1,17 +1,15 @@
 // bollinger_strategy_bybit.go
 //
 // Демо-стратегия «лонг-только по пробою верхней полосы Боллинджера»
-// для Bybit v5.  Реализовано «правильное» чтение WebSocket-ов и расчёт
-// объёма позиции по доступному балансу с учётом плеча ×5.
+// для Bybit v5.  Добавлена динамическая расчётка объёма позиции по
+// доступному балансу с учётом плеча ×5, минимального нотионала 100 USDT
+// и минимального размера контракта 0.001 BTC.  Благодаря этому
+// устраняется ошибка 110007 «ab not enough for new order».
 //
-//   - приватный поток wallet читается в отдельной горутине;
-//   - при любой ошибке соединение закрывается и пересоздаётся;
-//   - никаких повторных ReadMessage() после ошибки → паника исчезает.
+// Источники по спецификациям:
 //
-// Запуск:
-//
-//	go run bollinger_strategy_bybit.go            # обычный режим
-//	go run bollinger_strategy_bybit.go --debug    # подробные логи
+//	— минимальный размер ордера 0.001 BTC и минимальный нотионал 100 USDT
+//	  для BTCUSDT Perpetual :contentReference[oaicite:0]{index=0}
 package main
 
 import (
@@ -73,16 +71,16 @@ const (
 	interval   = "1" // 1-минутные свечи
 	windowSize = 20  // SMA период
 	bbMult     = 2.0 // σ множитель
-	leverage   = 5.0 // кредитное плечо ×5
+
+	leverage     = 5.0   // кредитное плечо
+	contractSize = 0.001 // 1 контракт = 0.001 BTC (USDT-линейный)  :contentReference[oaicite:1]{index=1}
+	minNotional  = 100.0 // минимум 100 USDT на ордер             :contentReference[oaicite:2]{index=2}
 )
 
-// //////////////////////////////////////////////////////////////////////////////
-// === Переменные стратегии ===
-// //////////////////////////////////////////////////////////////////////////////
 var (
 	closes   []float64
 	inLong   bool
-	orderQty float64 // объём открытой позиции (контрактов); 0 = нет позиции
+	orderQty float64 // объём текущей позиции (контракты)
 )
 
 // //////////////////////////////////////////////////////////////////////////////
@@ -188,7 +186,7 @@ func placeOrderMarket(side string, qty float64, reduceOnly bool) error {
 		"symbol":      symbol,
 		"side":        side,
 		"orderType":   "Market",
-		"qty":         fmt.Sprintf("%.0f", qty),
+		"qty":         fmt.Sprintf("%.0f", qty), // Bybit qty – целое число контрактов
 		"reduceOnly":  reduceOnly,
 		"timeInForce": "GTC",
 	}
@@ -324,37 +322,44 @@ func onClosedCandle(closePrice float64) {
 		closePrice, smaVal, upper, lower, inLong)
 
 	//----------------------------------------------------------------------
-	// Сигнал на покупку (пробой верхней полосы)
+	// Сигнал BUY — пробой верхней полосы
 	//----------------------------------------------------------------------
 	if !inLong && closePrice > upper {
 		log.Printf("BUY signal @%.2f (upper %.2f)", closePrice, upper)
 
-		// 1. Получаем доступный баланс USDT
+		// 1. Запрашиваем доступный баланс USDT
 		balUSDT, err := getBalanceREST("USDT")
 		if err != nil {
 			log.Printf("Buy aborted: balance REST error: %v", err)
 			return
 		}
-		// 2. Рассчитываем максимальное число контрактов с учётом плеча ×5
-		maxContracts := math.Floor(balUSDT * leverage / closePrice)
 
-		if maxContracts < 1 {
-			log.Printf("Buy aborted: insufficient balance (%.2f USDT) for even 1 contract", balUSDT)
+		// 2. Максимум контрактов по балансу / плечу
+		//maxQtyBalance := math.Floor(balUSDT * leverage / (closePrice * contractSize))
+		maxQtyBalance := math.Floor(balUSDT / (closePrice * contractSize))
+
+		// 3. Минимум контрактов, чтобы пройти по notional ≥ 100 USDT
+		minQtyNotional := math.Ceil(minNotional / (closePrice * contractSize))
+
+		if maxQtyBalance < minQtyNotional {
+			log.Printf("Buy aborted: balance %.2f USDT недостаточен для минимального нотионала %.2f USDT",
+				balUSDT, minNotional)
 			return
 		}
-		qty := maxContracts
 
-		// 3. Отправляем рыночный ордер
+		qty := maxQtyBalance
+
+		// 4. Размещаем ордер
 		if err := placeOrderMarket("Buy", qty, false); err == nil {
 			inLong = true
-			orderQty = qty // сохраняем объём позиции для последующего закрытия
+			orderQty = qty
 		} else {
 			log.Printf("Buy error: %v", err)
 		}
 	}
 
 	//----------------------------------------------------------------------
-	// Сигнал на продажу (цена ниже нижней полосы)
+	// Сигнал SELL — цена опустилась ниже нижней полосы
 	//----------------------------------------------------------------------
 	if inLong && closePrice < lower {
 		log.Printf("SELL signal @%.2f (lower %.2f)", closePrice, lower)
