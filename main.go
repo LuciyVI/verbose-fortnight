@@ -1,7 +1,8 @@
 // bollinger_strategy_bybit.go
 //
-// Демо‑стратегия «лонг‑только по пробою верхней полосы Боллинджера»
-// для Bybit v5.  Реализовано «правильное» чтение WebSocket‑ов:
+// Демо-стратегия «лонг-только по пробою верхней полосы Боллинджера»
+// для Bybit v5.  Реализовано «правильное» чтение WebSocket-ов и расчёт
+// объёма позиции по доступному балансу с учётом плеча ×5.
 //
 //   - приватный поток wallet читается в отдельной горутине;
 //   - при любой ошибке соединение закрывается и пересоздаётся;
@@ -40,7 +41,7 @@ var (
 	debug bool
 
 	// активные соединения (меняются при реконнектах).  Используем atomic.Pointer,
-	// чтобы ping‑гороутина всегда писала в актуальные сокеты.
+	// чтобы ping-гороутина всегда писала в актуальные сокеты.
 	privPtr atomic.Pointer[websocket.Conn]
 	pubPtr  atomic.Pointer[websocket.Conn]
 )
@@ -55,8 +56,8 @@ func dbg(format string, v ...interface{}) {
 // === Конфигурация ===
 // //////////////////////////////////////////////////////////////////////////////
 const (
-	APIKey    = ""
-	APISecret = ""
+	APIKey    = "iAk6FbPXdSri6jFU1J"
+	APISecret = "svqVf30XLzbaxmByb3qcMBBBUGN0NwXc2lSL"
 
 	demoRESTHost     = "https://api-demo.bybit.com"
 	demoWSPrivateURL = "wss://stream-demo.bybit.com/v5/private"
@@ -69,15 +70,19 @@ const (
 	accountType = "UNIFIED"
 
 	symbol     = "BTCUSDT"
-	interval   = "1" // 1‑минутные свечи
+	interval   = "1" // 1-минутные свечи
 	windowSize = 20  // SMA период
 	bbMult     = 2.0 // σ множитель
-	orderQty   = 1.0 // кол‑во контрактов
+	leverage   = 5.0 // кредитное плечо ×5
 )
 
+// //////////////////////////////////////////////////////////////////////////////
+// === Переменные стратегии ===
+// //////////////////////////////////////////////////////////////////////////////
 var (
-	closes []float64
-	inLong bool
+	closes   []float64
+	inLong   bool
+	orderQty float64 // объём открытой позиции (контрактов); 0 = нет позиции
 )
 
 // //////////////////////////////////////////////////////////////////////////////
@@ -105,7 +110,7 @@ func stddev(data []float64) float64 {
 // === Подписи ===
 ////////////////////////////////////////////////////////////////////////////////
 
-// REST v5
+// REST v5
 func signREST(secret, timestamp, apiKey, recvWindow, payload string) string {
 	s := timestamp + apiKey + recvWindow + payload
 	mac := hmac.New(sha256.New, []byte(secret))
@@ -113,7 +118,7 @@ func signREST(secret, timestamp, apiKey, recvWindow, payload string) string {
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
-// WebSocket v5
+// WebSocket v5
 func signWS(secret string, expires int64) string {
 	base := "GET/realtime" + strconv.FormatInt(expires, 10)
 	mac := hmac.New(sha256.New, []byte(secret))
@@ -318,19 +323,49 @@ func onClosedCandle(closePrice float64) {
 	dbg("Candle close %.2f | SMA %.2f Upper %.2f Lower %.2f inLong=%v",
 		closePrice, smaVal, upper, lower, inLong)
 
+	//----------------------------------------------------------------------
+	// Сигнал на покупку (пробой верхней полосы)
+	//----------------------------------------------------------------------
 	if !inLong && closePrice > upper {
 		log.Printf("BUY signal @%.2f (upper %.2f)", closePrice, upper)
-		if err := placeOrderMarket("Buy", orderQty, false); err == nil {
+
+		// 1. Получаем доступный баланс USDT
+		balUSDT, err := getBalanceREST("USDT")
+		if err != nil {
+			log.Printf("Buy aborted: balance REST error: %v", err)
+			return
+		}
+		// 2. Рассчитываем максимальное число контрактов с учётом плеча ×5
+		maxContracts := math.Floor(balUSDT * leverage / closePrice)
+
+		if maxContracts < 1 {
+			log.Printf("Buy aborted: insufficient balance (%.2f USDT) for even 1 contract", balUSDT)
+			return
+		}
+		qty := maxContracts
+
+		// 3. Отправляем рыночный ордер
+		if err := placeOrderMarket("Buy", qty, false); err == nil {
 			inLong = true
+			orderQty = qty // сохраняем объём позиции для последующего закрытия
 		} else {
 			log.Printf("Buy error: %v", err)
 		}
 	}
 
+	//----------------------------------------------------------------------
+	// Сигнал на продажу (цена ниже нижней полосы)
+	//----------------------------------------------------------------------
 	if inLong && closePrice < lower {
 		log.Printf("SELL signal @%.2f (lower %.2f)", closePrice, lower)
+
+		if orderQty < 1 {
+			log.Printf("Sell aborted: recorded orderQty < 1 (%.0f)", orderQty)
+			return
+		}
 		if err := placeOrderMarket("Sell", orderQty, true); err == nil {
 			inLong = false
+			orderQty = 0
 		} else {
 			log.Printf("Sell error: %v", err)
 		}
@@ -425,7 +460,7 @@ func main() {
 	// Основной цикл
 	//----------------------------------------------------------------------
 	for {
-		// 1‑й приоритет — обработка кошелька (non‑blocking)
+		// 1-й приоритет — обработка кошелька (non-blocking)
 	drainWallet:
 		for {
 			select {
@@ -451,7 +486,7 @@ func main() {
 		if err != nil {
 			log.Printf("Public WS read error: %v – reconnecting", err)
 			pubConn.Close()
-			// попытка реконнекта с back‑off
+			// попытка реконнекта с back-off
 			for i := 1; ; i++ {
 				time.Sleep(time.Duration(i*2) * time.Second)
 				if pubConn, err = newWSConn(demoWSPublicURL); err == nil {
@@ -459,7 +494,7 @@ func main() {
 					topic := fmt.Sprintf("kline.%s.%s", interval, symbol)
 					if err = pubConn.WriteJSON(map[string]interface{}{"op": "subscribe", "args": []string{topic}}); err == nil {
 						if _, msg, err := pubConn.ReadMessage(); err == nil {
-							dbg("Public re‑sub resp: %s", string(msg))
+							dbg("Public re-sub resp: %s", string(msg))
 							break
 						}
 					}
