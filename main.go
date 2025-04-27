@@ -1,15 +1,18 @@
 // bollinger_strategy_bybit.go
 //
 // Демо-стратегия «лонг-только по пробою верхней полосы Боллинджера»
-// для Bybit v5.  Добавлена динамическая расчётка объёма позиции по
-// доступному балансу с учётом плеча ×5, минимального нотионала 100 USDT
-// и минимального размера контракта 0.001 BTC.  Благодаря этому
-// устраняется ошибка 110007 «ab not enough for new order».
+// для Bybit v5 (линейные бессрочные).  Особенности:
 //
-// Источники по спецификациям:
+//   - объём позиции рассчитывается без плеча (1×), строго в пределах
+//     доступного баланса USDT;
+//   - минимальный номинал и шаг количества берутся динамически через
+//     /v5/market/instruments-info, поэтому код работает с любым тикером;
+//   - в debug-режиме цветовая подсветка логов.
 //
-//	— минимальный размер ордера 0.001 BTC и минимальный нотионал 100 USDT
-//	  для BTCUSDT Perpetual :contentReference[oaicite:0]{index=0}
+// Запуск:
+//
+//	go run bollinger_strategy_bybit.go            # обычный режим
+//	go run bollinger_strategy_bybit.go --debug    # подробные логи
 package main
 
 import (
@@ -33,13 +36,12 @@ import (
 )
 
 // //////////////////////////////////////////////////////////////////////////////
-// === Глобальные переменные и util ===
+// === Глобальные переменные и util ============================================
 // //////////////////////////////////////////////////////////////////////////////
 var (
 	debug bool
 
-	// активные соединения (меняются при реконнектах).  Используем atomic.Pointer,
-	// чтобы ping-гороутина всегда писала в актуальные сокеты.
+	// активные WS-соединения (заменяются при реконнектах)
 	privPtr atomic.Pointer[websocket.Conn]
 	pubPtr  atomic.Pointer[websocket.Conn]
 )
@@ -50,13 +52,42 @@ func dbg(format string, v ...interface{}) {
 	}
 }
 
+// === Цветные логи (работают только если debug == true) ======================
+const (
+	clrReset = "\033[0m"
+	clrSig   = "\033[36m" // сигналы  – cyan
+	clrOrd   = "\033[32m" // ордера   – green
+	clrErr   = "\033[31m" // ошибки   – red
+)
+
+func logSignalf(format string, v ...interface{}) {
+	if debug {
+		log.Printf(clrSig+format+clrReset, v...)
+	} else {
+		log.Printf(format, v...)
+	}
+}
+func logOrderf(format string, v ...interface{}) {
+	if debug {
+		log.Printf(clrOrd+format+clrReset, v...)
+	} else {
+		log.Printf(format, v...)
+	}
+}
+func logErrorf(format string, v ...interface{}) {
+	if debug {
+		log.Printf(clrErr+format+clrReset, v...)
+	} else {
+		log.Printf(format, v...)
+	}
+}
+
 // //////////////////////////////////////////////////////////////////////////////
-// === Конфигурация ===
+// === Конфигурация ============================================================
 // //////////////////////////////////////////////////////////////////////////////
 const (
-	APIKey    = "iAk6FbPXdSri6jFU1J"
-	APISecret = "svqVf30XLzbaxmByb3qcMBBBUGN0NwXc2lSL"
-
+	APIKey           = ""
+	APISecret        = ""
 	demoRESTHost     = "https://api-demo.bybit.com"
 	demoWSPrivateURL = "wss://stream-demo.bybit.com/v5/private"
 	demoWSPublicURL  = "wss://stream.bybit.com/v5/public/linear"
@@ -67,24 +98,33 @@ const (
 	recvWindow  = "5000"
 	accountType = "UNIFIED"
 
-	symbol     = "BTCUSDT"
-	interval   = "1" // 1-минутные свечи
-	windowSize = 20  // SMA период
-	bbMult     = 2.0 // σ множитель
+	symbol     = "BTCUSDT" // тикер
+	interval   = "1"       // k-line тайм-фрейм, минуты
+	windowSize = 20        // SMA период
+	bbMult     = 2.0       // σ-множитель
 
-	leverage     = 5.0   // кредитное плечо
-	contractSize = 0.001 // 1 контракт = 0.001 BTC (USDT-линейный)  :contentReference[oaicite:1]{index=1}
-	minNotional  = 100.0 // минимум 100 USDT на ордер             :contentReference[oaicite:2]{index=2}
+	contractSize = 0.001 // 1 контракт = 0.001 BTC
 )
 
+// //////////////////////////////////////////////////////////////////////////////
+// === Переменные стратегии ====================================================
+// //////////////////////////////////////////////////////////////////////////////
 var (
 	closes   []float64
 	inLong   bool
 	orderQty float64 // объём текущей позиции (контракты)
 )
 
+// динамические параметры инструмента
+type instrumentInfo struct {
+	MinNotional float64 // минимальный номинал ордера (USDT)
+	QtyStep     float64 // шаг количества контрактов
+}
+
+var instr instrumentInfo
+
 // //////////////////////////////////////////////////////////////////////////////
-// === Индикаторы ===
+// === Индикаторы ==============================================================
 // //////////////////////////////////////////////////////////////////////////////
 func sma(data []float64) float64 {
 	sum := 0.0
@@ -105,7 +145,7 @@ func stddev(data []float64) float64 {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// === Подписи ===
+// === Подписи =================================================================
 ////////////////////////////////////////////////////////////////////////////////
 
 // REST v5
@@ -125,7 +165,61 @@ func signWS(secret string, expires int64) string {
 }
 
 // //////////////////////////////////////////////////////////////////////////////
-// === REST: баланс ===
+// === REST: информация о инструменте =========================================
+// //////////////////////////////////////////////////////////////////////////////
+func getInstrumentInfo(sym string) (instrumentInfo, error) {
+	const path = "/v5/market/instruments-info"
+
+	q := url.Values{}
+	q.Set("category", "linear")
+	q.Set("symbol", sym)
+
+	ts := fmt.Sprintf("%d", time.Now().UnixMilli())
+	sig := signREST(APISecret, ts, APIKey, recvWindow, q.Encode())
+
+	req, err := http.NewRequest("GET", demoRESTHost+path+"?"+q.Encode(), nil)
+	if err != nil {
+		return instrumentInfo{}, err
+	}
+	req.Header.Set("X-BAPI-API-KEY", APIKey)
+	req.Header.Set("X-BAPI-TIMESTAMP", ts)
+	req.Header.Set("X-BAPI-RECV-WINDOW", recvWindow)
+	req.Header.Set("X-BAPI-SIGN-TYPE", "2")
+	req.Header.Set("X-BAPI-SIGN", sig)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return instrumentInfo{}, err
+	}
+	defer resp.Body.Close()
+
+	var r struct {
+		RetCode int    `json:"retCode"`
+		RetMsg  string `json:"retMsg"`
+		Result  struct {
+			List []struct {
+				MinOrderAmt   string `json:"minOrderAmt"` // в USDT
+				LotSizeFilter struct {
+					QtyStep string `json:"qtyStep"`
+				} `json:"lotSizeFilter"`
+			} `json:"list"`
+		} `json:"result"`
+	}
+	body, _ := io.ReadAll(resp.Body)
+	dbg("Instrument raw: %s", string(body))
+	if err := json.Unmarshal(body, &r); err != nil {
+		return instrumentInfo{}, err
+	}
+	if r.RetCode != 0 || len(r.Result.List) == 0 {
+		return instrumentInfo{}, fmt.Errorf("instrument info error %d: %s", r.RetCode, r.RetMsg)
+	}
+	minAmt, _ := strconv.ParseFloat(r.Result.List[0].MinOrderAmt, 64)
+	qStep, _ := strconv.ParseFloat(r.Result.List[0].LotSizeFilter.QtyStep, 64)
+	return instrumentInfo{MinNotional: minAmt, QtyStep: qStep}, nil
+}
+
+// //////////////////////////////////////////////////////////////////////////////
+// === REST: баланс ============================================================
 // //////////////////////////////////////////////////////////////////////////////
 func getBalanceREST(coin string) (float64, error) {
 	ts := fmt.Sprintf("%d", time.Now().UnixMilli())
@@ -177,26 +271,31 @@ func getBalanceREST(coin string) (float64, error) {
 }
 
 // //////////////////////////////////////////////////////////////////////////////
-// === REST: рыночный ордер ===
+// === REST: рыночный ордер ====================================================
 // //////////////////////////////////////////////////////////////////////////////
 func placeOrderMarket(side string, qty float64, reduceOnly bool) error {
-	path := "/v5/order/create"
+	const path = "/v5/order/create"
+
 	bodyMap := map[string]interface{}{
 		"category":    "linear",
 		"symbol":      symbol,
 		"side":        side,
 		"orderType":   "Market",
-		"qty":         fmt.Sprintf("%.0f", qty), // Bybit qty – целое число контрактов
-		"reduceOnly":  reduceOnly,
-		"timeInForce": "GTC",
+		"qty":         fmt.Sprintf("%.0f", qty), // Bybit принимает строку
+		"timeInForce": "IOC",
+		"positionIdx": 0, // one-way
 	}
+	if reduceOnly {
+		bodyMap["reduceOnly"] = true
+	}
+
 	bodyBytes, _ := json.Marshal(bodyMap)
 	dbg("REST order body: %s", string(bodyBytes))
 
 	ts := fmt.Sprintf("%d", time.Now().UnixMilli())
 	sig := signREST(APISecret, ts, APIKey, recvWindow, string(bodyBytes))
 
-	req, err := http.NewRequest("POST", demoRESTHost+path, bytes.NewReader(bodyBytes))
+	req, err := http.NewRequest(http.MethodPost, demoRESTHost+path, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return err
 	}
@@ -212,25 +311,26 @@ func placeOrderMarket(side string, qty float64, reduceOnly bool) error {
 		return err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	dbg("REST order response: %s", string(body))
+	respBody, _ := io.ReadAll(resp.Body)
+	dbg("REST order response: %s", string(respBody))
 
 	var r struct {
 		RetCode int    `json:"retCode"`
 		RetMsg  string `json:"retMsg"`
 	}
-	if err := json.Unmarshal(body, &r); err != nil {
+	if err := json.Unmarshal(respBody, &r); err != nil {
 		return err
 	}
 	if r.RetCode != 0 {
 		return fmt.Errorf("order error %d: %s", r.RetCode, r.RetMsg)
 	}
-	log.Printf("Market order %s %.0f OK", side, qty)
+
+	logOrderf("Market order %s %.0f OK", side, qty)
 	return nil
 }
 
 // //////////////////////////////////////////////////////////////////////////////
-// === WebSocket helper ===
+// === WebSocket helper ========================================================
 // //////////////////////////////////////////////////////////////////////////////
 func newWSConn(url string) (*websocket.Conn, error) {
 	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
@@ -246,7 +346,7 @@ func newWSConn(url string) (*websocket.Conn, error) {
 }
 
 // //////////////////////////////////////////////////////////////////////////////
-// === Приватный WS: подключение, auth, подписка ===
+// === Приватный WS: подключение + подпись =====================================
 // //////////////////////////////////////////////////////////////////////////////
 func connectPrivateWS() (*websocket.Conn, error) {
 	ws, err := newWSConn(demoWSPrivateURL)
@@ -286,7 +386,7 @@ func connectPrivateWS() (*websocket.Conn, error) {
 }
 
 // //////////////////////////////////////////////////////////////////////////////
-// === Обработка приватного потока в горутине ===
+// === Обработка приватного потока ============================================
 // //////////////////////////////////////////////////////////////////////////////
 func walletListener(ws *websocket.Conn, out chan<- []byte, done chan<- struct{}) {
 	for {
@@ -301,7 +401,7 @@ func walletListener(ws *websocket.Conn, out chan<- []byte, done chan<- struct{})
 }
 
 // //////////////////////////////////////////////////////////////////////////////
-// === Обработка закрытых свечей ===
+// === Обработка закрытия свечи ===============================================
 // //////////////////////////////////////////////////////////////////////////////
 func onClosedCandle(closePrice float64) {
 	closes = append(closes, closePrice)
@@ -321,64 +421,73 @@ func onClosedCandle(closePrice float64) {
 	dbg("Candle close %.2f | SMA %.2f Upper %.2f Lower %.2f inLong=%v",
 		closePrice, smaVal, upper, lower, inLong)
 
-	//----------------------------------------------------------------------
-	// Сигнал BUY — пробой верхней полосы
-	//----------------------------------------------------------------------
+	// ------------------------------------------------------------------
+	// BUY-сигнал — пробой верхней полосы
+	// ------------------------------------------------------------------
 	if !inLong && closePrice > upper {
-		log.Printf("BUY signal @%.2f (upper %.2f)", closePrice, upper)
+		logSignalf("BUY signal @%.2f (upper %.2f)", closePrice, upper)
 
-		// 1. Запрашиваем доступный баланс USDT
+		// 1. Баланс
 		balUSDT, err := getBalanceREST("USDT")
 		if err != nil {
-			log.Printf("Buy aborted: balance REST error: %v", err)
+			logErrorf("Buy aborted: balance REST error: %v", err)
 			return
 		}
 
-		// 2. Максимум контрактов по балансу / плечу
-		//maxQtyBalance := math.Floor(balUSDT * leverage / (closePrice * contractSize))
-		maxQtyBalance := math.Floor(balUSDT / (closePrice * contractSize))
+		// 2. Минимальное и максимальное количество
+		nominalPerCtt := closePrice * contractSize
+		step := instr.QtyStep
+		if step <= 0 {
+			step = 1
+		}
 
-		// 3. Минимум контрактов, чтобы пройти по notional ≥ 100 USDT
-		minQtyNotional := math.Ceil(minNotional / (closePrice * contractSize))
+		minQty := math.Ceil(instr.MinNotional/nominalPerCtt/step) * step
+		if minQty < step {
+			minQty = step
+		}
 
-		if maxQtyBalance < minQtyNotional {
-			log.Printf("Buy aborted: balance %.2f USDT недостаточен для минимального нотионала %.2f USDT",
-				balUSDT, minNotional)
+		maxQty := math.Floor(balUSDT/nominalPerCtt/step) * step
+
+		if maxQty < minQty {
+			logErrorf("Buy aborted: баланс %.2f USDT → maxQty %.0f < minQty %.0f (номинал %.2f USDT)",
+				balUSDT, maxQty, minQty, instr.MinNotional)
 			return
 		}
 
-		qty := maxQtyBalance
+		// 3. Выбираем объём (минимально возможный)
+		qty := minQty
 
-		// 4. Размещаем ордер
+		// 4. Отправляем ордер
 		if err := placeOrderMarket("Buy", qty, false); err == nil {
 			inLong = true
 			orderQty = qty
 		} else {
-			log.Printf("Buy error: %v", err)
+			logErrorf("Buy error: %v", err)
 		}
 	}
 
-	//----------------------------------------------------------------------
-	// Сигнал SELL — цена опустилась ниже нижней полосы
-	//----------------------------------------------------------------------
+	// ------------------------------------------------------------------
+	// SELL-сигнал — цена опустилась ниже нижней полосы
+	// ------------------------------------------------------------------
 	if inLong && closePrice < lower {
-		log.Printf("SELL signal @%.2f (lower %.2f)", closePrice, lower)
+		logSignalf("SELL signal @%.2f (lower %.2f)", closePrice, lower)
 
 		if orderQty < 1 {
-			log.Printf("Sell aborted: recorded orderQty < 1 (%.0f)", orderQty)
+			logErrorf("Sell aborted: recorded orderQty < 1 (%.0f)", orderQty)
 			return
 		}
+
 		if err := placeOrderMarket("Sell", orderQty, true); err == nil {
 			inLong = false
 			orderQty = 0
 		} else {
-			log.Printf("Sell error: %v", err)
+			logErrorf("Sell error: %v", err)
 		}
 	}
 }
 
 // //////////////////////////////////////////////////////////////////////////////
-// === Kline структуры ===
+// === Структуры для k-line ====================================================
 // //////////////////////////////////////////////////////////////////////////////
 type KlineMsg struct {
 	Topic string      `json:"topic"`
@@ -399,7 +508,7 @@ func (k KlineData) CloseFloat() float64 {
 }
 
 // //////////////////////////////////////////////////////////////////////////////
-// === MAIN ===
+// === MAIN ====================================================================
 // //////////////////////////////////////////////////////////////////////////////
 func main() {
 	flag.BoolVar(&debug, "debug", false, "enable debug logging")
@@ -408,15 +517,24 @@ func main() {
 		log.Printf("Debug mode ON")
 	}
 
-	// начальный баланс
+	// ------------------------------------------------------------
+	// Инициализация: баланс + параметры инструмента
+	// ------------------------------------------------------------
 	bal, err := getBalanceREST("USDT")
 	if err != nil {
 		log.Fatalf("Failed REST balance: %v", err)
 	}
 	log.Printf("Init balance (USDT): %.2f", bal)
 
+	instr, err = getInstrumentInfo(symbol)
+	if err != nil {
+		log.Fatalf("Instrument info error: %v", err)
+	}
+	log.Printf("Symbol %s — minNotional %.2f, qtyStep %.4f",
+		symbol, instr.MinNotional, instr.QtyStep)
+
 	//----------------------------------------------------------------------
-	// Приватный WS (wallet) + listener goroutine
+	// Приватный WS (wallet)
 	//----------------------------------------------------------------------
 	privConn, err := connectPrivateWS()
 	if err != nil {
@@ -429,7 +547,7 @@ func main() {
 	go walletListener(privConn, walletChan, walletDone)
 
 	//----------------------------------------------------------------------
-	// Публичный WS (kline)
+	// Публичный WS (k-line)
 	//----------------------------------------------------------------------
 	pubConn, err := newWSConn(demoWSPublicURL)
 	if err != nil {
@@ -446,7 +564,7 @@ func main() {
 	}
 
 	//----------------------------------------------------------------------
-	// Ping goroutine (каждые pingPeriod)
+	// Ping goroutine
 	//----------------------------------------------------------------------
 	ticker := time.NewTicker(pingPeriod)
 	defer ticker.Stop()
@@ -465,7 +583,7 @@ func main() {
 	// Основной цикл
 	//----------------------------------------------------------------------
 	for {
-		// 1-й приоритет — обработка кошелька (non-blocking)
+		// 1 — drain кошелёк (non-blocking)
 	drainWallet:
 		for {
 			select {
@@ -486,12 +604,12 @@ func main() {
 			}
 		}
 
-		// 2. читаем kline (блокирующе)
+		// 2 — читаем k-line (blocking)
 		_, raw, err := pubConn.ReadMessage()
 		if err != nil {
-			log.Printf("Public WS read error: %v – reconnecting", err)
+			logErrorf("Public WS read error: %v – reconnecting", err)
 			pubConn.Close()
-			// попытка реконнекта с back-off
+			// попытка реконнекта
 			for i := 1; ; i++ {
 				time.Sleep(time.Duration(i*2) * time.Second)
 				if pubConn, err = newWSConn(demoWSPublicURL); err == nil {
@@ -505,20 +623,21 @@ func main() {
 					}
 					pubConn.Close()
 				}
-				log.Printf("Public reconnect failed: %v", err)
+				logErrorf("Public reconnect failed: %v", err)
 			}
 			continue
 		}
 		dbg("Public raw: %s", string(raw))
+
 		var km KlineMsg
 		if json.Unmarshal(raw, &km) == nil && len(km.Data) > 0 && km.Data[0].Confirm {
 			onClosedCandle(km.Data[0].CloseFloat())
 		}
 
-		// 3. проверяем, не умер ли приватный поток
+		// 3 — следим, не умер ли приватный поток
 		select {
 		case <-walletDone:
-			log.Printf("Private WS closed – reconnecting")
+			logErrorf("Private WS closed – reconnecting")
 			for i := 1; ; i++ {
 				time.Sleep(time.Duration(i*2) * time.Second)
 				if privConn, err = connectPrivateWS(); err == nil {
@@ -526,7 +645,7 @@ func main() {
 					go walletListener(privConn, walletChan, walletDone)
 					break
 				}
-				log.Printf("Private reconnect failed: %v", err)
+				logErrorf("Private reconnect failed: %v", err)
 			}
 		default:
 		}
