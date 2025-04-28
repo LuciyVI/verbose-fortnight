@@ -61,7 +61,10 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -122,8 +125,8 @@ func logErrorf(f string, v ...interface{}) {
 // ---------------------------------------------------------------------------
 
 const (
-	APIKey    = "" // demo keys!
-	APISecret = ""
+	APIKey    = "iAk6FbPXdSri6jFU1J" // demo keys!
+	APISecret = "svqVf30XLzbaxmByb3qcMBBBUGN0NwXc2lSL"
 
 	demoRESTHost     = "https://api-demo.bybit.com"
 	demoWSPrivateURL = "wss://stream-demo.bybit.com/v5/private"
@@ -163,6 +166,18 @@ type instrumentInfo struct {
 }
 
 var instr instrumentInfo
+
+var (
+	obLock  sync.Mutex
+	bidsMap = map[string]float64{} // price → size
+	asksMap = map[string]float64{}
+)
+
+// настройки TP
+const (
+	obDepth        = 1     // orderbook.50
+	tpThresholdQty = 500.0 // «стенка»: кумулятив ≥ 500 контрактов
+)
 
 // ---------------------------------------------------------------------------
 // ========== 5. Indicators ==================================================
@@ -359,6 +374,40 @@ func placeOrderMarket(side string, qty float64, reduceOnly bool) error {
 	return nil
 }
 
+// Limit reduceOnly Take-Profit
+func placeTakeProfitOrder(side string, qty, price float64) error {
+	const path = "/v5/order/create"
+	body := map[string]interface{}{
+		"category":    "linear",
+		"symbol":      symbol,
+		"side":        map[string]string{"LONG": "Sell", "SHORT": "Buy"}[side],
+		"orderType":   "Limit",
+		"price":       fmt.Sprintf("%.2f", price),
+		"qty":         formatQty(qty, instr.QtyStep),
+		"timeInForce": "GTC",
+		"reduceOnly":  true,
+		"positionIdx": 0,
+	}
+	raw, _ := json.Marshal(body)
+	ts := fmt.Sprintf("%d", time.Now().UnixMilli())
+	req, _ := http.NewRequest("POST", demoRESTHost+path, bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-BAPI-API-KEY", APIKey)
+	req.Header.Set("X-BAPI-TIMESTAMP", ts)
+	req.Header.Set("X-BAPI-RECV-WINDOW", recvWindow)
+	req.Header.Set("X-BAPI-SIGN-TYPE", "2")
+	req.Header.Set("X-BAPI-SIGN", signREST(APISecret, ts, APIKey, recvWindow, string(raw)))
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	logOrderf("TP set @ %.2f (%s, qty %.4f)", price, side, qty)
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // ========== 8. WebSocket Helpers ===========================================
 // ---------------------------------------------------------------------------
@@ -404,7 +453,7 @@ func connectPrivateWS() (*websocket.Conn, error) {
 }
 
 // Reconnect public WS after any error (back-off with 2s * n).
-func reconnectPublic() (*websocket.Conn, error) {
+func reconnectPublic(klineTopic, obTopic string) (*websocket.Conn, error) {
 	for backoff := 1; ; backoff++ {
 		time.Sleep(time.Duration(backoff*2) * time.Second)
 
@@ -413,9 +462,11 @@ func reconnectPublic() (*websocket.Conn, error) {
 			logErrorf("Public reconnect dial: %v", err)
 			continue
 		}
-		topic := fmt.Sprintf("kline.%s.%s", interval, symbol)
+
+		klineTopic := fmt.Sprintf("kline.%s.%s", interval, symbol)
+		obTopic := fmt.Sprintf("orderbook.%d.%s", obDepth, symbol)
 		if err = conn.WriteJSON(map[string]interface{}{
-			"op": "subscribe", "args": []string{topic},
+			"op": "subscribe", "args": []string{klineTopic, obTopic},
 		}); err != nil {
 			logErrorf("Public resub send: %v", err)
 			conn.Close()
@@ -441,6 +492,93 @@ func walletListener(ws *websocket.Conn, out chan<- []byte, done chan<- struct{})
 		}
 		out <- msg
 	}
+}
+
+// --- applySnapshot: полная перезапись локального стакана
+func applySnapshot(bids, asks [][]string) {
+	obLock.Lock()
+	defer obLock.Unlock()
+	bidsMap, asksMap = map[string]float64{}, map[string]float64{}
+	for _, lv := range bids {
+		if len(lv) < 2 {
+			continue
+		}
+		sz, _ := strconv.ParseFloat(lv[1], 64)
+		bidsMap[lv[0]] = sz
+	}
+	for _, lv := range asks {
+		if len(lv) < 2 {
+			continue
+		}
+		sz, _ := strconv.ParseFloat(lv[1], 64)
+		asksMap[lv[0]] = sz
+	}
+}
+
+// --- applyDelta: частичные изменения
+func applyDelta(bids, asks [][]string) {
+	obLock.Lock()
+	defer obLock.Unlock()
+	for _, lv := range bids {
+		if len(lv) < 2 {
+			continue
+		}
+		sz, _ := strconv.ParseFloat(lv[1], 64)
+		if sz == 0 {
+			delete(bidsMap, lv[0])
+		} else {
+			bidsMap[lv[0]] = sz
+		}
+	}
+	for _, lv := range asks {
+		if len(lv) < 2 {
+			continue
+		}
+		sz, _ := strconv.ParseFloat(lv[1], 64)
+		if sz == 0 {
+			delete(asksMap, lv[0])
+		} else {
+			asksMap[lv[0]] = sz
+		}
+	}
+}
+
+// --- calcTakeProfit: ищем первую «стенку» ликвидности
+func calcTakeProfit(side string, threshold float64) float64 {
+	type lvl struct{ p, sz float64 }
+	obLock.Lock()
+	defer obLock.Unlock()
+
+	if side == "LONG" {
+		var arr []lvl
+		for ps, sz := range asksMap {
+			p, _ := strconv.ParseFloat(ps, 64)
+			arr = append(arr, lvl{p, sz})
+		}
+		sort.Slice(arr, func(i, j int) bool { return arr[i].p < arr[j].p })
+		cum := 0.0
+		for _, v := range arr {
+			cum += v.sz
+			if cum >= threshold {
+				return v.p * 0.9995
+			} // чуть ниже
+		}
+	} else if side == "SHORT" {
+		var arr []lvl
+		for ps, sz := range bidsMap {
+			p, _ := strconv.ParseFloat(ps, 64)
+			arr = append(arr, lvl{p, sz})
+		}
+		sort.Slice(arr, func(i, j int) bool { return arr[i].p > arr[j].p })
+		cum := 0.0
+		for _, v := range arr {
+			cum += v.sz
+			if cum >= threshold {
+				return v.p * 1.0005
+			} // чуть выше
+		}
+	}
+	return 0 // стенка не найдена
 }
 
 // ---------------------------------------------------------------------------
@@ -546,6 +684,16 @@ func (k KlineData) CloseFloat() float64 {
 	return f
 }
 
+type OrderbookMsg struct {
+	Topic string        `json:"topic"`
+	Type  string        `json:"type"` // snapshot | delta
+	Data  OrderbookData `json:"data"`
+}
+type OrderbookData struct {
+	B [][]string `json:"b"` // bids [price,size]
+	A [][]string `json:"a"` // asks
+}
+
 // ---------------------------------------------------------------------------
 // ========== 12. MAIN ========================================================
 // ---------------------------------------------------------------------------
@@ -577,7 +725,6 @@ func main() {
 		log.Fatalf("Private WS dial: %v", err)
 	}
 	privPtr.Store(privConn)
-
 	walletChan := make(chan []byte, 16)
 	walletDone := make(chan struct{})
 	go walletListener(privConn, walletChan, walletDone)
@@ -588,8 +735,15 @@ func main() {
 		log.Fatalf("Public WS dial: %v", err)
 	}
 	pubPtr.Store(pubConn)
-	topic := fmt.Sprintf("kline.%s.%s", interval, symbol)
-	if err := pubConn.WriteJSON(map[string]interface{}{"op": "subscribe", "args": []string{topic}}); err != nil {
+
+	// два топика: kline и orderbook
+	klineTopic := fmt.Sprintf("kline.%s.%s", interval, symbol)
+	obTopic := fmt.Sprintf("orderbook.%d.%s", obDepth, symbol)
+
+	if err := pubConn.WriteJSON(map[string]interface{}{
+		"op":   "subscribe",
+		"args": []string{klineTopic, obTopic},
+	}); err != nil {
 		log.Fatalf("Public sub send: %v", err)
 	}
 	pubConn.ReadMessage() // sub resp
@@ -628,16 +782,41 @@ func main() {
 		if err != nil {
 			logErrorf("Public WS read error: %v – reconnecting", err)
 			pubConn.Close()
-			if pubConn, err = reconnectPublic(); err == nil {
+			if pubConn, err = reconnectPublic(klineTopic, obTopic); err == nil {
 				pubPtr.Store(pubConn)
 				continue
 			}
 			log.Fatalf("Fatal: cannot restore public WS: %v", err)
 		}
 
-		var km KlineMsg
-		if json.Unmarshal(raw, &km) == nil && len(km.Data) > 0 && km.Data[0].Confirm {
-			onClosedCandle(km.Data[0].CloseFloat())
+		// сначала узнаём канал
+		var peek struct {
+			Topic string `json:"topic"`
+		}
+		if json.Unmarshal(raw, &peek) != nil {
+			continue
+		}
+
+		switch {
+		case strings.HasPrefix(peek.Topic, "kline."):
+			var km KlineMsg
+			if json.Unmarshal(raw, &km) == nil && len(km.Data) > 0 && km.Data[0].Confirm {
+				onClosedCandle(km.Data[0].CloseFloat())
+			}
+
+		case strings.HasPrefix(peek.Topic, "orderbook."):
+			var om OrderbookMsg
+			if json.Unmarshal(raw, &om) != nil {
+				break
+			}
+
+			switch strings.ToLower(om.Type) {
+			case "snapshot":
+				applySnapshot(om.Data.B, om.Data.A)
+			case "delta":
+				applyDelta(om.Data.B, om.Data.A)
+			}
+
 		}
 
 		// 3) monitor private channel closure
