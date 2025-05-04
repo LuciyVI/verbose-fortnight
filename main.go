@@ -169,9 +169,27 @@ func calcATR(period int) float64 {
 	if len(highs) < period || len(lows) < period || len(closes) < period {
 		return 0
 	}
+
 	var trSum float64
 	for i := len(closes) - period; i < len(closes); i++ {
-		tr := highs[i] - lows[i]
+		high := highs[i]
+		low := lows[i]
+		closePrev := closes[i]
+
+		// Переводим в "единицы контракта", если цена выражена в USD
+		// Например, 95952 → делим на стоимость пункта (tick value), если известна
+		// Либо просто делим на коэффициент контракта, например contractSize
+		normalizedHigh := high * contractSize
+		normalizedLow := low * contractSize
+		normalizedClose := closePrev * contractSize
+
+		tr := math.Max(
+			normalizedHigh-normalizedLow,
+			math.Max(
+				math.Abs(normalizedHigh-normalizedClose),
+				math.Abs(normalizedLow-normalizedClose),
+			),
+		)
 		trSum += tr
 	}
 	return trSum / float64(period)
@@ -306,12 +324,15 @@ func formatQty(qty, step float64) string {
 // ---------------------------------------------------------------------------
 
 func placeOrderMarket(side string, qty float64, reduceOnly bool) error {
+	if side == "" {
+		return fmt.Errorf("invalid side: empty")
+	}
 	const path = "/v5/order/create"
 	body := map[string]interface{}{
 		"category":    "linear",
 		"symbol":      symbol,
 		"side":        side,
-		"orderType":   "Market",
+		"orderType":   "Market", // ← теперь рыночный ордер
 		"qty":         formatQty(qty, instr.QtyStep),
 		"timeInForce": "IOC",
 		"positionIdx": 0,
@@ -329,7 +350,6 @@ func placeOrderMarket(side string, qty float64, reduceOnly bool) error {
 	req.Header.Set("X-BAPI-RECV-WINDOW", recvWindow)
 	req.Header.Set("X-BAPI-SIGN-TYPE", "2")
 	req.Header.Set("X-BAPI-SIGN", signREST(APISecret, ts, APIKey, recvWindow, string(raw)))
-
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err
@@ -337,25 +357,23 @@ func placeOrderMarket(side string, qty float64, reduceOnly bool) error {
 	defer resp.Body.Close()
 	reply, _ := io.ReadAll(resp.Body)
 	dbg("REST order response: %s", reply)
-
 	var r struct {
 		RetCode int    `json:"retCode"`
 		RetMsg  string `json:"retMsg"`
 	}
-
 	if json.Unmarshal(reply, &r) != nil || r.RetCode != 0 {
 		return fmt.Errorf("error placing market order: %d: %s", r.RetCode, r.RetMsg)
 	}
-
-	logOrderf("Market %s %s OK", side, body["qty"])
+	logOrderf("Market %s %.4f OK", side, qty)
 	return nil
 }
+
 func placeStopLoss(side string, qty, price float64) error {
 	const path = "/v5/order/create"
 	body := map[string]interface{}{
 		"category":      "linear",
 		"symbol":        symbol,
-		"side":          map[string]string{"LONG": "Sell", "SHORT": "Buy"}[side],
+		"side":          side,
 		"orderType":     "Market", // или "Limit" – зависит от твоей стратегии
 		"qty":           formatQty(qty, instr.QtyStep),
 		"stopLossPrice": fmt.Sprintf("%.2f", price),
@@ -387,7 +405,7 @@ func placeTakeProfitOrder(side string, qty, price float64) error {
 	body := map[string]interface{}{
 		"category":    "linear",
 		"symbol":      symbol,
-		"side":        map[string]string{"LONG": "Sell", "SHORT": "Buy"}[side],
+		"side":        side,
 		"orderType":   "Limit",
 		"price":       fmt.Sprintf("%.2f", price),
 		"qty":         formatQty(qty, instr.QtyStep),
@@ -420,7 +438,7 @@ func placeStopLossOrder(side string, qty, price float64) error {
 	body := map[string]interface{}{
 		"category":    "linear",
 		"symbol":      symbol,
-		"side":        map[string]string{"LONG": "Sell", "SHORT": "Buy"}[side],
+		"side":        side,
 		"orderType":   "Limit",
 		"price":       fmt.Sprintf("%.2f", price),
 		"qty":         formatQty(qty, instr.QtyStep),
@@ -448,9 +466,45 @@ func placeStopLossOrder(side string, qty, price float64) error {
 	return nil
 }
 
+func calcTakeProfitVoting(side string) float64 {
+	tpBB := calcTakeProfitBB(side)
+	tpATR := calcTakeProfitATR(side)
+	tpVol := calcTakeProfitVolume(side, tpThresholdQty)
+	switch side {
+	case "LONG":
+		return max(tpBB, tpATR, tpVol)
+	case "SHORT":
+		return min(tpBB, tpATR, tpVol)
+	default:
+		return 0
+	}
+}
+
+func calcStopLossVoting(side string) float64 {
+	slBB := calcStopLossBB(side)
+	slATR := calcStopLossATR(side)
+	slVol := calcStopLossVolume(side, slThresholdQty)
+	switch side {
+	case "LONG":
+		return min(slBB, slATR, slVol)
+	case "SHORT":
+		return max(slBB, slATR, slVol)
+	default:
+		return 0
+	}
+}
+
 // ---------------------------------------------------------------------------
 // ========== 8. Take Profit Methods =========================================
 // ---------------------------------------------------------------------------
+
+func max(a, b, c float64) float64 {
+	return math.Max(math.Max(a, b), c)
+}
+
+func min(a, b, c float64) float64 {
+	return math.Min(math.Min(a, b), c)
+}
 
 func calcTakeProfitBB(side string) float64 {
 	if len(closes) < windowSize {
@@ -777,11 +831,44 @@ func tpWorker() {
 // ---------------------------------------------------------------------------
 // ========== 11. Position Management ========================================
 // ---------------------------------------------------------------------------
+// Отменяет все активные ордера по символу (например, TP/SL)
+
+func cancelCurrentOrders() {
+	const path = "/v5/order/cancel-all"
+	body := map[string]interface{}{
+		"category": "linear",
+		"symbol":   symbol,
+	}
+	raw, _ := json.Marshal(body)
+	ts := fmt.Sprintf("%d", time.Now().UnixMilli())
+	req, _ := http.NewRequest("POST", demoRESTHost+path, bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-BAPI-API-KEY", APIKey)
+	req.Header.Set("X-BAPI-TIMESTAMP", ts)
+	req.Header.Set("X-BAPI-RECV-WINDOW", recvWindow)
+	req.Header.Set("X-BAPI-SIGN-TYPE", "2")
+	req.Header.Set("X-BAPI-SIGN", signREST(APISecret, ts, APIKey, recvWindow, string(raw)))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		logErrorf("Failed to cancel orders: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	log.Printf("Отменены все активные ордера перед обновлением позиции")
+}
 
 func openPosition(newSide string, price float64) {
-	// Закрываем противоположную позицию, если она есть
 	if posSide != "" && posSide != newSide && orderQty > 0 {
-		reduce := map[string]string{"LONG": "Sell", "SHORT": "Buy"}[posSide]
+		var reduce string
+		switch posSide {
+		case "LONG":
+			reduce = "Sell"
+		case "SHORT":
+			reduce = "Buy"
+		default:
+			logErrorf("Unknown position side for closing: %s", posSide)
+			return
+		}
 		if err := placeOrderMarket(reduce, orderQty, true); err != nil {
 			logErrorf("Close %s error: %v", posSide, err)
 			return
@@ -789,67 +876,73 @@ func openPosition(newSide string, price float64) {
 		posSide = ""
 		orderQty = 0
 	}
-
-	// Если уже в нужной стороне → ничего не делаем
 	if posSide == newSide {
+		dbg("Обновление TP/SL для существующей позиции")
+		cancelCurrentOrders()
+		drainTPQueue()
+		tpChan <- tpJob{
+			side:       newSide,
+			qty:        orderQty,
+			entryPrice: price,
+		}
+		placeStopLoss(newSide, orderQty, price)
 		return
 	}
-
-	// Получаем баланс USDT для расчёта объёма
 	balUSDT, err := getBalanceREST("USDT")
 	if err != nil {
 		logErrorf("Balance error: %v", err)
 		return
 	}
-
-	// Минимальный шаг и минимальное кол-во контрактов
 	step := instr.QtyStep
 	minQty := instr.MinQty
 	if minQty < step {
 		minQty = step
 	}
-
-	// Номинал одного контракта
 	nominalPerCtt := price * contractSize
-
-	// Максимальное количество на баланс
-	maxQty := math.Floor(balUSDT/nominalPerCtt/step*100) / 100 // округление до 2 знаков
-
-	// Проверяем минимальные значения
+	maxQty := math.Floor(balUSDT/nominalPerCtt/step*100) / 100
 	if maxQty < minQty {
 		logErrorf("Not enough balance %.2f USDT → maxQty %.4f < minQty %.4f (nominal %.2f)",
 			balUSDT, maxQty, minQty, minQty*nominalPerCtt)
 		return
 	}
-
 	qty := minQty
-	if err := placeOrderMarket(map[string]string{"LONG": "Buy", "SHORT": "Sell"}[newSide], qty, false); err != nil {
+	var side string
+	switch newSide {
+	case "LONG":
+		side = "Buy"
+	case "SHORT":
+		side = "Sell"
+	default:
+		logErrorf("Invalid newSide value: %s", newSide)
+		return
+	}
+	if err := placeOrderMarket(side, qty, false); err != nil {
 		logErrorf("Open %s error: %v", newSide, err)
 		return
 	}
-
-	// Ждём загрузки стакана
 	for i := 0; i < 50 && !orderbookReady.Load(); i++ {
 		dbg("Жду загрузки стакана (%d/50)", i+1)
 		time.Sleep(100 * time.Millisecond)
 	}
-
-	// Обновляем состояние
 	posSide = newSide
 	orderQty = qty
-
-	// Очищаем старые задачи TP
 	drainTPQueue()
-
-	// Отправляем новую задачу
-	tpChan <- tpJob{
+	job := tpJob{
 		side:       newSide,
 		qty:        qty,
 		entryPrice: price,
 	}
-
-	// Устанавливаем Stop-Loss ≤ ±1%
-	placeStopLoss(newSide, qty, price)
+	tpChan <- job
+	go func() {
+		tp := calcTakeProfitVoting(newSide)
+		sl := calcStopLossVoting(newSide)
+		if tp > 0 && !math.IsNaN(tp) {
+			placeTakeProfitOrder(newSide, qty, tp)
+		}
+		if sl > 0 && !math.IsNaN(sl) {
+			placeStopLossOrder(newSide, qty, sl)
+		}
+	}()
 }
 
 // ---------------------------------------------------------------------------
@@ -860,23 +953,19 @@ func onClosedCandle(closePrice float64) {
 	closes = append(closes, closePrice)
 	highs = append(highs, closePrice)
 	lows = append(lows, closePrice)
-
 	if len(closes) > windowSize {
 		closes = closes[1:]
 		highs = highs[1:]
 		lows = lows[1:]
 	}
-
 	if len(closes) < windowSize {
 		dbg("Buffering close %.2f (%d/%d)", closePrice, len(closes), windowSize)
 		return
 	}
-
 	smaVal := sma(closes)
 	stdVal := stddev(closes)
 	upper := smaVal + bbMult*stdVal
 	lower := smaVal - bbMult*stdVal
-
 	dbg("Candle close %.2f | SMA %.2f Upper %.2f Lower %.2f pos=%s qty=%.4f",
 		closePrice, smaVal, upper, lower, posSide, orderQty)
 
