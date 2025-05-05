@@ -169,30 +169,101 @@ func calcATR(period int) float64 {
 	if len(highs) < period || len(lows) < period || len(closes) < period {
 		return 0
 	}
-
 	var trSum float64
 	for i := len(closes) - period; i < len(closes); i++ {
-		high := highs[i]
+		high := highs[i] // Удалено деление на 100
 		low := lows[i]
 		closePrev := closes[i]
-
-		// Переводим в "единицы контракта", если цена выражена в USD
-		// Например, 95952 → делим на стоимость пункта (tick value), если известна
-		// Либо просто делим на коэффициент контракта, например contractSize
-		normalizedHigh := high * contractSize
-		normalizedLow := low * contractSize
-		normalizedClose := closePrev * contractSize
-
 		tr := math.Max(
-			normalizedHigh-normalizedLow,
+			high-low,
 			math.Max(
-				math.Abs(normalizedHigh-normalizedClose),
-				math.Abs(normalizedLow-normalizedClose),
+				math.Abs(high-closePrev),
+				math.Abs(low-closePrev),
 			),
 		)
 		trSum += tr
 	}
 	return trSum / float64(period)
+}
+
+func updatePositionTradingStop(posSide string, takeProfit, stopLoss float64) error {
+	const path = "/v5/position/trading-stop"
+	body := map[string]interface{}{
+		"category":    "linear",
+		"symbol":      symbol,
+		"positionIdx": 0,
+	}
+	// Уберите деление на 100
+	if takeProfit > 0 {
+		body["takeProfit"] = fmt.Sprintf("%.2f", takeProfit)
+	}
+	if stopLoss > 0 {
+		body["stopLoss"] = fmt.Sprintf("%.2f", stopLoss)
+	}
+	raw, _ := json.Marshal(body)
+	dbg("Update TP/SL body: %s", raw)
+	ts := fmt.Sprintf("%d", time.Now().UnixMilli())
+	req, _ := http.NewRequest("POST", demoRESTHost+path, bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-BAPI-API-KEY", APIKey)
+	req.Header.Set("X-BAPI-TIMESTAMP", ts)
+	req.Header.Set("X-BAPI-RECV-WINDOW", recvWindow)
+	req.Header.Set("X-BAPI-SIGN-TYPE", "2")
+	req.Header.Set("X-BAPI-SIGN", signREST(APISecret, ts, APIKey, recvWindow, string(raw)))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	reply, _ := io.ReadAll(resp.Body)
+	dbg("TP/SL update response: %s", reply)
+	var r struct {
+		RetCode int    `json:"retCode"`
+		RetMsg  string `json:"retMsg"`
+	}
+	if json.Unmarshal(reply, &r) != nil || r.RetCode != 0 {
+		return fmt.Errorf("error updating TP/SL: %d: %s", r.RetCode, r.RetMsg)
+	}
+	logOrderf("TP/SL updated: TP=%.2f, SL=%.2f", takeProfit, stopLoss)
+	return nil
+}
+
+// New function to update TP/SL via position trading-stop endpoint
+func updatePositionTPSL(symbol string, tp, sl float64) error {
+	const path = "/v5/position/trading-stop"
+	body := map[string]interface{}{
+		"category":    "linear",
+		"symbol":      symbol,
+		"takeProfit":  fmt.Sprintf("%.2f", tp), // Убрать /100
+		"stopLoss":    fmt.Sprintf("%.2f", sl), // Убрать /100
+		"positionIdx": 0,
+	}
+	raw, _ := json.Marshal(body)
+	dbg("Update TP/SL body: %s", raw)
+	ts := fmt.Sprintf("%d", time.Now().UnixMilli())
+	req, _ := http.NewRequest("POST", demoRESTHost+path, bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-BAPI-API-KEY", APIKey)
+	req.Header.Set("X-BAPI-TIMESTAMP", ts)
+	req.Header.Set("X-BAPI-RECV-WINDOW", recvWindow)
+	req.Header.Set("X-BAPI-SIGN-TYPE", "2")
+	req.Header.Set("X-BAPI-SIGN", signREST(APISecret, ts, APIKey, recvWindow, string(raw)))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	reply, _ := io.ReadAll(resp.Body)
+	dbg("TP/SL update response: %s", reply)
+	var r struct {
+		RetCode int    `json:"retCode"`
+		RetMsg  string `json:"retMsg"`
+	}
+	if json.Unmarshal(reply, &r) != nil || r.RetCode != 0 {
+		return fmt.Errorf("error updating TP/SL: %d: %s", r.RetCode, r.RetMsg)
+	}
+	logOrderf("TP/SL updated: TP=%.2f, SL=%.2f", tp, sl)
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -466,6 +537,22 @@ func placeStopLossOrder(side string, qty, price float64) error {
 	return nil
 }
 
+func calcTakeProfitATR(side string) float64 {
+	atr := calcATR(14)
+	if atr == 0 {
+		atr = 90
+	}
+	var tp float64
+	if side == "LONG" {
+		tp = getLastAskPrice() + atr*1.5 // Используйте "сырые" цены
+	} else if side == "SHORT" {
+		tp = getLastBidPrice() - atr*1.5
+	}
+	if instr.TickSize > 0 {
+		tp = math.Round(tp/instr.TickSize) * instr.TickSize // Уберите *100
+	}
+	return tp
+}
 func calcTakeProfitVoting(side string) float64 {
 	tpBB := calcTakeProfitBB(side)
 	tpATR := calcTakeProfitATR(side)
@@ -478,6 +565,24 @@ func calcTakeProfitVoting(side string) float64 {
 	default:
 		return 0
 	}
+}
+
+func calcStopLossATR(side string) float64 {
+	atr := calcATR(14)
+	if atr == 0 {
+		atr = 90
+	}
+	var sl float64
+	if side == "LONG" {
+		sl = getLastBidPrice() - atr*1.5 // Используйте "сырые" цены
+	} else if side == "SHORT" {
+		sl = getLastAskPrice() + atr*1.5
+	}
+	if instr.TickSize > 0 {
+		sl = math.Round(sl/instr.TickSize) * instr.TickSize // Уберите /100
+	}
+	dbg("[SL ATR Debug] ATR=%.2f | SL=%.2f", atr, sl)
+	return sl
 }
 
 func calcStopLossVoting(side string) float64 {
@@ -550,34 +655,15 @@ func getLastBidPrice() float64 {
 	return min
 }
 
-func calcTakeProfitATR(side string) float64 {
-	atr := calcATR(14)
-	if atr == 0 {
-		atr = 90
-	}
-	var tp float64
-	if side == "LONG" {
-		tp = getLastAskPrice() + atr*1.5
-	} else if side == "SHORT" {
-		tp = getLastBidPrice() - atr*1.5
-	}
-	if instr.TickSize > 0 {
-		tp = math.Round(tp/instr.TickSize*100) / 100
-	}
-	return tp
-}
-
 func calcTakeProfitVolume(side string, threshold float64) float64 {
 	type lvl struct{ p, sz float64 }
-
 	obLock.Lock()
 	defer obLock.Unlock()
-
 	if side == "LONG" && len(asksMap) > 0 {
 		var arr []lvl
 		for ps, sz := range asksMap {
 			p, _ := strconv.ParseFloat(ps, 64)
-			arr = append(arr, lvl{p, sz})
+			arr = append(arr, lvl{p, sz}) // Уберите /100
 		}
 		sort.Slice(arr, func(i, j int) bool { return arr[i].p < arr[j].p })
 		cum := 0.0
@@ -586,15 +672,15 @@ func calcTakeProfitVolume(side string, threshold float64) float64 {
 			if cum >= threshold {
 				tp := v.p * 0.9995
 				if instr.TickSize > 0 {
-					tp = math.Round(tp/instr.TickSize*100) / 100
+					tp = math.Round(tp/instr.TickSize) * instr.TickSize // Уберите *100
 				}
 				return tp
 			}
 		}
 		if len(arr) > 0 {
-			tp := arr[0].p * 0.9995
+			tp := arr[len(arr)-1].p * 1.0005
 			if instr.TickSize > 0 {
-				tp = math.Round(tp/instr.TickSize*100) / 100
+				tp = math.Round(tp/instr.TickSize) * instr.TickSize // Уберите *100
 			}
 			return tp
 		}
@@ -609,17 +695,17 @@ func calcTakeProfitVolume(side string, threshold float64) float64 {
 		for _, v := range arr {
 			cum += v.sz
 			if cum >= threshold {
-				tp := v.p * 1.0005
+				tp := v.p * 0.9995
 				if instr.TickSize > 0 {
-					tp = math.Round(tp/instr.TickSize*100) / 100
+					tp = math.Round(tp/instr.TickSize) * instr.TickSize // Уберите *100
 				}
 				return tp
 			}
 		}
 		if len(arr) > 0 {
-			tp := arr[0].p * 1.0005
+			tp := arr[0].p * 0.9995
 			if instr.TickSize > 0 {
-				tp = math.Round(tp/instr.TickSize*100) / 100
+				tp = math.Round(tp/instr.TickSize) * instr.TickSize // Уберите *100
 			}
 			return tp
 		}
@@ -649,29 +735,10 @@ func calcStopLossBB(side string) float64 {
 	return sl
 }
 
-func calcStopLossATR(side string) float64 {
-	atr := calcATR(14)
-	if atr == 0 {
-		atr = 90
-	}
-	var sl float64
-	if side == "LONG" {
-		sl = getLastBidPrice() - atr*1.5
-	} else if side == "SHORT" {
-		sl = getLastAskPrice() + atr*1.5
-	}
-	if instr.TickSize > 0 {
-		sl = math.Round(sl/instr.TickSize*100) / 100
-	}
-	return sl
-}
-
 func calcStopLossVolume(side string, threshold float64) float64 {
 	type lvl struct{ p, sz float64 }
-
 	obLock.Lock()
 	defer obLock.Unlock()
-
 	if side == "LONG" && len(bidsMap) > 0 {
 		var arr []lvl
 		for ps, sz := range bidsMap {
@@ -685,7 +752,7 @@ func calcStopLossVolume(side string, threshold float64) float64 {
 			if cum >= threshold {
 				sl := v.p * 0.99
 				if instr.TickSize > 0 {
-					sl = math.Round(sl/instr.TickSize*100) / 100
+					sl = math.Round(sl/instr.TickSize) * instr.TickSize // Уберите *100
 				}
 				return sl
 			}
@@ -693,7 +760,7 @@ func calcStopLossVolume(side string, threshold float64) float64 {
 		if len(arr) > 0 {
 			sl := arr[len(arr)-1].p * 0.99
 			if instr.TickSize > 0 {
-				sl = math.Round(sl/instr.TickSize*100) / 100
+				sl = math.Round(sl/instr.TickSize) * instr.TickSize // Уберите *100
 			}
 			return sl
 		}
@@ -710,7 +777,7 @@ func calcStopLossVolume(side string, threshold float64) float64 {
 			if cum >= threshold {
 				sl := v.p * 1.01
 				if instr.TickSize > 0 {
-					sl = math.Round(sl/instr.TickSize*100) / 100
+					sl = math.Round(sl/instr.TickSize) * instr.TickSize // Уберите *100
 				}
 				return sl
 			}
@@ -718,7 +785,7 @@ func calcStopLossVolume(side string, threshold float64) float64 {
 		if len(arr) > 0 {
 			sl := arr[0].p * 1.01
 			if instr.TickSize > 0 {
-				sl = math.Round(sl/instr.TickSize*100) / 100
+				sl = math.Round(sl/instr.TickSize) * instr.TickSize // Уберите *100
 			}
 			return sl
 		}
@@ -784,12 +851,18 @@ func tpWorker() {
 			continue
 		}
 
-		// Считаем все три варианта TP
+		// Рассчитываем TP тремя способами:
+		// 1. Bollinger Bands (BB)
+		// 2. ATR (Average True Range)
+		// 3. Volume (объем в стакане)
 		tpBB := calcTakeProfitBB(job.side)
 		tpATR := calcTakeProfitATR(job.side)
 		tpVol := calcTakeProfitVolume(job.side, tpThresholdQty)
+		dbg("[TP Debug] BB=%.2f | ATR=%.2f | Volume=%.2f", tpBB, tpATR, tpVol)
 
-		// Выбираем лучший вариант
+		// Выбираем финальный TP:
+		// - Для LONG: максимальное значение из трех вариантов
+		// - Для SHORT: минимальное значение из трех вариантов
 		var finalTP float64
 		switch job.side {
 		case "LONG":
@@ -801,7 +874,7 @@ func tpWorker() {
 			continue
 		}
 
-		// Если всё равно не определён → fallback к фиксированному отступу
+		// Если TP не определен → используем фиксированный отступ от цены входа
 		if finalTP == 0 || math.IsNaN(finalTP) {
 			entryPrice := job.entryPrice
 			if entryPrice == 0 {
@@ -822,8 +895,17 @@ func tpWorker() {
 		dbg("[TP] BB=%.2f | ATR=%.2f | Volume=%.2f → Final TP=%.2f",
 			tpBB, tpATR, tpVol, finalTP)
 
-		if err := placeTakeProfitOrder(job.side, job.qty, finalTP); err != nil {
-			logErrorf("error placing TP: %v", err)
+		// Сторона ордера должна быть противоположной позиции:
+		// - Для LONG → Sell
+		// - Для SHORT → Buy
+		orderSide := "Sell"
+		if job.side == "SHORT" {
+			orderSide = "Buy"
+		}
+
+		// Выставляем ордер TP
+		if err := placeTakeProfitOrder(orderSide, job.qty, finalTP); err != nil {
+			logErrorf("Ошибка выставления TP: %v", err)
 		}
 	}
 }
@@ -859,6 +941,7 @@ func cancelCurrentOrders() {
 
 func openPosition(newSide string, price float64) {
 	if posSide != "" && posSide != newSide && orderQty > 0 {
+		// Close opposite position
 		var reduce string
 		switch posSide {
 		case "LONG":
@@ -876,18 +959,21 @@ func openPosition(newSide string, price float64) {
 		posSide = ""
 		orderQty = 0
 	}
+
 	if posSide == newSide {
-		dbg("Обновление TP/SL для существующей позиции")
-		cancelCurrentOrders()
-		drainTPQueue()
-		tpChan <- tpJob{
-			side:       newSide,
-			qty:        orderQty,
-			entryPrice: price,
+		dbg("Updating TP/SL for existing position")
+		// Calculate new TP/SL without canceling orders
+		tp := calcTakeProfitVoting(newSide)
+		sl := calcStopLossVoting(newSide)
+
+		if tp > 0 && !math.IsNaN(tp) && sl > 0 && !math.IsNaN(sl) {
+			if err := updatePositionTPSL(symbol, tp, sl); err != nil {
+				logErrorf("Failed to update TP/SL: %v", err)
+			}
 		}
-		placeStopLoss(newSide, orderQty, price)
 		return
 	}
+
 	balUSDT, err := getBalanceREST("USDT")
 	if err != nil {
 		logErrorf("Balance error: %v", err)
