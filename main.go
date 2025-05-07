@@ -37,10 +37,12 @@ var (
 )
 
 const (
-	clrReset = "\033[0m"
-	clrSig   = "\033[36m" // cyan
-	clrOrd   = "\033[32m" // green
-	clrErr   = "\033[31m" // red
+	clrReset  = "\033[0m"
+	clrSig    = "\033[36m" // cyan
+	clrOrd    = "\033[32m" // green
+	clrErr    = "\033[31m" // red
+	slPerc    = 0.01       // Процент SL от TP (1%)
+	trailPerc = 0.005      // Процент трейлинг-стопа (0.5%)
 )
 
 func dbg(format string, v ...interface{}) {
@@ -230,13 +232,17 @@ func updatePositionTradingStop(posSide string, takeProfit, stopLoss float64) err
 
 // New function to update TP/SL via position trading-stop endpoint
 func updatePositionTPSL(symbol string, tp, sl float64) error {
+	exists, _, _, _, _ := hasOpenPosition()
+	if !exists {
+		return fmt.Errorf("no open position to update TP/SL")
+	}
 	const path = "/v5/position/trading-stop"
 	body := map[string]interface{}{
 		"category":    "linear",
 		"symbol":      symbol,
-		"takeProfit":  fmt.Sprintf("%.2f", tp), // Убрать /100
-		"stopLoss":    fmt.Sprintf("%.2f", sl), // Убрать /100
-		"positionIdx": 0,
+		"takeProfit":  fmt.Sprintf("%.2f", tp),
+		"stopLoss":    fmt.Sprintf("%.2f", sl),
+		"positionIdx": 0, // ❌ Нужно динамически определять positionIdx (0 для long, 1 для short)
 	}
 	raw, _ := json.Marshal(body)
 	dbg("Update TP/SL body: %s", raw)
@@ -567,38 +573,6 @@ func calcTakeProfitVoting(side string) float64 {
 	}
 }
 
-func calcStopLossATR(side string) float64 {
-	atr := calcATR(14)
-	if atr == 0 {
-		atr = 90
-	}
-	var sl float64
-	if side == "LONG" {
-		sl = getLastBidPrice() - atr*1.5 // Используйте "сырые" цены
-	} else if side == "SHORT" {
-		sl = getLastAskPrice() + atr*1.5
-	}
-	if instr.TickSize > 0 {
-		sl = math.Round(sl/instr.TickSize) * instr.TickSize // Уберите /100
-	}
-	dbg("[SL ATR Debug] ATR=%.2f | SL=%.2f", atr, sl)
-	return sl
-}
-
-func calcStopLossVoting(side string) float64 {
-	slBB := calcStopLossBB(side)
-	slATR := calcStopLossATR(side)
-	slVol := calcStopLossVolume(side, slThresholdQty)
-	switch side {
-	case "LONG":
-		return min(slBB, slATR, slVol)
-	case "SHORT":
-		return max(slBB, slATR, slVol)
-	default:
-		return 0
-	}
-}
-
 // ---------------------------------------------------------------------------
 // ========== 8. Take Profit Methods =========================================
 // ---------------------------------------------------------------------------
@@ -717,82 +691,6 @@ func calcTakeProfitVolume(side string, threshold float64) float64 {
 // ========== 9. Stop Loss Functions =========================================
 // ---------------------------------------------------------------------------
 
-func calcStopLossBB(side string) float64 {
-	if len(closes) < windowSize {
-		return 0
-	}
-	smaVal := sma(closes)
-	stdVal := stddev(closes)
-	var sl float64
-	if side == "LONG" {
-		sl = smaVal - bbMult*stdVal
-	} else if side == "SHORT" {
-		sl = smaVal + bbMult*stdVal
-	}
-	if instr.TickSize > 0 {
-		sl = math.Round(sl/instr.TickSize*100) / 100
-	}
-	return sl
-}
-
-func calcStopLossVolume(side string, threshold float64) float64 {
-	type lvl struct{ p, sz float64 }
-	obLock.Lock()
-	defer obLock.Unlock()
-	if side == "LONG" && len(bidsMap) > 0 {
-		var arr []lvl
-		for ps, sz := range bidsMap {
-			p, _ := strconv.ParseFloat(ps, 64)
-			arr = append(arr, lvl{p, sz})
-		}
-		sort.Slice(arr, func(i, j int) bool { return arr[i].p > arr[j].p })
-		cum := 0.0
-		for _, v := range arr {
-			cum += v.sz
-			if cum >= threshold {
-				sl := v.p * 0.99
-				if instr.TickSize > 0 {
-					sl = math.Round(sl/instr.TickSize) * instr.TickSize // Уберите *100
-				}
-				return sl
-			}
-		}
-		if len(arr) > 0 {
-			sl := arr[len(arr)-1].p * 0.99
-			if instr.TickSize > 0 {
-				sl = math.Round(sl/instr.TickSize) * instr.TickSize // Уберите *100
-			}
-			return sl
-		}
-	} else if side == "SHORT" && len(asksMap) > 0 {
-		var arr []lvl
-		for ps, sz := range asksMap {
-			p, _ := strconv.ParseFloat(ps, 64)
-			arr = append(arr, lvl{p, sz})
-		}
-		sort.Slice(arr, func(i, j int) bool { return arr[i].p < arr[j].p })
-		cum := 0.0
-		for _, v := range arr {
-			cum += v.sz
-			if cum >= threshold {
-				sl := v.p * 1.01
-				if instr.TickSize > 0 {
-					sl = math.Round(sl/instr.TickSize) * instr.TickSize // Уберите *100
-				}
-				return sl
-			}
-		}
-		if len(arr) > 0 {
-			sl := arr[0].p * 1.01
-			if instr.TickSize > 0 {
-				sl = math.Round(sl/instr.TickSize) * instr.TickSize // Уберите *100
-			}
-			return sl
-		}
-	}
-	return 0
-}
-
 // ---------------------------------------------------------------------------
 // ========== 10. getLastEntryPriceFromREST — получает цену входа из позиции =======
 // ---------------------------------------------------------------------------
@@ -843,26 +741,35 @@ func getLastEntryPriceFromREST() float64 {
 // ---------------------------------------------------------------------------
 // ========== 10. TP Worker =================================================
 // ---------------------------------------------------------------------------
+func normalizeSide(side string) string {
+	switch side {
+	case "Buy":
+		return "LONG"
+	case "buy":
+		return "LONG"
+	case "Sell":
+		return "SHORT"
+	case "sell":
+		return "SHORT"
+	case "LONG", "SHORT":
+		return side
+	default:
+		return ""
+	}
+}
 
 func tpWorker() {
 	for job := range tpChan {
-		if job.side != posSide {
-			dbg("Несовпадение стороны при установке TP: %s vs %s", job.side, posSide)
+		exists, side, qty, _, _ := hasOpenPosition() // Игнорируем TP/SL
+		if !exists || normalizeSide(job.side) != normalizeSide(side) || job.qty != qty {
+			dbg("Несовпадение стороны или количества при установке TP: %s vs %s", job.side, side)
 			continue
 		}
-
 		// Рассчитываем TP тремя способами:
-		// 1. Bollinger Bands (BB)
-		// 2. ATR (Average True Range)
-		// 3. Volume (объем в стакане)
 		tpBB := calcTakeProfitBB(job.side)
 		tpATR := calcTakeProfitATR(job.side)
 		tpVol := calcTakeProfitVolume(job.side, tpThresholdQty)
 		dbg("[TP Debug] BB=%.2f | ATR=%.2f | Volume=%.2f", tpBB, tpATR, tpVol)
-
-		// Выбираем финальный TP:
-		// - Для LONG: максимальное значение из трех вариантов
-		// - Для SHORT: минимальное значение из трех вариантов
 		var finalTP float64
 		switch job.side {
 		case "LONG":
@@ -873,8 +780,6 @@ func tpWorker() {
 			logErrorf("Неизвестная сторона: %s", job.side)
 			continue
 		}
-
-		// Если TP не определен → используем фиксированный отступ от цены входа
 		if finalTP == 0 || math.IsNaN(finalTP) {
 			entryPrice := job.entryPrice
 			if entryPrice == 0 {
@@ -891,19 +796,12 @@ func tpWorker() {
 			}
 			dbg("Fallback: использую фиксированный TP %.2f (entry %.2f)", finalTP, entryPrice)
 		}
-
 		dbg("[TP] BB=%.2f | ATR=%.2f | Volume=%.2f → Final TP=%.2f",
 			tpBB, tpATR, tpVol, finalTP)
-
-		// Сторона ордера должна быть противоположной позиции:
-		// - Для LONG → Sell
-		// - Для SHORT → Buy
 		orderSide := "Sell"
 		if job.side == "SHORT" {
 			orderSide = "Buy"
 		}
-
-		// Выставляем ордер TP
 		if err := placeTakeProfitOrder(orderSide, job.qty, finalTP); err != nil {
 			logErrorf("Ошибка выставления TP: %v", err)
 		}
@@ -939,9 +837,76 @@ func cancelCurrentOrders() {
 	log.Printf("Отменены все активные ордера перед обновлением позиции")
 }
 
+func hasOpenPosition() (bool, string, float64, float64, float64) {
+	const path = "/v5/position/list"
+	q := url.Values{}
+	q.Set("category", "linear")
+	q.Set("symbol", symbol)
+	ts := fmt.Sprintf("%d", time.Now().UnixMilli())
+	req, _ := http.NewRequest("GET", demoRESTHost+path+"?"+q.Encode(), nil)
+	// Установка заголовков запроса
+	req.Header.Set("X-BAPI-API-KEY", APIKey)
+	req.Header.Set("X-BAPI-TIMESTAMP", ts)
+	req.Header.Set("X-BAPI-RECV-WINDOW", recvWindow)
+	req.Header.Set("X-BAPI-SIGN-TYPE", "2")
+	req.Header.Set("X-BAPI-SIGN", signREST(APISecret, ts, APIKey, recvWindow, q.Encode()))
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		logErrorf("Failed to fetch position list: %v", err)
+		return false, "", 0, 0, 0
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	dbg("Raw position response: %s", body)
+
+	var r struct {
+		RetCode int `json:"retCode"`
+		Result  struct {
+			List []struct {
+				Side       string `json:"side"`
+				Size       string `json:"size"`
+				TakeProfit string `json:"takeProfit"` // Добавлено для получения TP
+				StopLoss   string `json:"stopLoss"`   // Добавлено для получения SL
+			} `json:"list"`
+		} `json:"result"`
+	}
+
+	if json.Unmarshal(body, &r) != nil || r.RetCode != 0 || len(r.Result.List) == 0 {
+		dbg("No open position or invalid response")
+		return false, "", 0, 0, 0
+	}
+
+	for _, res := range r.Result.List {
+		size, _ := strconv.ParseFloat(res.Size, 64)
+		if size > 0 {
+			// Обработка пустых значений TP/SL
+			if res.TakeProfit == "" {
+				res.TakeProfit = "0"
+			}
+			if res.StopLoss == "" {
+				res.StopLoss = "0"
+			}
+			tp, _ := strconv.ParseFloat(res.TakeProfit, 64)
+			sl, _ := strconv.ParseFloat(res.StopLoss, 64)
+			dbg("Найдена открытая позиция: %s %.4f | TP=%.2f | SL=%.2f", res.Side, size, tp, sl)
+			return true, res.Side, size, tp, sl
+		}
+	}
+	return false, "", 0, 0, 0
+}
+
 func openPosition(newSide string, price float64) {
+	// Синхронизация с биржей перед обработкой
+	exists, currentSide, currentQty, _, _ := hasOpenPosition()
+	if exists {
+		posSide = currentSide
+		orderQty = currentQty
+	} else {
+		posSide = ""
+		orderQty = 0
+	}
 	if posSide != "" && posSide != newSide && orderQty > 0 {
-		// Close opposite position
 		var reduce string
 		switch posSide {
 		case "LONG":
@@ -959,21 +924,35 @@ func openPosition(newSide string, price float64) {
 		posSide = ""
 		orderQty = 0
 	}
-
 	if posSide == newSide {
 		dbg("Updating TP/SL for existing position")
-		// Calculate new TP/SL without canceling orders
+		exists, _, _, _, _ := hasOpenPosition()
+		if !exists {
+			logErrorf("Cannot update TP/SL: no open position")
+			posSide = ""
+			orderQty = 0
+			return
+		}
 		tp := calcTakeProfitVoting(newSide)
-		sl := calcStopLossVoting(newSide)
-
-		if tp > 0 && !math.IsNaN(tp) && sl > 0 && !math.IsNaN(sl) {
-			if err := updatePositionTPSL(symbol, tp, sl); err != nil {
-				logErrorf("Failed to update TP/SL: %v", err)
+		slPerc := slOffset // 1% от TP
+		if newSide == "LONG" {
+			sl := tp * (1 - slPerc)
+			if tp > 0 && !math.IsNaN(tp) && sl > 0 && !math.IsNaN(sl) {
+				if err := updatePositionTPSL(symbol, tp, sl); err != nil {
+					logErrorf("Failed to update TP/SL: %v", err)
+				}
+			}
+		} else {
+			sl := tp * (1 + slPerc)
+			if tp > 0 && !math.IsNaN(tp) && sl > 0 && !math.IsNaN(sl) {
+				if err := updatePositionTPSL(symbol, tp, sl); err != nil {
+					logErrorf("Failed to update TP/SL: %v", err)
+				}
 			}
 		}
 		return
 	}
-
+	// Открытие новой позиции
 	balUSDT, err := getBalanceREST("USDT")
 	if err != nil {
 		logErrorf("Balance error: %v", err)
@@ -1021,7 +1000,13 @@ func openPosition(newSide string, price float64) {
 	tpChan <- job
 	go func() {
 		tp := calcTakeProfitVoting(newSide)
-		sl := calcStopLossVoting(newSide)
+		slPerc := slOffset // 1% от TP
+		var sl float64
+		if newSide == "LONG" {
+			sl = tp * (1 - slPerc)
+		} else {
+			sl = tp * (1 + slPerc)
+		}
 		if tp > 0 && !math.IsNaN(tp) {
 			placeTakeProfitOrder(newSide, qty, tp)
 		}
@@ -1029,6 +1014,53 @@ func openPosition(newSide string, price float64) {
 			placeStopLossOrder(newSide, qty, sl)
 		}
 	}()
+}
+
+func syncPositionRealTime() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			exists, side, qty, currentTP, currentSL := hasOpenPosition()
+			if exists {
+				dbg("Синхронизация позиции: %s | %.4f | TP=%.2f | SL=%.2f", side, qty, currentTP, currentSL)
+				posSide = side
+				orderQty = qty
+				entryPrice := getLastEntryPriceFromREST()
+				if entryPrice > 0 {
+					currentPrice := 0.0
+					if side == "LONG" {
+						currentPrice = getLastBidPrice()
+					} else {
+						currentPrice = getLastAskPrice()
+					}
+					trailPerc := 0.005 // 0.5% трейлинг-стоп
+					newSl := 0.0
+					if side == "LONG" {
+						if currentPrice > entryPrice*(1+trailPerc) {
+							newSl = currentPrice * (1 - trailPerc)
+						}
+					} else {
+						if currentPrice < entryPrice*(1-trailPerc) {
+							newSl = currentPrice * (1 + trailPerc)
+						}
+					}
+					if newSl > 0 {
+						if err := updatePositionTPSL(symbol, currentTP, newSl); err != nil {
+							logErrorf("Failed to update trailing SL: %v", err)
+						} else {
+							logOrderf("Trailing SL updated to %.2f", newSl)
+						}
+					}
+				}
+			} else {
+				dbg("Позиция закрыта. Обновление локального состояния.")
+				posSide = ""
+				orderQty = 0
+			}
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1178,7 +1210,12 @@ func connectPrivateWS() (*websocket.Conn, error) {
 		return nil, err
 	}
 	ws.ReadMessage() // auth ack
-	if err := ws.WriteJSON(map[string]interface{}{"op": "subscribe", "args": []string{"wallet"}}); err != nil {
+
+	// Подписываемся на позиции и кошелек
+	if err := ws.WriteJSON(map[string]interface{}{
+		"op":   "subscribe",
+		"args": []string{"wallet", "position"}, // ← Добавили "position"
+	}); err != nil {
 		ws.Close()
 		return nil, err
 	}
@@ -1218,6 +1255,32 @@ func walletListener(ws *websocket.Conn, out chan<- []byte, done chan<- struct{})
 			ws.Close()
 			done <- struct{}{}
 			return
+		}
+		var peek struct {
+			Topic string `json:"topic"`
+		}
+		if json.Unmarshal(msg, &peek) == nil {
+			if peek.Topic == "position" {
+				dbg("Получено обновление позиции: %s", string(msg))
+				var posUpdate struct {
+					Data struct {
+						Side string `json:"side"`
+						Size string `json:"size"`
+					} `json:"data"`
+				}
+				if json.Unmarshal(msg, &posUpdate) == nil {
+					size, _ := strconv.ParseFloat(posUpdate.Data.Size, 64)
+					if size > 0 {
+						posSide = normalizeSide(posUpdate.Data.Side)
+						orderQty = size
+						dbg("Обновлено: %s %.4f", posSide, orderQty)
+					} else {
+						posSide = ""
+						orderQty = 0
+						dbg("Позиция закрыта через вебсокет")
+					}
+				}
+			}
 		}
 		out <- msg
 	}
@@ -1290,6 +1353,8 @@ func main() {
 	}()
 
 	go tpWorker()
+
+	go syncPositionRealTime()
 
 	for {
 	drainWallet:
