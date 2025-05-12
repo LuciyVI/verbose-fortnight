@@ -1370,11 +1370,11 @@ func smaWorker() {
         // Условия с гистерезисом
         if cls < smaVal*(1-hysteresis) && isGoldenCross() {
             dbg("Сигнал LONG: Close < SMA*(1-hysteresis) и Golden Cross")
-            sigChan <- Signal{"SMA_LONG", cls, time.Now()}
+            sigChan <- Signal{"STRATEGY_LONG", cls, time.Now()}
         }
         if cls > smaVal*(1+hysteresis) && isGoldenCross() {
             dbg("Сигнал SHORT: Close > SMA*(1+hysteresis) и Golden Cross")
-            sigChan <- Signal{"SMA_SHORT", cls, time.Now()}
+            sigChan <- Signal{"STRATEGY_SHORT", cls, time.Now()}
         }
     }
 }
