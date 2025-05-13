@@ -1314,18 +1314,18 @@ func checkOrderbookStrength(side string) bool {
 
     // Адаптивные пороги в зависимости от рыночного режима
     if marketRegime == "trend" {
-        if side == "LONG" && bidDepth/askDepth > 1.1 {
+        if side == "LONG" && bidDepth/askDepth > 1.3 {
             dbg("Тренд: сигнал LONG подтверждён")
             return true
-        } else if side == "SHORT" && askDepth/bidDepth > 1.1 {
+        } else if side == "SHORT" && askDepth/bidDepth > 1.3 {
             dbg("Тренд: сигнал SHORT подтверждён")
             return true
         }
     } else if marketRegime == "range" {
-        if side == "LONG" && bidDepth/askDepth > 1.1 {
+        if side == "LONG" && bidDepth/askDepth > 1.3 {
             dbg("Диапазон: сигнал LONG подтверждён")
             return true
-        } else if side == "SHORT" && askDepth/bidDepth > 1.1 {
+        } else if side == "SHORT" && askDepth/bidDepth > 1.3 {
             dbg("Диапазон: сигнал SHORT подтверждён")
             return true
         }
