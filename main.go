@@ -13,12 +13,13 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-	"sort"
+
 	"github.com/gorilla/websocket"
 )
 
@@ -42,7 +43,7 @@ const (
 	slPerc    = 0.01       // Процент SL от TP (1%)
 	trailPerc = 0.005      // Процент трейлинг-стопа (0.5%)
 	smaLen    = 20         // окно для SMA-воркера
-	 
+
 )
 
 func dbg(format string, v ...interface{}) {
@@ -628,8 +629,6 @@ func min(a, b, c float64) float64 {
 	return math.Min(math.Min(a, b), c)
 }
 
-
-
 func getLastAskPrice() float64 {
 	obLock.Lock()
 	defer obLock.Unlock()
@@ -655,7 +654,6 @@ func getLastBidPrice() float64 {
 	}
 	return min
 }
-
 
 func getLastEntryPriceFromREST() float64 {
 	const path = "/v5/position/list"
@@ -1118,21 +1116,22 @@ func syncPositionRealTime() {
 // ========== onClosedCandle (c выводом заполнения буфера) ===================
 // ---------------------------------------------------------------------------
 func onClosedCandle(closePrice float64) {
-    closes = append(closes, closePrice)
-    highs = append(highs, closePrice)
-    lows = append(lows, closePrice)
+	closes = append(closes, closePrice)
+	highs = append(highs, closePrice)
+	lows = append(lows, closePrice)
 
-    // Логирование для отладки
-    log.Printf("Добавлена цена: %.2f, длина closes: %d", closePrice, len(closes))
+	// Логирование для отладки
+	log.Printf("Добавлена цена: %.2f, длина closes: %d", closePrice, len(closes))
 
-    // Увеличьте maxLen, чтобы избежать обрезки данных
-    maxLen := smaLen * 100 // Старое значение: smaLen * 10
-    if len(closes) > maxLen {
-        closes = closes[len(closes)-maxLen:]
-        highs = highs[len(highs)-maxLen:]
-        lows = lows[len(lows)-maxLen:]
-    }
+	// Увеличьте maxLen, чтобы избежать обрезки данных
+	maxLen := smaLen * 100 // Старое значение: smaLen * 10
+	if len(closes) > maxLen {
+		closes = closes[len(closes)-maxLen:]
+		highs = highs[len(highs)-maxLen:]
+		lows = lows[len(lows)-maxLen:]
+	}
 }
+
 // ---------------------------------------------------------------------------
 // ========== 13. WebSocket Handlers =========================================
 // ---------------------------------------------------------------------------
@@ -1298,39 +1297,39 @@ func reconnectPublic(klineTopic, obTopic string) (*websocket.Conn, error) {
 }
 
 func checkOrderbookStrength(side string) bool {
-    obLock.Lock()
-    defer obLock.Unlock()
+	obLock.Lock()
+	defer obLock.Unlock()
 
-    var bidDepth, askDepth float64
-    for _, size := range bidsMap {
-        bidDepth += size
-    }
-    for _, size := range asksMap {
-        askDepth += size
-    }
+	var bidDepth, askDepth float64
+	for _, size := range bidsMap {
+		bidDepth += size
+	}
+	for _, size := range asksMap {
+		askDepth += size
+	}
 
-    // Логируем объемы ордербука
-    dbg("Bid Depth: %.2f, Ask Depth: %.2f", bidDepth, askDepth)
+	// Логируем объемы ордербука
+	dbg("Bid Depth: %.2f, Ask Depth: %.2f", bidDepth, askDepth)
 
-    // Адаптивные пороги в зависимости от рыночного режима
-    if marketRegime == "trend" {
-        if side == "LONG" && bidDepth/askDepth > 1.3 {
-            dbg("Тренд: сигнал LONG подтверждён")
-            return true
-        } else if side == "SHORT" && askDepth/bidDepth > 1.3 {
-            dbg("Тренд: сигнал SHORT подтверждён")
-            return true
-        }
-    } else if marketRegime == "range" {
-        if side == "LONG" && bidDepth/askDepth > 1.3 {
-            dbg("Диапазон: сигнал LONG подтверждён")
-            return true
-        } else if side == "SHORT" && askDepth/bidDepth > 1.3 {
-            dbg("Диапазон: сигнал SHORT подтверждён")
-            return true
-        }
-    }
-    return false
+	// Адаптивные пороги в зависимости от рыночного режима
+	if marketRegime == "trend" {
+		if side == "LONG" && bidDepth/askDepth > 1.3 {
+			dbg("Тренд: сигнал LONG подтверждён")
+			return true
+		} else if side == "SHORT" && askDepth/bidDepth > 1.3 {
+			dbg("Тренд: сигнал SHORT подтверждён")
+			return true
+		}
+	} else if marketRegime == "range" {
+		if side == "LONG" && bidDepth/askDepth > 1.3 {
+			dbg("Диапазон: сигнал LONG подтверждён")
+			return true
+		} else if side == "SHORT" && askDepth/bidDepth > 1.3 {
+			dbg("Диапазон: сигнал SHORT подтверждён")
+			return true
+		}
+	}
+	return false
 }
 
 // Получает текущий блокрейт (награду за блок)
@@ -1339,179 +1338,178 @@ func getCurrentBlockReward() float64 {
 	return 3.125
 }
 
-
 func smaWorker() {
-    const (
-        smaLen     = 20
-    )
+	const (
+		smaLen = 20
+	)
 	var hysteresis = 0.005 // 0.5%
-    for range time.Tick(1 * time.Second) {
-        closesCopy := append([]float64(nil), closes...)
-        if len(closesCopy) < smaLen {
-            log.Printf("Недостаточно данных для SMA (требуется %d, получено %d)", smaLen, len(closesCopy))
-            continue
-        }
+	for range time.Tick(1 * time.Second) {
+		closesCopy := append([]float64(nil), closes...)
+		if len(closesCopy) < smaLen {
+			log.Printf("Недостаточно данных для SMA (требуется %d, получено %d)", smaLen, len(closesCopy))
+			continue
+		}
 
-        smaVal := sma(closesCopy)
-        cls := closesCopy[len(closesCopy)-1]
-        
+		smaVal := sma(closesCopy)
+		cls := closesCopy[len(closesCopy)-1]
 
-        // Логируем ключевые значения
-        dbg("SMA: %.2f, Close: %.2f, MarketRegime: %s", smaVal, cls,  marketRegime)
+		// Логируем ключевые значения
+		dbg("SMA: %.2f, Close: %.2f, MarketRegime: %s", smaVal, cls, marketRegime)
 
-        // Адаптируем гистерезис в зависимости от рыночного режима
-        if marketRegime == "trend" {
-            hysteresis = 0.01 // Более широкий гистерезис в тренде
-        } else {
-            hysteresis = 0.005 // Стандартный гистерезис в диапазоне
-        }
-        dbg("Гистерезис: %.2f", hysteresis)
+		// Адаптируем гистерезис в зависимости от рыночного режима
+		if marketRegime == "trend" {
+			hysteresis = 0.01 // Более широкий гистерезис в тренде
+		} else {
+			hysteresis = 0.005 // Стандартный гистерезис в диапазоне
+		}
+		dbg("Гистерезис: %.2f", hysteresis)
 
-        // Условия с гистерезисом
-        if cls < smaVal*(1-hysteresis) && isGoldenCross() {
-            dbg("Сигнал LONG: Close < SMA*(1-hysteresis) и Golden Cross")
-            sigChan <- Signal{"STRATEGY_LONG", cls, time.Now()}
-        }
-        if cls > smaVal*(1+hysteresis) && isGoldenCross() {
-            dbg("Сигнал SHORT: Close > SMA*(1+hysteresis) и Golden Cross")
-            sigChan <- Signal{"STRATEGY_SHORT", cls, time.Now()}
-        }
-    }
+		// Условия с гистерезисом
+		if cls < smaVal*(1-hysteresis) && isGoldenCross() {
+			dbg("Сигнал LONG: Close < SMA*(1-hysteresis) и Golden Cross")
+			sigChan <- Signal{"SMA_LONG", cls, time.Now()}
+		}
+		if cls > smaVal*(1+hysteresis) && isGoldenCross() {
+			dbg("Сигнал SHORT: Close > SMA*(1+hysteresis) и Golden Cross")
+			sigChan <- Signal{"SMA_SHORT", cls, time.Now()}
+		}
+	}
 }
+
 // Расчет TP на основе ATR
 func calcTakeProfitATR(side string) float64 {
-    atr := calcATR(14)
-    if atr == 0 {
-        atr = 90
-    }
+	atr := calcATR(14)
+	if atr == 0 {
+		atr = 90
+	}
 
-    var tp float64
-    if side == "LONG" {
-        tp = getLastAskPrice() + atr*1.5
-    } else if side == "SHORT" {
-        tp = getLastBidPrice() - atr*1.5
-    }
+	var tp float64
+	if side == "LONG" {
+		tp = getLastAskPrice() + atr*1.5
+	} else if side == "SHORT" {
+		tp = getLastBidPrice() - atr*1.5
+	}
 
-    if instr.TickSize > 0 {
-        tp = math.Round(tp/instr.TickSize) * instr.TickSize
-    }
-    return tp
+	if instr.TickSize > 0 {
+		tp = math.Round(tp/instr.TickSize) * instr.TickSize
+	}
+	return tp
 }
 
 func calcTakeProfitBB(side string) float64 {
-    if len(closes) < windowSize {
-        return 0
-    }
-    smaVal := sma(closes)
-    stdVal := stddev(closes)
-    var tp float64
-    if side == "LONG" {
-        tp = smaVal + bbMult*stdVal
-    } else if side == "SHORT" {
-        tp = smaVal - bbMult*stdVal
-    }
-    if instr.TickSize > 0 {
-        tp = math.Round(tp/instr.TickSize) * instr.TickSize
-    }
-    return tp
+	if len(closes) < windowSize {
+		return 0
+	}
+	smaVal := sma(closes)
+	stdVal := stddev(closes)
+	var tp float64
+	if side == "LONG" {
+		tp = smaVal + bbMult*stdVal
+	} else if side == "SHORT" {
+		tp = smaVal - bbMult*stdVal
+	}
+	if instr.TickSize > 0 {
+		tp = math.Round(tp/instr.TickSize) * instr.TickSize
+	}
+	return tp
 }
 
 // Расчет TP на основе объема
 func calcTakeProfitVolume(side string, thresholdQty float64) float64 {
-    obLock.Lock()
-    defer obLock.Unlock()
-    var arr []struct{ p, sz float64 }
+	obLock.Lock()
+	defer obLock.Unlock()
+	var arr []struct{ p, sz float64 }
 
-    if side == "LONG" && len(asksMap) > 0 {
-        for ps, sz := range asksMap {
-            p, _ := strconv.ParseFloat(ps, 64)
-            arr = append(arr, struct{ p, sz float64 }{p, sz})
-        }
-        sort.Slice(arr, func(i, j int) bool { return arr[i].p < arr[j].p })
-        cum := 0.0
-        for _, v := range arr {
-            cum += v.sz
-            if cum >= thresholdQty {
-                tp := v.p * 0.9995
-                if instr.TickSize > 0 {
-                    tp = math.Round(tp/instr.TickSize) * instr.TickSize
-                }
-                return tp
-            }
-        }
-        if len(arr) > 0 {
-            tp := arr[len(arr)-1].p * 1.0005
-            if instr.TickSize > 0 {
-                tp = math.Round(tp/instr.TickSize) * instr.TickSize
-            }
-            return tp
-        }
-    } else if side == "SHORT" && len(bidsMap) > 0 {
-        for ps, sz := range bidsMap {
-            p, _ := strconv.ParseFloat(ps, 64)
-            arr = append(arr, struct{ p, sz float64 }{p, sz})
-        }
-        sort.Slice(arr, func(i, j int) bool { return arr[i].p > arr[j].p })
-        cum := 0.0
-        for _, v := range arr {
-            cum += v.sz
-            if cum >= thresholdQty {
-                tp := v.p * 0.9995
-                if instr.TickSize > 0 {
-                    tp = math.Round(tp/instr.TickSize) * instr.TickSize
-                }
-                return tp
-            }
-        }
-        if len(arr) > 0 {
-            tp := arr[0].p * 0.9995
-            if instr.TickSize > 0 {
-                tp = math.Round(tp/instr.TickSize) * instr.TickSize
-            }
-            return tp
-        }
-    }
-    return 0
+	if side == "LONG" && len(asksMap) > 0 {
+		for ps, sz := range asksMap {
+			p, _ := strconv.ParseFloat(ps, 64)
+			arr = append(arr, struct{ p, sz float64 }{p, sz})
+		}
+		sort.Slice(arr, func(i, j int) bool { return arr[i].p < arr[j].p })
+		cum := 0.0
+		for _, v := range arr {
+			cum += v.sz
+			if cum >= thresholdQty {
+				tp := v.p * 0.9995
+				if instr.TickSize > 0 {
+					tp = math.Round(tp/instr.TickSize) * instr.TickSize
+				}
+				return tp
+			}
+		}
+		if len(arr) > 0 {
+			tp := arr[len(arr)-1].p * 1.0005
+			if instr.TickSize > 0 {
+				tp = math.Round(tp/instr.TickSize) * instr.TickSize
+			}
+			return tp
+		}
+	} else if side == "SHORT" && len(bidsMap) > 0 {
+		for ps, sz := range bidsMap {
+			p, _ := strconv.ParseFloat(ps, 64)
+			arr = append(arr, struct{ p, sz float64 }{p, sz})
+		}
+		sort.Slice(arr, func(i, j int) bool { return arr[i].p > arr[j].p })
+		cum := 0.0
+		for _, v := range arr {
+			cum += v.sz
+			if cum >= thresholdQty {
+				tp := v.p * 0.9995
+				if instr.TickSize > 0 {
+					tp = math.Round(tp/instr.TickSize) * instr.TickSize
+				}
+				return tp
+			}
+		}
+		if len(arr) > 0 {
+			tp := arr[0].p * 0.9995
+			if instr.TickSize > 0 {
+				tp = math.Round(tp/instr.TickSize) * instr.TickSize
+			}
+			return tp
+		}
+	}
+	return 0
 }
 
 // Смешанный расчет TP
 func calcTakeProfitVoting(side string) float64 {
-    tpBB := calcTakeProfitBB(side)
-    tpATR := calcTakeProfitATR(side)
-    tpVol := calcTakeProfitVolume(side, tpThresholdQty)
+	tpBB := calcTakeProfitBB(side)
+	tpATR := calcTakeProfitATR(side)
+	tpVol := calcTakeProfitVolume(side, tpThresholdQty)
 
-    switch side {
-    case "LONG":
-        return math.Max(math.Max(tpBB, tpATR), tpVol)
-    case "SHORT":
-        return math.Min(math.Min(tpBB, tpATR), tpVol)
-    default:
-        return 0
-    }
+	switch side {
+	case "LONG":
+		return math.Max(math.Max(tpBB, tpATR), tpVol)
+	case "SHORT":
+		return math.Min(math.Min(tpBB, tpATR), tpVol)
+	default:
+		return 0
+	}
 }
 
 // ---------------------------------------------------------------------------
 // 3w. Исполнитель сигналов (одна горутина), ответственная за ордера
 // ---------------------------------------------------------------------------
 func trader() {
-    signalStrength := make(map[string]int)
-    for sig := range sigChan {
-        signalStrength[sig.Kind]++
+	signalStrength := make(map[string]int)
+	for sig := range sigChan {
+		signalStrength[sig.Kind]++
 
-        // Логируем силу сигнала
-        dbg("Сила сигнала: %v", signalStrength)
+		// Логируем силу сигнала
+		dbg("Сила сигнала: %v", signalStrength)
 
-        // Подтверждение от нескольких индикаторов
-        if (signalStrength["SMA_LONG"] >= 2) && checkOrderbookStrength("LONG") {
-            dbg("Подтверждён сигнал LONG: %d индикаторов", signalStrength["SMA_LONG"])
-            handleLongSignal(sig.ClosePrice)
-            resetSignalStrength(&signalStrength)
-        } else if (signalStrength["SMA_SHORT"] >= 2) && checkOrderbookStrength("SHORT") {
-            dbg("Подтверждён сигнал SHORT: %d индикаторов", signalStrength["SMA_SHORT"])
-            handleShortSignal(sig.ClosePrice)
-            resetSignalStrength(&signalStrength)
-        }
-    }
+		// Подтверждение от нескольких индикаторов
+		if (signalStrength["SMA_LONG"] >= 2) && checkOrderbookStrength("LONG") {
+			dbg("Подтверждён сигнал LONG: %d индикаторов", signalStrength["SMA_LONG"])
+			handleLongSignal(sig.ClosePrice)
+			resetSignalStrength(&signalStrength)
+		} else if (signalStrength["SMA_SHORT"] >= 2) && checkOrderbookStrength("SHORT") {
+			dbg("Подтверждён сигнал SHORT: %d индикаторов", signalStrength["SMA_SHORT"])
+			handleShortSignal(sig.ClosePrice)
+			resetSignalStrength(&signalStrength)
+		}
+	}
 }
 
 func resetSignalStrength(m *map[string]int) {
@@ -1561,151 +1559,151 @@ func logSignalStats() {
 	log.Printf("Signal stats: %d/%d (%.1f%%)", correct, total, accuracy)
 }
 
-
 func calcEMA(src []float64, period int) float64 {
-    if len(src) < period {
-        dbg("Недостаточно данных для EMA (требуется %d, получено %d)", period, len(src))
-        return 0
-    }
+	if len(src) < period {
+		dbg("Недостаточно данных для EMA (требуется %d, получено %d)", period, len(src))
+		return 0
+	}
 
-    multiplier := 2.0 / float64(period+1)
-    ema := src[0]
-    for i := 1; i < len(src); i++ {
-        ema = (src[i] * multiplier) + (ema * (1 - multiplier))
-    }
+	multiplier := 2.0 / float64(period+1)
+	ema := src[0]
+	for i := 1; i < len(src); i++ {
+		ema = (src[i] * multiplier) + (ema * (1 - multiplier))
+	}
 
-    // Логируем EMA
-    dbg("Рассчитанная EMA для %d периодов: %.2f", period, ema)
-    return ema
+	// Логируем EMA
+	dbg("Рассчитанная EMA для %d периодов: %.2f", period, ema)
+	return ema
 }
 
 // Расчёт MACD (Moving Average Convergence Divergence)
 var macdHistory []float64
 
 func calcMACD(src []float64) (macdLine, signalLine float64) {
-    if len(src) < 26 {
-        dbg("Недостаточно данных для EMA (требуется 26, получено %d)", len(src))
-        return 0, 0
-    }
+	if len(src) < 26 {
+		dbg("Недостаточно данных для EMA (требуется 26, получено %d)", len(src))
+		return 0, 0
+	}
 
-    ema12 := calcEMA(src, 12)
-    ema26 := calcEMA(src, 26)
-    macdLine = ema12 - ema26
+	ema12 := calcEMA(src, 12)
+	ema26 := calcEMA(src, 26)
+	macdLine = ema12 - ema26
 
-    // Логируем EMA12 и EMA26
-    dbg("EMA12: %.2f, EMA26: %.2f", ema12, ema26)
+	// Логируем EMA12 и EMA26
+	dbg("EMA12: %.2f, EMA26: %.2f", ema12, ema26)
 
-    macdHistory = append(macdHistory, macdLine)
-    if len(macdHistory) > 9 {
-        macdHistory = macdHistory[1:]
-    }
+	macdHistory = append(macdHistory, macdLine)
+	if len(macdHistory) > 9 {
+		macdHistory = macdHistory[1:]
+	}
 
-    // Рассчитываем сигнальную линию (EMA9)
-    signalLine = calcEMA(macdHistory, 9)
+	// Рассчитываем сигнальную линию (EMA9)
+	signalLine = calcEMA(macdHistory, 9)
 
-    // Логируем MACD и сигнальную линию
-    dbg("MACD: %.2f, Signal: %.2f", macdLine, signalLine)
-    return macdLine, signalLine
+	// Логируем MACD и сигнальную линию
+	dbg("MACD: %.2f, Signal: %.2f", macdLine, signalLine)
+	return macdLine, signalLine
 }
 
 var trendThreshold = 3.0 // 3% за 50 свечей
 
 func detectMarketRegime() {
-    // Лог: Проверка длины closes
-    dbg("detectMarketRegime: Длина closes = %d", len(closes))
+	// Лог: Проверка длины closes
+	dbg("detectMarketRegime: Длина closes = %d", len(closes))
 
-    // Проверка, достаточно ли данных для анализа
-    if len(closes) < 50 {
-        dbg("detectMarketRegime: Недостаточно данных для определения рыночного режима (требуется 50, получено %d)", len(closes))
-        return
-    }
+	// Проверка, достаточно ли данных для анализа
+	if len(closes) < 50 {
+		dbg("detectMarketRegime: Недостаточно данных для определения рыночного режима (требуется 50, получено %d)", len(closes))
+		return
+	}
 
-    // Лог: Извлечение последних 50 свечей
-    recent := closes[len(closes)-50:]
-    dbg("detectMarketRegime: Последние 50 свечей: %v", recent)
+	// Лог: Извлечение последних 50 свечей
+	recent := closes[len(closes)-50:]
+	dbg("detectMarketRegime: Последние 50 свечей: %v", recent)
 
-    // Расчет максимальной и минимальной цены
-    maxHigh := maxSlice(recent)
-    minLow := minSlice(recent)
-    dbg("detectMarketRegime: maxHigh = %.2f, minLow = %.2f", maxHigh, minLow)
+	// Расчет максимальной и минимальной цены
+	maxHigh := maxSlice(recent)
+	minLow := minSlice(recent)
+	dbg("detectMarketRegime: maxHigh = %.2f, minLow = %.2f", maxHigh, minLow)
 
-    // Расчет диапазона в процентах
-    rangePerc := (maxHigh - minLow) / minLow * 100
-    dbg("detectMarketRegime: Рыночный диапазон: %.2f%% (max: %.2f, min: %.2f)", rangePerc, maxHigh, minLow)
+	// Расчет диапазона в процентах
+	rangePerc := (maxHigh - minLow) / minLow * 100
+	dbg("detectMarketRegime: Рыночный диапазон: %.2f%% (max: %.2f, min: %.2f)", rangePerc, maxHigh, minLow)
 
-    // Определение рыночного режима
-    if rangePerc > trendThreshold {
-        marketRegime = "trend"
-        dbg("detectMarketRegime: Рыночный режим: Тренд (rangePerc = %.2f%% > %.1f%%)", rangePerc, trendThreshold)
-    } else {
-        marketRegime = "range"
-        dbg("detectMarketRegime: Рыночный режим: Диапазон (rangePerc = %.2f%% <= %.1f%%)", rangePerc, trendThreshold)
-    }
+	// Определение рыночного режима
+	if rangePerc > trendThreshold {
+		marketRegime = "trend"
+		dbg("detectMarketRegime: Рыночный режим: Тренд (rangePerc = %.2f%% > %.1f%%)", rangePerc, trendThreshold)
+	} else {
+		marketRegime = "range"
+		dbg("detectMarketRegime: Рыночный режим: Диапазон (rangePerc = %.2f%% <= %.1f%%)", rangePerc, trendThreshold)
+	}
 }
 
 func handleLongSignal(closePrice float64) {
-    exists, side, _, _, _ := hasOpenPosition()
-    side = normalizeSide(side)
-    newSide := normalizeSide("LONG")
+	exists, side, _, _, _ := hasOpenPosition()
+	side = normalizeSide(side)
+	newSide := normalizeSide("LONG")
 
-    dbg("Проверка позиции: exists=%v, side=%s", exists, side)
+	dbg("Проверка позиции: exists=%v, side=%s", exists, side)
 
-    if !exists {
-        dbg("Нет открытой позиции, открываем LONG")
-        openPosition(newSide, closePrice)
-    } else if side == newSide {
-        dbg("Позиция уже LONG, обновляем TP/SL")
-        adjustTPSL(closePrice)
-    } else {
-        dbg("Смена стороны с %s на %s", side, newSide)
-        openPosition(newSide, closePrice)
-    }
+	if !exists {
+		dbg("Нет открытой позиции, открываем LONG")
+		openPosition(newSide, closePrice)
+	} else if side == newSide {
+		dbg("Позиция уже LONG, обновляем TP/SL")
+		adjustTPSL(closePrice)
+	} else {
+		dbg("Смена стороны с %s на %s", side, newSide)
+		openPosition(newSide, closePrice)
+	}
 }
 
 func handleShortSignal(closePrice float64) {
-    exists, side, _, _, _ := hasOpenPosition()
-    if !exists {
-        dbg("Нет открытой позиции, открываем SHORT")
-        openPosition("SHORT", closePrice)
-    } else if side == "SHORT" {
-        dbg("Позиция уже SHORT, обновляем TP/SL")
-        adjustTPSLForShort(closePrice)
-    } else {
-        dbg("Смена стороны с %s на SHORT", side)
-        openPosition("SHORT", closePrice)
-    }
+	exists, side, _, _, _ := hasOpenPosition()
+	if !exists {
+		dbg("Нет открытой позиции, открываем SHORT")
+		openPosition("SHORT", closePrice)
+	} else if side == "SHORT" {
+		dbg("Позиция уже SHORT, обновляем TP/SL")
+		adjustTPSLForShort(closePrice)
+	} else {
+		dbg("Смена стороны с %s на SHORT", side)
+		openPosition("SHORT", closePrice)
+	}
 }
 func isGoldenCross() bool {
-    if len(closes) < 27 {
-        dbg("Недостаточно данных для MACD (требуется 27, получено %d)", len(closes))
-        return false
-    }
+	if len(closes) < 27 {
+		dbg("Недостаточно данных для MACD (требуется 27, получено %d)", len(closes))
+		return false
+	}
 
-    prevData := closes[len(closes)-27:]   // 27 элементов
-    currData := closes[len(closes)-26:]   // 26 элементов
+	prevData := closes[len(closes)-27:] // 27 элементов
+	currData := closes[len(closes)-26:] // 26 элементов
 
-    prevMacd, prevSignal := calcMACD(prevData)
-    currMacd, currSignal := calcMACD(currData)
+	prevMacd, prevSignal := calcMACD(prevData)
+	currMacd, currSignal := calcMACD(currData)
 
-    // Логируем значения MACD и сигнальной линии
-    dbg("Предыдущий MACD: %.2f, Сигнал: %.2f", prevMacd, prevSignal)
-    dbg("Текущий MACD: %.2f, Сигнал: %.2f", currMacd, currSignal)
+	// Логируем значения MACD и сигнальной линии
+	dbg("Предыдущий MACD: %.2f, Сигнал: %.2f", prevMacd, prevSignal)
+	dbg("Текущий MACD: %.2f, Сигнал: %.2f", currMacd, currSignal)
 
-    // Проверка на нулевые значения
-    if prevMacd == 0 || prevSignal == 0 || currMacd == 0 || currSignal == 0 {
-        dbg("Нулевые значения MACD, игнорируем сигнал")
-        return false
-    }
+	// Проверка на нулевые значения
+	if prevMacd == 0 || prevSignal == 0 || currMacd == 0 || currSignal == 0 {
+		dbg("Нулевые значения MACD, игнорируем сигнал")
+		return false
+	}
 
-    // Логируем условие золотого кросса
-    if prevMacd < prevSignal && currMacd > currSignal {
-        dbg("Золотой кросс обнаружен: MACD пересек сигнал снизу вверх")
-        return true
-    } else {
-        dbg("Золотой кросс не обнаружен")
-        return false
-    }
+	// Логируем условие золотого кросса
+	if prevMacd < prevSignal && currMacd > currSignal {
+		dbg("Золотой кросс обнаружен: MACD пересек сигнал снизу вверх")
+		return true
+	} else {
+		dbg("Золотой кросс не обнаружен")
+		return false
+	}
 }
+
 // ---------------------------------------------------------------------------
 // ========== 16. MAIN (полная версия, запускает индикаторные горутины) ======
 // ---------------------------------------------------------------------------
@@ -1774,12 +1772,10 @@ func main() {
 	}()
 
 	// ---------- 6. Индикаторные горутины ------------------------------------
-	
+
 	go smaWorker() // сигнал по SMA
 	go trader()    // исполняет вход / пересчёт TP-SL
 	go syncPositionRealTime()
-
-
 
 	// ---------- 8. Логирование статистики сигналов ------------------------
 	go func() {
