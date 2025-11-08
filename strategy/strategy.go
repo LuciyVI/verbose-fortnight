@@ -56,31 +56,20 @@ func (t *Trader) TPWorker() {
 			continue
 		}
 		
-		// Calculate TP using multiple methods:
-		t.Logger.Debug("Calculating TP using Bollinger Bands...")
-		tpBB := t.OrderManager.CalculateTakeProfitBB(job.Side)
-		t.Logger.Debug("TP using Bollinger Bands: %.2f", tpBB)
-		
-		t.Logger.Debug("Calculating TP using ATR...")
-		tpATR := t.OrderManager.CalculateTakeProfitATR(job.Side)
-		t.Logger.Debug("TP using ATR: %.2f", tpATR)
-		
-		t.Logger.Debug("Calculating TP using volume levels...")
-		tpVol := t.OrderManager.CalculateTakeProfitVolume(job.Side, t.Config.TpThresholdQty)
-		t.Logger.Debug("TP using volume levels: %.2f", tpVol)
-		
-		t.Logger.Info("TP calculations - BB: %.2f, ATR: %.2f, Vol: %.2f", tpBB, tpATR, tpVol)
-		
-		var finalTP float64
-		switch job.Side {
-		case "LONG":
-			finalTP = t.PositionManager.GetMax(tpBB, tpATR, tpVol)
-		case "SHORT":
-			finalTP = t.PositionManager.GetMin(tpBB, tpATR, tpVol)
-		default:
-			t.Logger.Error("Unknown side: %s", job.Side)
+		// Calculate TP based on 15-minute price projection
+		t.Logger.Debug("Calculating TP based on 15-minute price projection...")
+		entryPrice := job.EntryPrice
+		if entryPrice == 0 {
+			entryPrice = t.PositionManager.GetLastEntryPrice()
+		}
+		if entryPrice == 0 {
+			t.Logger.Error("Cannot find entry price - skipping TP")
 			continue
 		}
+		
+		// Use our new 15-minute projection method
+		finalTP := t.calculateTPBasedOn15MinProjection(entryPrice, job.Side)
+		t.Logger.Info("TP calculated using 15-minute projection: %.2f", finalTP)
 		
 		if finalTP == 0 || math.IsNaN(finalTP) {
 			entryPrice := job.EntryPrice
@@ -103,6 +92,18 @@ func (t *Trader) TPWorker() {
 			}
 			t.Logger.Info("Using fallback TP calculation: %.2f", finalTP)
 		}
+		
+		// Calculate TP/SL with 2:1 ratio
+		entryPrice = job.EntryPrice
+		if entryPrice == 0 {
+			entryPrice = t.PositionManager.GetLastEntryPrice()
+		}
+		if entryPrice == 0 {
+			entryPrice = finalTP // Fallback if we can't get entry price
+		}
+		
+		// Apply 2:1 ratio between TP and SL based on 15-minute projection
+		finalTP, _ = t.calculateTPSLWithRatio(entryPrice, job.Side)
 		
 		orderSide := "Sell"
 		if job.Side == "SHORT" {
@@ -308,6 +309,9 @@ func (t *Trader) HandleLongSignal(closePrice float64) {
 	} else if side == newSide {
 		t.adjustTPSL(closePrice)
 	} else {
+		// Close opposite position first
+		t.closeOppositePosition(newSide)
+		// Then open new position
 		t.openPosition(newSide, closePrice)
 	}
 }
@@ -315,12 +319,18 @@ func (t *Trader) HandleLongSignal(closePrice float64) {
 // HandleShortSignal processes a short signal
 func (t *Trader) HandleShortSignal(closePrice float64) {
 	exists, side, _, _, _ := t.PositionManager.HasOpenPosition()
+	side = t.PositionManager.NormalizeSide(side)
+	newSide := t.PositionManager.NormalizeSide("SHORT")
+
 	if !exists {
-		t.openPosition("SHORT", closePrice)
-	} else if side == "SHORT" {
+		t.openPosition(newSide, closePrice)
+	} else if side == newSide {
 		t.adjustTPSLForShort(closePrice)
 	} else {
-		t.openPosition("SHORT", closePrice)
+		// Close opposite position first
+		t.closeOppositePosition(newSide)
+		// Then open new position
+		t.openPosition(newSide, closePrice)
 	}
 }
 
@@ -403,25 +413,16 @@ func (t *Trader) openPosition(newSide string, price float64) {
 	}
 	t.Logger.Info("Successfully placed market order to open position %s", newSide)
 
-	// Set TP/SL
+	// Set TP/SL with 2:1 ratio based on 15-minute projection
 	entry := t.PositionManager.GetLastEntryPrice()
 	if entry == 0 {
 		entry = price
 	}
 
-	const tpPerc = 0.005 // 0.5%
-	const slPerc = 0.001 // 0.1%
+	// Calculate TP/SL with 2:1 ratio based on 15-minute projection
+	tp, sl := t.calculateTPSLWithRatio(entry, newSide)
 
-	var tp, sl float64
-	if newSide == "LONG" {
-		tp = entry * (1 + tpPerc)
-		sl = entry * (1 - slPerc)
-	} else {
-		tp = entry * (1 - tpPerc)
-		sl = entry * (1 + slPerc)
-	}
-	
-	t.Logger.Info("Setting TP/SL: TP=%.2f, SL=%.2f", tp, sl)
+	t.Logger.Info("Setting TP/SL with 2:1 ratio: TP=%.2f, SL=%.2f", tp, sl)
 
 	// Update position TP/SL
 	body := map[string]interface{}{
@@ -462,7 +463,113 @@ func (t *Trader) openPosition(newSide string, price float64) {
 	t.Logger.Info("Position opened: %s %.4f @ %.2f | TP %.2f  SL %.2f", newSide, qty, entry, tp, sl)
 }
 
-// adjustTPSL adjusts TP/SL for long positions
+// calculateTPSLWithRatio calculates TP/SL with a 2:1 ratio based on 15-minute price projection
+// TP is calculated based on expected price movement in the next 15 minutes
+func (t *Trader) calculateTPSLWithRatio(entryPrice float64, positionSide string) (takeProfit float64, stopLoss float64) {
+	// Calculate TP based on 15-minute price projection
+	takeProfit = t.calculateTPBasedOn15MinProjection(entryPrice, positionSide)
+	
+	// Calculate the percentage distance from entry to TP
+	var tpPercentDistance float64
+	if positionSide == "LONG" {
+		tpPercentDistance = math.Abs((takeProfit - entryPrice) / entryPrice * 100)
+	} else {
+		tpPercentDistance = math.Abs((entryPrice - takeProfit) / entryPrice * 100)
+	}
+	
+	// Calculate SL distance as half of TP distance (2:1 ratio)
+	slPercentDistance := tpPercentDistance / 2
+	
+	// Set SL based on position side to maintain 2:1 ratio
+	if positionSide == "LONG" {
+		// For LONG positions: SL below entry price, TP above entry price
+		stopLoss = entryPrice * (1 - slPercentDistance/100)
+	} else {
+		// For SHORT positions: SL above entry price, TP below entry price
+		stopLoss = entryPrice * (1 + slPercentDistance/100)
+	}
+	
+	// Validate that we maintain the 2:1 ratio
+	tpDistanceActual := math.Abs(takeProfit - entryPrice)
+	slDistanceActual := math.Abs(entryPrice - stopLoss)
+	
+	ratio := 0.0
+	if slDistanceActual > 0 {
+		ratio = tpDistanceActual / slDistanceActual
+	}
+	
+	t.Logger.Debug("TP/SL calculation with 2:1 ratio - Entry: %.2f, TP: %.2f, SL: %.2f, TP Distance: %.4f, SL Distance: %.4f, Actual Ratio: %.2f:1", 
+		entryPrice, takeProfit, stopLoss, tpDistanceActual, slDistanceActual, ratio)
+	
+	return takeProfit, stopLoss
+}
+
+// calculateTPBasedOn15MinProjection calculates TP based on expected price movement in next 15 minutes
+func (t *Trader) calculateTPBasedOn15MinProjection(entryPrice float64, positionSide string) float64 {
+	// Get recent price data for 15-minute projection
+	if len(t.State.Closes) < 15 {
+		t.Logger.Warning("Not enough data for 15-minute projection, using fallback")
+		// Fallback to simple percentage-based TP
+		const defaultTPPerc = 0.005 // 0.5%
+		if positionSide == "LONG" {
+			return entryPrice * (1 + defaultTPPerc)
+		}
+		return entryPrice * (1 - defaultTPPerc)
+	}
+	
+	// Use the last 15 minutes of data (15 one-minute candles)
+	recentCloses := t.State.Closes
+	if len(recentCloses) > 15 {
+		recentCloses = recentCloses[len(recentCloses)-15:]
+	}
+	
+	// Calculate average price movement per minute
+	priceChanges := make([]float64, len(recentCloses)-1)
+	for i := 1; i < len(recentCloses); i++ {
+		priceChanges[i-1] = recentCloses[i] - recentCloses[i-1]
+	}
+	
+	// Calculate average movement per minute
+	avgMovementPerMin := 0.0
+	for _, change := range priceChanges {
+		avgMovementPerMin += change
+	}
+	avgMovementPerMin /= float64(len(priceChanges))
+	
+	// Project movement for 15 minutes
+	projectedMovement := avgMovementPerMin * 15
+	
+	// Apply momentum factor to make projections more realistic
+	momentumFactor := 0.7 // Reduce projection to account for mean reversion
+	projectedMovement *= momentumFactor
+	
+	// Calculate TP based on position side
+	var tpPrice float64
+	if positionSide == "LONG" {
+		tpPrice = entryPrice + projectedMovement
+	} else {
+		tpPrice = entryPrice + projectedMovement // Note: for SHORT, negative movement means price goes down
+	}
+	
+	// Ensure TP is reasonable (at least 0.1% away from entry)
+	minTPDistance := entryPrice * 0.001
+	actualTPDistance := math.Abs(tpPrice - entryPrice)
+	
+	if actualTPDistance < minTPDistance {
+		if positionSide == "LONG" {
+			tpPrice = entryPrice * (1 + 0.001) // 0.1% above entry
+		} else {
+			tpPrice = entryPrice * (1 - 0.001) // 0.1% below entry
+		}
+	}
+	
+	t.Logger.Debug("15-minute TP projection - Entry: %.2f, Avg movement/minute: %.4f, Projected movement: %.4f, TP: %.2f", 
+		entryPrice, avgMovementPerMin, projectedMovement, tpPrice)
+	
+	return tpPrice
+}
+
+// adjustTPSL adjusts TP/SL for long positions with 2:1 ratio
 func (t *Trader) adjustTPSL(closePrice float64) {
 	t.Logger.Info("Adjusting TP/SL for LONG position, current price: %.2f", closePrice)
 	
@@ -485,7 +592,9 @@ func (t *Trader) adjustTPSL(closePrice float64) {
 		t.Logger.Info("New TP %.2f is not better than current TP %.2f, skipping update", newTP, curTP)
 		return
 	}
-	newSL := entry + 0.5*(newTP-entry)
+	
+	// Calculate TP/SL with 2:1 ratio based on 15-minute projection
+	newTP, newSL := t.calculateTPSLWithRatio(entry, "LONG")
 	
 	t.Logger.Info("Sending TP/SL update to exchange: TP %.2f, SL %.2f", newTP, newSL)
 	if err := t.PositionManager.UpdatePositionTPSL(t.Config.Symbol, newTP, newSL); err != nil {
@@ -495,7 +604,7 @@ func (t *Trader) adjustTPSL(closePrice float64) {
 	}
 }
 
-// adjustTPSLForShort adjusts TP/SL for short positions
+// adjustTPSLForShort adjusts TP/SL for short positions with 2:1 ratio
 func (t *Trader) adjustTPSLForShort(closePrice float64) {
 	t.Logger.Info("Adjusting TP/SL for SHORT position, current price: %.2f", closePrice)
 	
@@ -516,7 +625,8 @@ func (t *Trader) adjustTPSLForShort(closePrice float64) {
 		return
 	}
 	
-	newSL := entry - 0.5*(entry-newTP)
+	// Calculate TP/SL with 2:1 ratio based on 15-minute projection
+	newTP, newSL := t.calculateTPSLWithRatio(entry, "SHORT")
 	
 	t.Logger.Info("Sending TP/SL update to exchange: TP %.2f, SL %.2f", newTP, newSL)
 	if err := t.PositionManager.UpdatePositionTPSL(t.Config.Symbol, newTP, newSL); err != nil {
@@ -572,44 +682,55 @@ func (t *Trader) SMAMovingAverageWorker() {
 		}
 		t.Logger.Debug("Current market regime: %s, hysteresis: %.3f", t.State.MarketRegime, hysteresis)
 
-		// Generate LONG signal based on multiple indicators
+		// Generate signals based on multiple indicators with priority (RSI temporarily disabled)
+		// Primary: SMA, Secondary: MACD, Tertiary: Golden Cross, Quaternary: Bollinger Bands
 		longSignal := false
-		if cls < smaVal*(1-hysteresis) {
-			t.Logger.Debug("SMA signal: Close %.2f < SMA(%.2f) * (1-%.3f) = %.2f", cls, smaVal, hysteresis, smaVal*(1-hysteresis))
-			longSignal = true
-		}
-		if rsi < 40 { // Oversold condition
-			t.Logger.Debug("RSI signal: RSI(%.2f) < 40", rsi)
-			longSignal = true
-		}
-		if macdHist > 0 && macdLine > signalLine { // Bullish MACD crossover
-			t.Logger.Debug("MACD signal: Histogram(%.4f) > 0 and MACD(%.4f) > Signal(%.4f)", macdHist, macdLine, signalLine)
-			longSignal = true
-		}
-		if indicators.GoldenCross(closesCopy) { // Golden cross
-			t.Logger.Debug("Golden cross detected")
-			longSignal = true
-		}
-
-		// Generate SHORT signal based on multiple indicators
 		shortSignal := false
-		if cls > smaVal*(1+hysteresis) {
-			t.Logger.Debug("SMA signal: Close %.2f > SMA(%.2f) * (1+%.3f) = %.2f", cls, smaVal, hysteresis, smaVal*(1+hysteresis))
+		
+		// Primary signal: SMA crossing without RSI confirmation (RSI temporarily disabled)
+		if cls < smaVal*(1-hysteresis) {
+			t.Logger.Debug("Primary LONG signal: Close %.2f < SMA(%.2f) * (1-%.3f) = %.2f", 
+				cls, smaVal, hysteresis, smaVal*(1-hysteresis))
+			longSignal = true
+		} else if cls > smaVal*(1+hysteresis) {
+			t.Logger.Debug("Primary SHORT signal: Close %.2f > SMA(%.2f) * (1+%.3f) = %.2f", 
+				cls, smaVal, hysteresis, smaVal*(1+hysteresis))
 			shortSignal = true
 		}
-		if rsi > 60 { // Overbought condition
-			t.Logger.Debug("RSI signal: RSI(%.2f) > 60", rsi)
-			shortSignal = true
+		
+		// Secondary signals: MACD confirmation
+		if !longSignal && !shortSignal {
+			if macdHist > 0 && macdLine > signalLine { // Bullish MACD
+				t.Logger.Debug("Secondary LONG signal: Histogram(%.4f) > 0 and MACD(%.4f) > Signal(%.4f)", 
+					macdHist, macdLine, signalLine)
+				longSignal = true
+			} else if macdHist < 0 && macdLine < signalLine { // Bearish MACD
+				t.Logger.Debug("Secondary SHORT signal: Histogram(%.4f) < 0 and MACD(%.4f) < Signal(%.4f)", 
+					macdHist, macdLine, signalLine)
+				shortSignal = true
+			}
 		}
-		if macdHist < 0 && macdLine < signalLine { // Bearish MACD crossover
-			t.Logger.Debug("MACD signal: Histogram(%.4f) < 0 and MACD(%.4f) < Signal(%.4f)", macdHist, macdLine, signalLine)
-			shortSignal = true
-		}
-		if indicators.GoldenCross(closesCopy) { // Golden cross (this might need adjustment)
-			t.Logger.Debug("Golden cross detected (for short signal - disabled)")
-			shortSignal = false // Disable this for short signals
+		
+		// Tertiary signals: Golden cross (only for LONG) without RSI
+		if !longSignal && !shortSignal {
+			if indicators.GoldenCross(closesCopy) {
+				t.Logger.Debug("Tertiary LONG signal: Golden cross detected")
+				longSignal = true
+			}
 		}
 
+		// Quaternary signals: Bollinger Bands (price touching bands for potential reversals)
+		if !longSignal && !shortSignal {
+			if cls <= bbLower { // Price touching or below lower band - potential LONG signal
+				t.Logger.Debug("Quaternary LONG signal: Close %.2f <= Bollinger Lower Band %.2f", cls, bbLower)
+				longSignal = true
+			} else if cls >= bbUpper { // Price touching or above upper band - potential SHORT signal
+				t.Logger.Debug("Quaternary SHORT signal: Close %.2f >= Bollinger Upper Band %.2f", cls, bbUpper)
+				shortSignal = true
+			}
+		}
+
+		// Send only one signal per cycle to prevent conflicts
 		if longSignal {
 			t.Logger.Info("LONG signal generated - Close: %.2f", cls)
 			t.State.SigChan <- models.Signal{
@@ -617,8 +738,7 @@ func (t *Trader) SMAMovingAverageWorker() {
 				ClosePrice: cls,
 				Time:       time.Now(),
 			}
-		}
-		if shortSignal {
+		} else if shortSignal {
 			t.Logger.Info("SHORT signal generated - Close: %.2f", cls)
 			t.State.SigChan <- models.Signal{
 				Kind:       "SMA_SHORT",
@@ -629,27 +749,109 @@ func (t *Trader) SMAMovingAverageWorker() {
 	}
 }
 
+// closeOppositePosition closes an existing position before opening a new one in the opposite direction
+func (t *Trader) closeOppositePosition(newSide string) {
+	exists, side, qty, _, _ := t.PositionManager.HasOpenPosition()
+	if !exists {
+		return
+	}
+	
+	side = t.PositionManager.NormalizeSide(side)
+	newSide = t.PositionManager.NormalizeSide(newSide)
+	
+	// Only close if it's truly the opposite side
+	if side != "" && side != newSide {
+		t.Logger.Info("Closing opposite position: %s", side)
+		
+		// Get entry price for profit calculation
+		entryPrice := t.PositionManager.GetLastEntryPrice()
+		
+		reduceSide := "Sell"
+		if side == "SHORT" {
+			reduceSide = "Buy"
+		}
+		
+		if err := t.OrderManager.PlaceOrderMarket(reduceSide, qty, true); err != nil {
+			t.Logger.Error("Error closing position %s: %v", side, err)
+			return
+		}
+		
+		t.Logger.Info("Successfully sent order to close position %s", side)
+		
+		// Calculate profit based on current price and entry price
+		var exitPrice float64
+		if side == "LONG" {
+			// For LONG positions, we sell to close
+			exitPrice = t.PositionManager.GetLastBidPrice()
+		} else if side == "SHORT" {
+			// For SHORT positions, we buy to close
+			exitPrice = t.PositionManager.GetLastAskPrice()
+		}
+		
+		if exitPrice <= 0 {
+			exitPrice = entryPrice // Fallback if we can't get current price
+		}
+		
+		profit := t.PositionManager.CalculatePositionProfit(side, entryPrice, exitPrice, qty)
+		signalType := "CLOSE_LONG"
+		if side == "SHORT" {
+			signalType = "CLOSE_SHORT"
+		}
+		
+		t.PositionManager.UpdateSignalStats(signalType, profit)
+	}
+}
+
 // Trader processes signals and executes trades
 func (t *Trader) Trader() {
 	signalStrength := make(map[string]int)
+	lastSignal := ""
+	
 	for sig := range t.State.SigChan {
 		signalStrength[sig.Kind]++
+		
+		// Prevent consecutive same signals
+		if sig.Kind == lastSignal {
+			if t.Config.Debug {
+				t.Logger.Debug("Skipping duplicate signal: %s", sig.Kind)
+			}
+			continue
+		}
 		
 		if t.Config.Debug {
 			t.Logger.Debug("Signal strength: %v", signalStrength)
 		}
 
-		if (signalStrength["SMA_LONG"] >= t.Config.SignalStrengthThreshold) && t.CheckOrderbookStrength("LONG") {
+		// Process LONG signal with proper conflict resolution
+		if sig.Kind == "SMA_LONG" && signalStrength["SMA_LONG"] >= t.Config.SignalStrengthThreshold && t.CheckOrderbookStrength("LONG") {
 			if t.Config.Debug {
 				t.Logger.Debug("Confirmed LONG signal: %d indicators", signalStrength["SMA_LONG"])
 			}
+			
+			// Check if we have an opposite position that needs to be closed first
+			exists, side, _, _, _ := t.PositionManager.HasOpenPosition()
+			if exists && t.PositionManager.NormalizeSide(side) == "SHORT" {
+				t.Logger.Info("Closing existing SHORT position before opening LONG")
+				t.closeOppositePosition("LONG")
+			}
+			
 			t.HandleLongSignal(sig.ClosePrice)
+			lastSignal = "SMA_LONG"
 			t.resetSignalStrength(&signalStrength)
-		} else if (signalStrength["SMA_SHORT"] >= t.Config.SignalStrengthThreshold) && t.CheckOrderbookStrength("SHORT") {
+		} else if sig.Kind == "SMA_SHORT" && signalStrength["SMA_SHORT"] >= t.Config.SignalStrengthThreshold && t.CheckOrderbookStrength("SHORT") {
 			if t.Config.Debug {
 				t.Logger.Debug("Confirmed SHORT signal: %d indicators", signalStrength["SMA_SHORT"])
 			}
+			
+			// Check if we have an opposite position that needs to be closed first
+			exists, side, _, _, _ := t.PositionManager.HasOpenPosition()
+			if exists && t.PositionManager.NormalizeSide(side) == "LONG" {
+				t.Logger.Info("Closing existing LONG position before opening SHORT")
+				t.closeOppositePosition("SHORT")
+			}
+			
 			t.HandleShortSignal(sig.ClosePrice)
+			lastSignal = "SMA_SHORT"
 			t.resetSignalStrength(&signalStrength)
 		}
 	}

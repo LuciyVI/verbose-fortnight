@@ -23,6 +23,7 @@ A sophisticated cryptocurrency trading bot written in Go that implements automat
 - **Risk Management**: Trailing stop-loss functionality and position sizing controls
 - **Market Regime Detection**: Adapts strategy based on whether market is trending or range-bound
 - **Multi-package Architecture**: Clean separation of concerns for better maintainability
+- **Secure Configuration**: API credentials loaded from environment variables
 
 ## Architecture
 
@@ -35,6 +36,9 @@ The application is organized into the following logical packages:
 - `order/` - Order placement and management logic
 - `position/` - Position tracking and management functions
 - `strategy/` - Trading strategy logic and signal processing
+- `daemon/` - Background processes and services
+- `internal/` - Internal utilities
+- `logging/` - Logging utilities
 
 ## Prerequisites
 
@@ -96,8 +100,7 @@ verbose-fortnight/
 ├── models/           # Data structures  
 │   └── models.go     # Type definitions and state
 ├── indicators/       # Technical analysis
-│   ├── indicators.go # Indicator calculations
-│   └── indicators_test.go # Tests
+│   └── indicators.go # Indicator calculations
 ├── api/              # API client implementations
 │   └── api.go        # Bybit API functions
 ├── order/            # Order management
@@ -106,24 +109,31 @@ verbose-fortnight/
 │   └── position.go   # Position functions
 ├── strategy/         # Trading logic
 │   └── strategy.go   # Strategy implementation
+├── daemon/           # Background processes and services
+├── internal/         # Internal utilities
+├── logging/          # Logging utilities
 ├── main.go           # Application entry point
 ├── go.mod            # Module definition
 ├── go.sum            # Dependency checksums
-└── README.md         # This file
+├── QWEN.md           # Qwen context file
+├── README.md         # This file
+└── trading_bot.log   # Trading bot log output
 ```
 
 ## Security
 
 ### API Credentials
-- API keys are loaded from environment variables, not hardcoded
+- API keys are loaded from environment variables, not hardcoded in the source code
 - Credentials are not logged or exposed in error messages
 - All API requests are properly signed using HMAC SHA-256
+- Timestamp and recvWindow validation for API requests
 
 ### Best Practices
 - Never commit API credentials to version control
 - Use Bybit demo account for testing
 - Regularly rotate API keys
 - Use keys with minimal required permissions
+- Follow security best practices for storing and managing API credentials
 
 ## Testing
 
@@ -156,6 +166,19 @@ The bot implements a multi-indicator approach:
 6. **Risk Management**: Market regime detection to adapt strategy
 
 ## Development
+
+### Development Conventions
+The code follows a multi-package architecture with clear separation of concerns:
+- `config/` - Handles application configuration and environment variables
+- `models/` - Defines data structures and application state
+- `indicators/` - Implements technical analysis calculations
+- `api/` - Manages API communication with Bybit
+- `order/` - Handles order placement and management
+- `position/` - Tracks and manages trading positions
+- `strategy/` - Implements trading logic and signal processing
+- `daemon/` - Runs background processes and services
+- `internal/` - Contains internal utilities
+- `logging/` - Manages application logging
 
 ### Adding New Indicators
 1. Add the indicator function to `indicators/indicators.go`

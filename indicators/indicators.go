@@ -156,7 +156,7 @@ func GoldenCross(closes []float64) bool {
 
 	// Calculate MACD on previous and current data points
 	prevData := closes[len(closes)-27 : len(closes)-1] // 26 elements
-	currData := closes[len(closes)-26:]               // 26 elements
+	currData := closes[len(closes)-26:]                // 26 elements
 
 	prevMacd, _ := MACD(prevData)
 	currMacd, _ := MACD(currData)

@@ -13,12 +13,13 @@ This is a cryptocurrency trading bot written in Go that implements automated tra
 - Volume-based signal confirmation
 - Market regime detection (trend vs range-bound)
 - Trailing stop-loss functionality
+- Multi-package architecture with clean separation of concerns
 
 ## Building and Running
 
 ### Prerequisites
 - Go 1.23.3 or higher
-- Bybit API credentials (already included in code as constants)
+- Bybit API credentials (demo or live)
 
 ### Build Commands
 ```bash
@@ -40,6 +41,20 @@ go test ./...
 
 ## Architecture and Key Components
 
+### Project Structure
+The application is organized into multiple packages with specific responsibilities:
+
+- `config/` - Configuration management with environment variable support
+- `models/` - Data structures and application state management
+- `indicators/` - Technical analysis functions and calculations
+- `api/` - Bybit API client implementations and request signing
+- `order/` - Order placement and management logic
+- `position/` - Position tracking and management functions
+- `strategy/` - Trading strategy logic and signal processing
+- `daemon/` - Background processes and services
+- `internal/` - Internal utilities
+- `logging/` - Logging utilities
+
 ### Core Features
 1. **WebSocket Integration**: Connects to both public (kline/orderbook) and private (position/wallet) streams
 2. **Signal Generation**: Uses SMA, MACD, and other indicators to generate trading signals
@@ -48,7 +63,7 @@ go test ./...
 5. **Market Regime Detection**: Adapts strategy based on whether market is trending or range-bound
 
 ### Configuration Constants
-- **API Credentials**: Hardcoded in the source code (for demo environment)
+- **API Credentials**: Loaded from environment variables
 - **Symbol**: BTCUSDT
 - **Interval**: 1-minute candles
 - **Contract Size**: 0.001 BTC per contract
@@ -73,17 +88,17 @@ go test ./...
 ## Development Conventions
 
 ### Code Structure
-The code is organized in logical sections with clear comments:
-- Global variables and utilities
-- Configuration constants
-- Strategy state management
-- Indicators calculation
-- API signing helpers
-- REST API calls
-- Order placement
-- WebSocket handlers
-- Position management
-- Main function with goroutines
+The code follows a multi-package architecture with clear separation of concerns:
+- `config/` - Handles application configuration and environment variables
+- `models/` - Defines data structures and application state
+- `indicators/` - Implements technical analysis calculations
+- `api/` - Manages API communication with Bybit
+- `order/` - Handles order placement and management
+- `position/` - Tracks and manages trading positions
+- `strategy/` - Implements trading logic and signal processing
+- `daemon/` - Runs background processes and services
+- `internal/` - Contains internal utilities
+- `logging/` - Manages application logging
 
 ### Debugging
 - Debug mode can be enabled with `-debug` flag
@@ -96,14 +111,16 @@ The code is organized in logical sections with clear comments:
 - Fallback mechanisms for missing data
 
 ### Security
-- HMAC SHA-256 signing for API requests
-- Secure handling of API credentials
-- Timestamp and recvWindow validation
+- API credentials loaded from environment variables, not hardcoded
+- All API requests are properly signed using HMAC SHA-256
+- Credentials are not logged or exposed in error messages
+- Timestamp and recvWindow validation for API requests
 
 ## Important Notes
 
-1. **API Credentials**: The API key and secret are hardcoded in the source code. This is appropriate for a demo environment but not for production.
-2. **Demo Environment**: The code uses Bybit's demo trading environment by default.
+1. **API Credentials**: The application loads API keys from environment variables rather than hardcoding them.
+2. **Demo Environment**: The code is configured to use Bybit's demo trading environment by default.
 3. **Risk Management**: The bot implements various risk management features including stop-loss, take-profit, and trailing stops.
-4. **Testing**: There is a test file available for testing some of the key functions.
+4. **Testing**: There are comprehensive tests available for testing the key functions across all packages.
 5. **Concurrency**: The application uses goroutines extensively for handling WebSocket data, indicators, and trading decisions.
+6. **Configuration**: Use environment variables for sensitive configuration (BYBIT_API_KEY, BYBIT_API_SECRET).
