@@ -49,8 +49,8 @@ type Config struct {
 // LoadConfig loads configuration from environment variables or uses defaults
 func LoadConfig() *Config {
 	return &Config{
-		APIKey:           getEnv("BYBIT_API_KEY", "5dkBCxJ2hGbpc0koc8"),
-		APISecret:        getEnv("BYBIT_API_SECRET", "FqeE61Sd9FWO6COtK7siMdaAjH0cwXCxL21F"),
+		APIKey:           getEnv("BYBIT_API_KEY", ""),
+		APISecret:        getEnv("BYBIT_API_SECRET", ""),
 		DemoRESTHost:     getEnv("BYBIT_DEMO_REST_HOST", "https://api-demo.bybit.com"),
 		DemoWSPrivateURL: getEnv("BYBIT_DEMO_WS_PRIVATE", "wss://stream-demo.bybit.com/v5/private"),
 		DemoWSPublicURL:  getEnv("BYBIT_DEMO_WS_PUBLIC", "wss://stream.bybit.com/v5/public/linear"),
