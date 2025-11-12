@@ -2,49 +2,45 @@
 
 ```mermaid
 flowchart TD
-    A[Start - SMA Worker Cycle] --> B[Calculate Technical Indicators]
-    B --> C[Get Current Close Price and SMA Value]
-    C --> D[Calculate Market Regime and Hysteresis]
-    D --> E[Calculate RSI for Logging Only\nRSI Temporarily Disabled]
-    E --> F[Calculate MACD Line and Signal Line]
-    F --> G[Calculate ATR, Bollinger Bands]
-    G --> H[Set Hysteresis Value\nBased on Market Regime]
-    
-    H --> I[Primary Signal Check:\nSMA Crossing Detection]
-    I --> J{Is Close below SMA * (1 - hysteresis)?}
-    J -->|Yes| K[Set longSignal = true\nLog Primary LONG Signal]
-    J -->|No| L{Is Close above SMA * (1 + hysteresis)?}
-    L -->|Yes| M[Set shortSignal = true\nLog Primary SHORT Signal]
-    L -->|No| N[No Primary Signal]
-    
-    K --> O{Secondary Signal Check:\nMACD Confirmation\nand not longSignal and not shortSignal?}
+    A[Start - SMA Worker Cycle] --> B[Calculate technical indicators]
+    B --> C[Get Close and SMA]
+    C --> D[Determine market regime and hysteresis h]
+    D --> E[RSI for logging only]
+    E --> F[Compute MACD line, signal, histogram]
+    F --> G[Compute ATR and Bollinger Bands]
+    G --> H[Set hysteresis by regime]
+    H --> I[Compute thresholds low/high]
+
+    I --> J{Is Close < low?}
+    J -->|Yes| K[longSignal=true; log primary LONG]
+    J -->|No| L{Is Close > high?}
+    L -->|Yes| M[shortSignal=true; log primary SHORT]
+    L -->|No| N[no primary signal]
+
+    K --> O{Secondary check: MACD confirm\nonly if no signal}
     M --> O
     N --> O
-    
-    O -->|Yes| P{MACD Histogram greater than 0\nand MACD Line greater than Signal Line?}
-    O -->|No| T{Tertiary Signal Check:\nGolden Cross\nand not longSignal and not shortSignal?}
-    
-    P -->|Yes| Q[Set longSignal = true\nLog Secondary LONG Signal]
-    P -->|No| R{MACD Histogram less than 0\nand MACD Line less than Signal Line?}
-    R -->|Yes| S[Set shortSignal = true\nLog Secondary SHORT Signal]
-    R -->|No| T
-    
+
+    O -->|hist>0 and line>signal| Q[longSignal=true; log secondary LONG]
+    O -->|hist<0 and line<signal| S[shortSignal=true; log secondary SHORT]
+    O -->|otherwise| T{Tertiary check: Golden Cross?\nonly if no signal}
+
     Q --> T
     S --> T
-    T -->|Yes| U[Set longSignal = true\nLog Tertiary LONG Signal]
-    T -->|No| V[No Additional Signals]
-    
-    U --> W{Send Signal?}
+    T -->|Yes| U[longSignal=true; log tertiary LONG]
+    T -->|No| V[no additional signals]
+
+    U --> W{Send signal?}
     V --> W
-    W -->|longSignal = true| X[Send LONG Signal\nKind: SMA_LONG]
-    W -->|shortSignal = true| Y[Send SHORT Signal\nKind: SMA_SHORT]
-    W -->|Both false| Z[No Signal Sent]
-    
-    X --> AA[End Cycle - Wait 1 Second]
+    W -->|longSignal=true| X[Send LONG; Kind=SMA_LONG]
+    W -->|shortSignal=true| Y[Send SHORT; Kind=SMA_SHORT]
+    W -->|none| Z[No signal sent]
+
+    X --> AA[End cycle - wait 1s]
     Y --> AA
     Z --> AA
     AA --> A
-    
+
     style A fill:#e1f5fe
     style AA fill:#e1f5fe
     style K fill:#c8e6c9
