@@ -41,6 +41,9 @@ type Config struct {
 	LogLevel      int // 0=DEBUG, 1=INFO, 2=WARNING, 3=ERROR
 	// Daemon configuration
 	DaemonMode bool
+	
+	// WebUI configuration
+	EnableWebUI bool
 }
 
 // LoadConfig loads configuration from environment variables or uses defaults
@@ -62,14 +65,14 @@ func LoadConfig() *Config {
 		ContractSize:     0.001,
 		ObDepth:          50,
 		TpThresholdQty:   500.0,
-		TpOffset:         0.002,
+		TpOffset:         0.008,  // Increased to 0.8% for better R/R ratio
 		SlThresholdQty:   500.0,
 		SmaLen:           20,
-		SlPerc:           0.01,
-		TrailPerc:        0.005,
+		SlPerc:           0.004,  // Reduced to 0.4% to create 2:1 R/R ratio with TP of 0.8%
+		TrailPerc:        0.005,  // Keep trailing stop at 0.5% but adjust how it's applied
 		Debug:            false,
 		DynamicTP:        false,
-		OrderbookStrengthThreshold: 1.3,
+		OrderbookStrengthThreshold: 1.05,
 		SignalStrengthThreshold:    2,
 		// Logging defaults
 		LogFile:       getEnv("LOG_FILE", "trading_bot.log"),
@@ -80,6 +83,8 @@ func LoadConfig() *Config {
 		LogLevel:      1, // INFO level
 		// Daemon defaults
 		DaemonMode: getEnvAsBool("DAEMON_MODE", false),
+		// WebUI defaults
+		EnableWebUI: getEnvAsBool("ENABLE_WEBUI", false),
 	}
 }
 

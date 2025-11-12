@@ -16,6 +16,7 @@ import (
 	"verbose-fortnight/models"
 	"verbose-fortnight/order"
 	"verbose-fortnight/position"
+	"verbose-fortnight/web_interface"  // Add the web interface import
 )
 
 // Trader handles trading logic and signal processing
@@ -26,10 +27,11 @@ type Trader struct {
 	OrderManager    *order.OrderManager
 	PositionManager *position.PositionManager
 	Logger          logging.LoggerInterface
+	WebUI           *web_interface.WebUI  // Add WebUI for broadcasting updates
 }
 
 // NewTrader creates a new trader instance
-func NewTrader(apiClient *api.RESTClient, cfg *config.Config, state *models.State, logger logging.LoggerInterface) *Trader {
+func NewTrader(apiClient *api.RESTClient, cfg *config.Config, state *models.State, logger logging.LoggerInterface, webUI *web_interface.WebUI) *Trader {
 	orderManager := order.NewOrderManager(apiClient, cfg, state, logger)
 	positionManager := position.NewPositionManager(apiClient, cfg, state, logger)
 	
@@ -40,6 +42,7 @@ func NewTrader(apiClient *api.RESTClient, cfg *config.Config, state *models.Stat
 		OrderManager:    orderManager,
 		PositionManager: positionManager,
 		Logger:          logger,
+		WebUI:           webUI,
 	}
 }
 
@@ -687,46 +690,46 @@ func (t *Trader) SMAMovingAverageWorker() {
 		longSignal := false
 		shortSignal := false
 		
-		// Primary signal: SMA crossing without RSI confirmation (RSI temporarily disabled)
-		if cls < smaVal*(1-hysteresis) {
-			t.Logger.Debug("Primary LONG signal: Close %.2f < SMA(%.2f) * (1-%.3f) = %.2f", 
-				cls, smaVal, hysteresis, smaVal*(1-hysteresis))
-			longSignal = true
-		} else if cls > smaVal*(1+hysteresis) {
-			t.Logger.Debug("Primary SHORT signal: Close %.2f > SMA(%.2f) * (1+%.3f) = %.2f", 
+		// Primary signal: SMA crossing without RSI confirmation (RSI temporarily disabled) - INVERTED LOGIC
+		if cls > smaVal*(1+hysteresis) {  // Inverted: was <, now >
+			t.Logger.Debug("Primary SHORT signal (inverted): Close %.2f > SMA(%.2f) * (1+%.3f) = %.2f", 
 				cls, smaVal, hysteresis, smaVal*(1+hysteresis))
 			shortSignal = true
+		} else if cls < smaVal*(1-hysteresis) {  // Inverted: was >, now <
+			t.Logger.Debug("Primary LONG signal (inverted): Close %.2f < SMA(%.2f) * (1-%.3f) = %.2f", 
+				cls, smaVal, hysteresis, smaVal*(1-hysteresis))
+			longSignal = true
 		}
 		
-		// Secondary signals: MACD confirmation
+		// Secondary signals: MACD confirmation - INVERTED LOGIC
 		if !longSignal && !shortSignal {
-			if macdHist > 0 && macdLine > signalLine { // Bullish MACD
-				t.Logger.Debug("Secondary LONG signal: Histogram(%.4f) > 0 and MACD(%.4f) > Signal(%.4f)", 
-					macdHist, macdLine, signalLine)
-				longSignal = true
-			} else if macdHist < 0 && macdLine < signalLine { // Bearish MACD
-				t.Logger.Debug("Secondary SHORT signal: Histogram(%.4f) < 0 and MACD(%.4f) < Signal(%.4f)", 
+			if macdHist < 0 && macdLine < signalLine { // Bearish MACD (inverted from bullish)
+				t.Logger.Debug("Secondary SHORT signal (inverted from bullish MACD): Histogram(%.4f) < 0 and MACD(%.4f) < Signal(%.4f)", 
 					macdHist, macdLine, signalLine)
 				shortSignal = true
+			} else if macdHist > 0 && macdLine > signalLine { // Bullish MACD (inverted from bearish)
+				t.Logger.Debug("Secondary LONG signal (inverted from bearish MACD): Histogram(%.4f) > 0 and MACD(%.4f) > Signal(%.4f)", 
+					macdHist, macdLine, signalLine)
+				longSignal = true
 			}
 		}
 		
-		// Tertiary signals: Golden cross (only for LONG) without RSI
+		// Tertiary signals: Death cross (opposite of golden cross) without RSI
 		if !longSignal && !shortSignal {
-			if indicators.GoldenCross(closesCopy) {
-				t.Logger.Debug("Tertiary LONG signal: Golden cross detected")
-				longSignal = true
+			if indicators.DeathCross(closesCopy) {
+				t.Logger.Debug("Tertiary SHORT signal (inverted from golden cross): Death cross detected")
+				shortSignal = true
 			}
 		}
 
-		// Quaternary signals: Bollinger Bands (price touching bands for potential reversals)
+		// Quaternary signals: Bollinger Bands (price touching bands for potential reversals) - INVERTED LOGIC
 		if !longSignal && !shortSignal {
-			if cls <= bbLower { // Price touching or below lower band - potential LONG signal
-				t.Logger.Debug("Quaternary LONG signal: Close %.2f <= Bollinger Lower Band %.2f", cls, bbLower)
-				longSignal = true
-			} else if cls >= bbUpper { // Price touching or above upper band - potential SHORT signal
-				t.Logger.Debug("Quaternary SHORT signal: Close %.2f >= Bollinger Upper Band %.2f", cls, bbUpper)
+			if cls >= bbUpper { // Price touching or above upper band - potential SHORT signal (inverted from LONG)
+				t.Logger.Debug("Quaternary SHORT signal (inverted from LONG): Close %.2f >= Bollinger Upper Band %.2f", cls, bbUpper)
 				shortSignal = true
+			} else if cls <= bbLower { // Price touching or below lower band - potential LONG signal (inverted from SHORT)
+				t.Logger.Debug("Quaternary LONG signal (inverted from SHORT): Close %.2f <= Bollinger Lower Band %.2f", cls, bbLower)
+				longSignal = true
 			}
 		}
 

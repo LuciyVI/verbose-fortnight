@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Trading Bot Dashboard</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+</head>
+<body>
+    <div class="container-fluid">
+        <nav class="navbar navbar-expand-lg navbar-dark bg-primary">
+            <div class="container">
+                <a class="navbar-brand" href="#">
+                    <i class="fas fa-chart-line"></i> Trading Bot Dashboard
+                </a>
+                <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
+                    <span class="navbar-toggler-icon"></span>
+                </button>
+                <div class="collapse navbar-collapse" id="navbarNav">
+                    <ul class="navbar-nav ms-auto">
+                        <li class="nav-item">
+                            <a class="nav-link active" href="#"><i class="fas fa-home"></i> Dashboard</a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link" href="#"><i class="fas fa-chart-bar"></i> Analytics</a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link" href="#"><i class="fas fa-cog"></i> Settings</a>
+                        </li>
+                    </ul>
+                </div>
+            </div>
+        </nav>
+
+        <div class="row mt-4">
+            <!-- Control Panel -->
+            <div class="col-md-3">
+                <div class="card">
+                    <div class="card-header bg-dark text-white">
+                        <h5><i class="fas fa-sliders-h"></i> Controls</h5>
+                    </div>
+                    <div class="card-body">
+                        <div class="mb-3">
+                            <label class="form-label">Bot Status</label>
+                            <div class="d-grid">
+                                <button id="toggleBotBtn" class="btn btn-success">Start Bot</button>
+                            </div>
+                        </div>
+                        
+                        <div class="mb-3">
+                            <label class="form-label">Trading Mode</label>
+                            <select class="form-select" id="tradingMode">
+                                <option value="live">Live Trading</option>
+                                <option value="demo" selected>Demo Trading</option>
+                                <option value="backtest">Backtesting</option>
+                            </select>
+                        </div>
+                        
+                        <div class="mb-3">
+                            <label class="form-label">Position Size (BTC)</label>
+                            <input type="number" class="form-control" id="positionSize" value="0.001" step="0.001">
+                        </div>
+                        
+                        <div class="mb-3">
+                            <label class="form-label">TP Offset (%)</label>
+                            <input type="number" class="form-control" id="tpOffset" value="0.8" step="0.1">
+                        </div>
+                        
+                        <div class="mb-3">
+                            <label class="form-label">SL Percentage (%)</label>
+                            <input type="number" class="form-control" id="slPercentage" value="0.4" step="0.1">
+                        </div>
+                        
+                        <div class="form-check form-switch mb-3">
+                            <input class="form-check-input" type="checkbox" id="enableLogging">
+                            <label class="form-check-label" for="enableLogging">Enable Detailed Logging</label>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Main Dashboard -->
+            <div class="col-md-9">
+                <div class="row mb-4">
+                    <div class="col-sm-6 col-md-3 mb-3">
+                        <div class="card bg-primary text-white">
+                            <div class="card-body">
+                                <div class="d-flex justify-content-between">
+                                    <div>
+                                        <h6>Total P&L</h6>
+                                        <h4 id="totalPnL">$0.00</h4>
+                                    </div>
+                                    <div class="align-self-center">
+                                        <i class="fas fa-coins fa-2x"></i>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-sm-6 col-md-3 mb-3">
+                        <div class="card bg-success text-white">
+                            <div class="card-body">
+                                <div class="d-flex justify-content-between">
+                                    <div>
+                                        <h6>Total Trades</h6>
+                                        <h4 id="totalTrades">0</h4>
+                                    </div>
+                                    <div class="align-self-center">
+                                        <i class="fas fa-exchange-alt fa-2x"></i>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-sm-6 col-md-3 mb-3">
+                        <div class="card bg-warning text-white">
+                            <div class="card-body">
+                                <div class="d-flex justify-content-between">
+                                    <div>
+                                        <h6>Win Rate</h6>
+                                        <h4 id="winRate">0%</h4>
+                                    </div>
+                                    <div class="align-self-center">
+                                        <i class="fas fa-percentage fa-2x"></i>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-sm-6 col-md-3 mb-3">
+                        <div class="card bg-info text-white">
+                            <div class="card-body">
+                                <div class="d-flex justify-content-between">
+                                    <div>
+                                        <h6>Active Positions</h6>
+                                        <h4 id="activePositions">0</h4>
+                                    </div>
+                                    <div class="align-self-center">
+                                        <i class="fas fa-chart-pie fa-2x"></i>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="row">
+                    <!-- Market Data -->
+                    <div class="col-md-6">
+                        <div class="card">
+                            <div class="card-header bg-light">
+                                <h5><i class="fas fa-chart-area"></i> Market Data</h5>
+                            </div>
+                            <div class="card-body">
+                                <div class="mb-3">
+                                    <label class="form-label">Current Price (BTCUSDT)</label>
+                                    <div class="input-group">
+                                        <span class="input-group-text"><i class="fas fa-dollar-sign"></i></span>
+                                        <input type="text" class="form-control" id="currentPrice" readonly>
+                                    </div>
+                                </div>
+                                
+                                <div class="mb-3">
+                                    <label class="form-label">24h Change</label>
+                                    <div class="input-group">
+                                        <span class="input-group-text"><i class="fas fa-arrows-alt-v"></i></span>
+                                        <input type="text" class="form-control" id="dailyChange" readonly>
+                                    </div>
+                                </div>
+                                
+                                <div class="mb-3">
+                                    <label class="form-label">SMA (20)</label>
+                                    <div class="input-group">
+                                        <span class="input-group-text"><i class="fas fa-line-chart"></i></span>
+                                        <input type="text" class="form-control" id="smaValue" readonly>
+                                    </div>
+                                </div>
+                                
+                                <div class="mb-3">
+                                    <label class="form-label">RSI (14)</label>
+                                    <div class="input-group">
+                                        <span class="input-group-text"><i class="fas fa-ruler"></i></span>
+                                        <input type="text" class="form-control" id="rsiValue" readonly>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Recent Trades -->
+                    <div class="col-md-6">
+                        <div class="card">
+                            <div class="card-header bg-light">
+                                <h5><i class="fas fa-history"></i> Recent Trades</h5>
+                            </div>
+                            <div class="card-body">
+                                <div class="table-responsive">
+                                    <table class="table table-sm table-hover">
+                                        <thead>
+                                            <tr>
+                                                <th>Time</th>
+                                                <th>Side</th>
+                                                <th>Price</th>
+                                                <th>P&L</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody id="recentTradesTable">
+                                            <tr>
+                                                <td colspan="4" class="text-center">No recent trades</td>
+                                            </tr>
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="row mt-4">
+                    <!-- Open Positions -->
+                    <div class="col-12">
+                        <div class="card">
+                            <div class="card-header bg-light">
+                                <h5><i class="fas fa-list"></i> Open Positions</h5>
+                            </div>
+                            <div class="card-body">
+                                <div class="table-responsive">
+                                    <table class="table table-sm table-hover">
+                                        <thead>
+                                            <tr>
+                                                <th>Symbol</th>
+                                                <th>Side</th>
+                                                <th>Size</th>
+                                                <th>Entry Price</th>
+                                                <th>Mark Price</th>
+                                                <th>TP</th>
+                                                <th>SL</th>
+                                                <th>Unrealized P&L</th>
+                                                <th>Action</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody id="openPositionsTable">
+                                            <tr>
+                                                <td colspan="9" class="text-center">No open positions</td>
+                                            </tr>
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modals -->
+    <div class="modal fade" id="settingsModal" tabindex="-1">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">Settings</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <div class="row">
+                        <div class="col-md-6">
+                            <div class="mb-3">
+                                <label class="form-label">API Key</label>
+                                <input type="password" class="form-control" id="apiKey">
+                            </div>
+                            
+                            <div class="mb-3">
+                                <label class="form-label">API Secret</label>
+                                <input type="password" class="form-control" id="apiSecret">
+                            </div>
+                            
+                            <div class="mb-3">
+                                <label class="form-label">Signal Strength Threshold</label>
+                                <input type="number" class="form-control" id="signalThreshold" value="2">
+                            </div>
+                        </div>
+                        <div class="col-md-6">
+                            <div class="mb-3">
+                                <label class="form-label">Orderbook Strength Threshold</label>
+                                <input type="number" class="form-control" id="orderbookThreshold" value="1.05" step="0.01">
+                            </div>
+                            
+                            <div class="mb-3">
+                                <label class="form-label">ATR Multiplier</label>
+                                <input type="number" class="form-control" id="atrMultiplier" value="2.0" step="0.1">
+                            </div>
+                            
+                            <div class="form-check form-switch mb-3">
+                                <input class="form-check-input" type="checkbox" id="trailStopEnabled" checked>
+                                <label class="form-check-label" for="trailStopEnabled">Enable Trailing Stop</label>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                    <button type="button" class="btn btn-primary" id="saveSettingsBtn">Save Settings</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="/static/js/script.js"></script>
+</body>
+</html>

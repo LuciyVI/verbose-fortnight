@@ -38,11 +38,30 @@ func CalculateATR(highs, lows, closes []float64, period int) float64 {
 	if len(highs) < period || len(lows) < period || len(closes) < period {
 		return 0
 	}
+	// Also make sure we have at least one previous close for the first TR calculation
+	if len(closes) < 2 {
+		// If we only have one close, return based on high-low for that period
+		var trSum float64
+		startIndex := len(closes) - period
+		for i := startIndex; i < len(closes); i++ {
+			if i < len(highs) && i < len(lows) {
+				trSum += highs[i] - lows[i]
+			}
+		}
+		return trSum / float64(period)
+	}
+	
 	var trSum float64
 	for i := len(closes) - period; i < len(closes); i++ {
+		if i >= len(highs) || i >= len(lows) || i >= len(closes) {
+			continue // Safety check
+		}
+		
 		high := highs[i]
 		low := lows[i]
 		var closePrev float64
+		
+		// For the first calculation in the period, if we're at the beginning of the data, use current close
 		if i > 0 {
 			closePrev = closes[i-1]
 		} else {
@@ -163,6 +182,23 @@ func GoldenCross(closes []float64) bool {
 
 	// This is simplified - a real golden cross would compare MACD line to signal line
 	return prevMacd < 0 && currMacd > 0
+}
+
+// DeathCross checks for death cross pattern (opposite of golden cross)
+func DeathCross(closes []float64) bool {
+	if len(closes) < 27 {
+		return false
+	}
+
+	// Calculate MACD on previous and current data points
+	prevData := closes[len(closes)-27 : len(closes)-1] // 26 elements
+	currData := closes[len(closes)-26:]                // 26 elements
+
+	prevMacd, _ := MACD(prevData)
+	currMacd, _ := MACD(currData)
+
+	// This is simplified - a real death cross would compare MACD line to signal line in opposite direction
+	return prevMacd > 0 && currMacd < 0
 }
 
 // MaxSlice returns the maximum value in a slice
