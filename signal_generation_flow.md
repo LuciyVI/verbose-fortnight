@@ -5,39 +5,39 @@ flowchart TD
     A[Start - SMA Worker Cycle] --> B[Calculate Technical Indicators]
     B --> C[Get Current Close Price and SMA Value]
     C --> D[Calculate Market Regime and Hysteresis]
-    D --> E[Calculate RSI for Logging Only<br/>RSI Temporarily Disabled]
+    D --> E[Calculate RSI for Logging Only\nRSI Temporarily Disabled]
     E --> F[Calculate MACD Line and Signal Line]
     F --> G[Calculate ATR, Bollinger Bands]
-    G --> H[Set Hysteresis Value<br/>Based on Market Regime]
+    G --> H[Set Hysteresis Value\nBased on Market Regime]
     
-    H --> I[Primary Signal Check:<br/>SMA Crossing Detection]
-    I --> J{Close < SMA * (1-hysteresis)?}
-    J -->|Yes| K[Set longSignal = true<br/>Log Primary LONG Signal]
-    J -->|No| L{Close > SMA * (1+hysteresis)?}
-    L -->|Yes| M[Set shortSignal = true<br/>Log Primary SHORT Signal]
+    H --> I[Primary Signal Check:\nSMA Crossing Detection]
+    I --> J{Is Close below SMA * (1 - hysteresis)?}
+    J -->|Yes| K[Set longSignal = true\nLog Primary LONG Signal]
+    J -->|No| L{Is Close above SMA * (1 + hysteresis)?}
+    L -->|Yes| M[Set shortSignal = true\nLog Primary SHORT Signal]
     L -->|No| N[No Primary Signal]
     
-    K --> O{Secondary Signal Check:<br/>MACD Confirmation<br/>AND !longSignal AND !shortSignal?}
+    K --> O{Secondary Signal Check:\nMACD Confirmation\nand not longSignal and not shortSignal?}
     M --> O
     N --> O
     
-    O -->|Yes| P{MACD Histogram > 0<br/>AND MACD Line > Signal Line?}
-    O -->|No| T{Tertiary Signal Check:<br/>Golden Cross<br/>AND !longSignal AND !shortSignal?}
+    O -->|Yes| P{MACD Histogram greater than 0\nand MACD Line greater than Signal Line?}
+    O -->|No| T{Tertiary Signal Check:\nGolden Cross\nand not longSignal and not shortSignal?}
     
-    P -->|Yes| Q[Set longSignal = true<br/>Log Secondary LONG Signal]
-    P -->|No| R{MACD Histogram < 0<br/>AND MACD Line < Signal Line?}
-    R -->|Yes| S[Set shortSignal = true<br/>Log Secondary SHORT Signal]
+    P -->|Yes| Q[Set longSignal = true\nLog Secondary LONG Signal]
+    P -->|No| R{MACD Histogram less than 0\nand MACD Line less than Signal Line?}
+    R -->|Yes| S[Set shortSignal = true\nLog Secondary SHORT Signal]
     R -->|No| T
     
     Q --> T
     S --> T
-    T -->|Yes| U[Set longSignal = true<br/>Log Tertiary LONG Signal]
+    T -->|Yes| U[Set longSignal = true\nLog Tertiary LONG Signal]
     T -->|No| V[No Additional Signals]
     
     U --> W{Send Signal?}
     V --> W
-    W -->|longSignal = true| X[Send LONG Signal<br/>Kind: SMA_LONG]
-    W -->|shortSignal = true| Y[Send SHORT Signal<br/>Kind: SMA_SHORT]
+    W -->|longSignal = true| X[Send LONG Signal\nKind: SMA_LONG]
+    W -->|shortSignal = true| Y[Send SHORT Signal\nKind: SMA_SHORT]
     W -->|Both false| Z[No Signal Sent]
     
     X --> AA[End Cycle - Wait 1 Second]
