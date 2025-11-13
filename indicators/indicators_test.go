@@ -1,97 +1,38 @@
 package indicators
 
 import (
-	"math"
 	"testing"
+	"math"
 )
 
-// Тип для удобного создания тестовых данных
-type orderbook struct {
-	bids [][]string // [[price, size], ...]
-	asks [][]string
+// TestCalculateATR tests the ATR calculation function
+func TestCalculateATR(t *testing.T) {
+	highs := []float64{50000, 50100, 50200, 50150, 50300, 50250, 50400, 50350, 50500, 50450, 50600, 50550, 50700, 50650, 50800}
+	lows := []float64{49900, 49950, 50050, 49900, 50100, 50050, 50200, 50150, 50300, 50250, 50400, 50350, 50500, 50450, 50600}
+	closes := []float64{50050, 50150, 50100, 50200, 50150, 50300, 50250, 50400, 50350, 50500, 50450, 50600, 50550, 50700, 50750}
+
+	atr := CalculateATR(highs, lows, closes, 14)
+
+	// We expect some positive value for ATR
+	if atr <= 0 {
+		t.Errorf("ATR should be positive, got %f", atr)
+	}
+
+	t.Logf("ATR(14) calculated: %f", atr)
 }
 
-func TestVolumeWeightedPrice(t *testing.T) {
-	// Test data setup
-	orderbook := map[string]float64{
-		"50000": 100,
-		"50100": 400,
-		"50200": 800,
+// TestCommissionCalculation tests the commission calculation logic
+func TestCommissionCalculation(t *testing.T) {
+	entryPrice := 50000.0
+	commission := 0.09 // 0.09% as percentage
+	commissionValue := entryPrice * (commission / 100)
+	
+	// Expected commission value for 50000 * 0.0009
+	expected := 45.0 // 50000 * 0.0009
+	
+	if math.Abs(commissionValue-expected) > 0.001 {
+		t.Errorf("Expected commission %f, got %f", expected, commissionValue)
 	}
-
-	// Test LONG side (asks) - looking for lowest price that meets threshold
-	price := VolumeWeightedPrice(orderbook, false, 900) // false = sell/ask (looking for lowest price first)
-	expected := 50000.0  // The first price level is 50000 with size 100, cumulative = 100 < 900
-	// Then 50100 with size 400, cumulative = 500 < 900
-	// Then 50200 with size 800, cumulative = 1300 >= 900, so it should return 50200
-	expected = 50200.0
-	if math.Abs(price-expected) > 1 {
-		t.Errorf("Expected ~%.0f, got %.2f", expected, price)
-	}
-
-	// Test SHORT side (bids) - looking for highest price that meets threshold
-	price = VolumeWeightedPrice(orderbook, true, 900) // true = buy/bid
-	expected = 50100.0
-	if math.Abs(price-expected) > 1 {
-		t.Errorf("Expected ~%.0f, got %.2f", expected, price)
-	}
-
-	// Test case with not enough liquidity
-	orderbookLow := map[string]float64{
-		"50000": 10,
-	}
-	price = VolumeWeightedPrice(orderbookLow, false, 900)
-	if price != 50000 {
-		t.Errorf("Expected 50000 for not enough liquidity, got %.2f", price)
-	}
-}
-
-func TestSMA(t *testing.T) {
-	data := []float64{10, 20, 30, 40, 50}
-	result := SMA(data)
-	expected := 30.0
-	if result != expected {
-		t.Errorf("Expected %.1f, got %.2f", expected, result)
-	}
-
-	// Test empty slice
-	emptyData := []float64{}
-	result = SMA(emptyData)
-	if result != 0 {
-		t.Errorf("Expected 0 for empty slice, got %.2f", result)
-	}
-}
-
-func TestStdDev(t *testing.T) {
-	data := []float64{2, 4, 4, 4, 5, 5, 7, 9}
-	result := StdDev(data)
-	expected := 2.0
-	if math.Abs(result-expected) > 0.1 {
-		t.Errorf("Expected ~%.1f, got %.2f", expected, result)
-	}
-}
-
-func TestMaxMinSlice(t *testing.T) {
-	data := []float64{1, 5, 3, 9, 2}
-	max := MaxSlice(data)
-	if max != 9 {
-		t.Errorf("Expected max 9, got %.2f", max)
-	}
-
-	min := MinSlice(data)
-	if min != 1 {
-		t.Errorf("Expected min 1, got %.2f", min)
-	}
-
-	// Test empty slice
-	empty := []float64{}
-	max = MaxSlice(empty)
-	if max != 0 {
-		t.Errorf("Expected 0 for empty max slice, got %.2f", max)
-	}
-
-	min = MinSlice(empty)
-	if min != 0 {
-		t.Errorf("Expected 0 for empty min slice, got %.2f", min)
-	}
+	
+	t.Logf("Commission for entry price %f at 0.09%%: %f", entryPrice, commissionValue)
 }

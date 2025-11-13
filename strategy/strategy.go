@@ -108,13 +108,14 @@ func (t *Trader) TPWorker() {
 			if tickSize <= 0 {
 				tickSize = 0.1 // Default fallback
 			}
+			// Account for commission (0.09% total for entry and exit)
+			commission := entryPrice * 0.0009
 			if job.Side == "LONG" {
-				finalTP = math.Round((entryPrice + (atr * tpMultiplier))/tickSize) * tickSize
+				finalTP = math.Round((entryPrice + (atr * tpMultiplier) + commission)/tickSize) * tickSize
 			} else {
-				finalTP = math.Round((entryPrice - (atr * tpMultiplier))/tickSize) * tickSize
+				finalTP = math.Round((entryPrice - (atr * tpMultiplier) - commission)/tickSize) * tickSize
 			}
 			t.Logger.Info("Using ATR-based fallback TP calculation: %.2f", finalTP)
-			t.Logger.Info("Using fallback TP calculation: %.2f", finalTP)
 		}
 		
 		// Calculate TP/SL with 2:1 ratio
@@ -503,14 +504,19 @@ func (t *Trader) calculateTPSLWithRatio(entryPrice float64, positionSide string)
 	tpMultiplier := t.Config.TPAtrMultiplier
 	slMultiplier := t.Config.SLAtrMultiplier
 
+	// Account for commission (0.09% total for entry and exit)
+	commission := 0.0009 // 0.09% commission
+
 	if positionSide == "LONG" {
 		// For LONG positions: TP above entry, SL below entry
-		takeProfit = entryPrice + (atr * tpMultiplier)
-		stopLoss = entryPrice - (atr * slMultiplier)
+		// Add commission to TP to ensure profit after fees, reduce SL to account for commission
+		takeProfit = entryPrice + (atr * tpMultiplier) + (entryPrice * commission)
+		stopLoss = entryPrice - (atr * slMultiplier) - (entryPrice * commission)
 	} else if positionSide == "SHORT" {
 		// For SHORT positions: TP below entry, SL above entry
-		takeProfit = entryPrice - (atr * tpMultiplier)
-		stopLoss = entryPrice + (atr * slMultiplier)
+		// Reduce TP to account for commission, increase SL to account for commission
+		takeProfit = entryPrice - (atr * tpMultiplier) - (entryPrice * commission)
+		stopLoss = entryPrice + (atr * slMultiplier) + (entryPrice * commission)
 	}
 
 	// Ensure TP and SL are properly rounded to tick size
@@ -519,9 +525,26 @@ func (t *Trader) calculateTPSLWithRatio(entryPrice float64, positionSide string)
 		stopLoss = math.Round(stopLoss/t.State.Instr.TickSize) * t.State.Instr.TickSize
 	}
 
-	// Validate that the calculated values make sense
+	// Validate that the calculated values make sense and are in correct order
 	tpDistanceActual := math.Abs(takeProfit - entryPrice)
 	slDistanceActual := math.Abs(entryPrice - stopLoss)
+
+	// Ensure TP is in profit direction and SL is in loss direction
+	if positionSide == "LONG" {
+		if takeProfit <= entryPrice {
+			takeProfit = entryPrice + (atr * tpMultiplier)
+		}
+		if stopLoss >= entryPrice {
+			stopLoss = entryPrice - (atr * slMultiplier)
+		}
+	} else if positionSide == "SHORT" {
+		if takeProfit >= entryPrice {
+			takeProfit = entryPrice - (atr * tpMultiplier)
+		}
+		if stopLoss <= entryPrice {
+			stopLoss = entryPrice + (atr * slMultiplier)
+		}
+	}
 
 	// Calculate the effective ratio
 	ratio := 0.0
@@ -540,6 +563,9 @@ func (t *Trader) calculateTPSLWithRatioFallback(entryPrice float64, positionSide
 	// Calculate TP based on 15-minute price projection
 	takeProfit = t.calculateTPBasedOn15MinProjection(entryPrice, positionSide)
 
+	// Account for commission (0.09% total for entry and exit)
+	commission := 0.0009 // 0.09% commission
+
 	// Calculate the percentage distance from entry to TP
 	var tpPercentDistance float64
 	if positionSide == "LONG" {
@@ -555,9 +581,21 @@ func (t *Trader) calculateTPSLWithRatioFallback(entryPrice float64, positionSide
 	if positionSide == "LONG" {
 		// For LONG positions: SL below entry price, TP above entry price
 		stopLoss = entryPrice * (1 - slPercentDistance/100)
+		// Add commission to TP to ensure profit after fees, reduce SL to account for commission
+		takeProfit = takeProfit + (entryPrice * commission)
+		stopLoss = stopLoss - (entryPrice * commission)
 	} else {
 		// For SHORT positions: SL above entry price, TP below entry price
 		stopLoss = entryPrice * (1 + slPercentDistance/100)
+		// Reduce TP to account for commission, increase SL to account for commission
+		takeProfit = takeProfit - (entryPrice * commission)
+		stopLoss = stopLoss + (entryPrice * commission)
+	}
+
+	// Ensure TP and SL are properly rounded to tick size
+	if t.State.Instr.TickSize > 0 {
+		takeProfit = math.Round(takeProfit/t.State.Instr.TickSize) * t.State.Instr.TickSize
+		stopLoss = math.Round(stopLoss/t.State.Instr.TickSize) * t.State.Instr.TickSize
 	}
 
 	// Validate that we maintain the 2:1 ratio
