@@ -344,6 +344,12 @@ func main() {
 	
 	// Handle daemon commands
 	if *daemonStart || *daemonStop || *daemonRestart {
+		// Initialize logging for daemon operations
+		if err := initLogging(); err != nil {
+			log.Fatalf("Failed to initialize logging: %v", err)
+			return
+		}
+		
 		if *daemonStart {
 			logInfo("Starting daemon...")
 			args := []string{}
