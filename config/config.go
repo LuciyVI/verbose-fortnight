@@ -29,6 +29,10 @@ type Config struct {
 	TrailPerc        float64
 	Debug            bool
 	DynamicTP        bool
+	// ATR-based parameters for dynamic TP/SL
+	TPAtrMultiplier  float64  // Multiplier for ATR to calculate Take Profit
+	SLAtrMultiplier  float64  // Multiplier for ATR to calculate Stop Loss
+	AtrPeriod        int      // Period for ATR calculation
 	// Signal confirmation thresholds
 	OrderbookStrengthThreshold float64
 	SignalStrengthThreshold    int
@@ -72,6 +76,10 @@ func LoadConfig() *Config {
 		TrailPerc:        0.005,  // Keep trailing stop at 0.5% but adjust how it's applied
 		Debug:            false,
 		DynamicTP:        false,
+		// ATR-based parameters for dynamic TP/SL
+		TPAtrMultiplier: 2.0,      // Default: Take Profit at 2.0 * ATR
+		SLAtrMultiplier: 1.0,      // Default: Stop Loss at 1.0 * ATR
+		AtrPeriod:       14,       // Default ATR period
 		OrderbookStrengthThreshold: 1.05,
 		SignalStrengthThreshold:    2,
 		// Logging defaults

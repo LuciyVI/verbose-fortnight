@@ -242,7 +242,11 @@ function updateSettings() {
         positionSize: parseFloat(document.getElementById('positionSize').value),
         tpOffset: parseFloat(document.getElementById('tpOffset').value),
         slPercentage: parseFloat(document.getElementById('slPercentage').value),
-        enableLogging: document.getElementById('enableLogging').checked
+        enableLogging: document.getElementById('enableLogging').checked,
+        // Add ATR parameters that might be accessible from main controls
+        TPAtrMultiplier: parseFloat(document.getElementById('atrTpMultiplier')?.value || '2.0'),
+        SLAtrMultiplier: parseFloat(document.getElementById('atrSlMultiplier')?.value || '1.0'),
+        AtrPeriod: parseInt(document.getElementById('atrPeriod')?.value || '14')
     };
     
     sendMessage({
@@ -271,7 +275,9 @@ document.addEventListener('DOMContentLoaded', function() {
             apiSecret: document.getElementById('apiSecret').value,
             signalThreshold: parseInt(document.getElementById('signalThreshold').value),
             orderbookThreshold: parseFloat(document.getElementById('orderbookThreshold').value),
-            atrMultiplier: parseFloat(document.getElementById('atrMultiplier').value),
+            TPAtrMultiplier: parseFloat(document.getElementById('atrTpMultiplier').value),
+            SLAtrMultiplier: parseFloat(document.getElementById('atrSlMultiplier').value),
+            AtrPeriod: parseInt(document.getElementById('atrPeriod').value),
             trailStopEnabled: document.getElementById('trailStopEnabled').checked
         };
         

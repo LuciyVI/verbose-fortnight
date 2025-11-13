@@ -22,13 +22,13 @@ cd /path/to/verbose-fortnight
 
 ```bash
 # Build the integrated trading bot application
-go build -o integrated_trading_bot ./cmd/integrated_trading_bot/
+go build -o go-trade main.go
 ```
 
-Alternatively, you can build directly using:
+Alternatively, you can run directly without building:
 
 ```bash
-go build -o integrated_trading_bot ./cmd/integrated_trading_bot/main.go
+go run main.go
 ```
 
 ## Run Instructions
@@ -40,50 +40,49 @@ export BYBIT_API_KEY="your_api_key_here"
 export BYBIT_API_SECRET="your_api_secret_here"
 ```
 
-### 2. Run the application with web UI enabled:
+### 2. Run the application:
 
 ```bash
-# Run the integrated bot with web UI
-./integrated_trading_bot -webui -web-port=8080 -debug
+# Run the trading bot
+./go-trade -debug
 ```
 
 ### Available Command Line Options:
 
-- `-webui`: Enable the web interface (default: false)
-- `-web-port`: Port for the web interface (default: 8080)
 - `-debug`: Enable debug logs (default: false)
-- `-start-daemon`: Start the application as a daemon
-- `-stop-daemon`: Stop the daemon process
-- `-restart-daemon`: Restart the daemon process
 
 ### Example commands:
 
 ```bash
-# Run with web UI on default port 8080
-./integrated_trading_bot -webui
+# Run with debug mode
+./go-trade -debug
 
-# Run with web UI on a custom port
-./integrated_trading_bot -webui -web-port=9000
+# Run without debug mode
+./go-trade
 
-# Run with debug and web UI
-./integrated_trading_bot -webui -debug
+# Run directly without building
+go run main.go -debug
 
-# Run as a daemon
-./integrated_trading_bot -start-daemon
+# Run without building and without debug
+go run main.go
 ```
 
-## Accessing the Web Interface
+## Web Interface
 
-If you've started the application with `-webui`, you can access the dashboard by opening your browser and navigating to:
-
-- `http://localhost:8080` (or the port you specified with `-web-port`)
-
-The web interface provides:
+The trading bot includes a web interface that provides:
 - Real-time dashboard statistics
 - Current market data
 - Open positions overview
 - Recent trades history
 - Control panel for the trading bot
+
+To enable the web interface, you need to set the ENABLE_WEBUI environment variable to true:
+
+```bash
+export ENABLE_WEBUI=true
+```
+
+The web interface will be available at `http://localhost:8080` when the bot is running.
 
 ## Configuration
 
@@ -94,8 +93,11 @@ The trading bot uses several configuration parameters that are loaded from the `
 - `Symbol`: Trading symbol (default: BTCUSDT)
 - `Interval`: Candle interval (default: 1m)
 - `Contract Size`: Size of each contract (default: 0.001)
-- `Take Profit Percentage`: TP percentage when dynamic TP is disabled
-- `Stop Loss Percentage`: SL percentage (default: 0.4%)
+- `ATR Take Profit Multiplier`: Multiplier for ATR to calculate Take Profit (default: 2.0)
+- `ATR Stop Loss Multiplier`: Multiplier for ATR to calculate Stop Loss (default: 1.0)
+- `ATR Period`: Period for ATR calculation (default: 14)
+- `Take Profit Percentage`: TP percentage when dynamic TP is disabled (fallback)
+- `Stop Loss Percentage`: SL percentage (fallback) (default: 0.4%)
 - `Trailing Stop Percentage`: Trailing stop percentage (default: 0.1%)
 
 ## Development and Testing
@@ -137,19 +139,41 @@ go run cmd/integrated_trading_bot/main.go -webui -debug
 2. Check the generated log files (default: `trading_bot.log`)
 3. Verify that all required environment variables are set
 
-## Running as a Daemon
+## Running as a Service
 
-The integrated trading bot supports running as a daemon for continuous operation:
+To run the trading bot as a service for continuous operation, you can use process managers like systemd, supervisor, or pm2:
 
+For systemd (Linux), you can create a service file at `/etc/systemd/system/trading-bot.service`:
+
+```ini
+[Unit]
+Description=Cryptocurrency Trading Bot
+After=network.target
+
+[Service]
+Type=simple
+User=your-username
+WorkingDirectory=/path/to/verbose-fortnight
+ExecStart=/path/to/verbose-fortnight/go-trade
+Restart=always
+RestartSec=10
+Environment=BYBIT_API_KEY=your_api_key
+Environment=BYBIT_API_SECRET=your_api_secret
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Then you can manage the service with:
 ```bash
-# Start the daemon
-./integrated_trading_bot -start-daemon -webui
+# Start the service
+sudo systemctl start trading-bot
 
-# Stop the daemon
-./integrated_trading_bot -stop-daemon
+# Enable auto-start on boot
+sudo systemctl enable trading-bot
 
-# Restart the daemon
-./integrated_trading_bot -restart-daemon
+# Check status
+sudo systemctl status trading-bot
 ```
 
 ## Additional Notes
@@ -159,6 +183,8 @@ The integrated trading bot supports running as a daemon for continuous operation
 - The web interface provides real-time monitoring and basic controls for the trading bot
 - The application implements proper graceful shutdown, which cancels all active orders and closes connections when terminated
 - The application includes several technical indicators like ATR, SMA, Bollinger Bands, and MACD to inform trading decisions
+- The bot features dynamic TP/SL based on market volatility using ATR (Average True Range), automatically adjusting stop levels based on current market conditions
+- ATR-based TP/SL helps maintain consistent risk/reward ratios regardless of market volatility
 
 ## License
 

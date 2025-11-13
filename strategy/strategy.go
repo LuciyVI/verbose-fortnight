@@ -96,11 +96,24 @@ func (t *Trader) TPWorker() {
 			if tickSize <= 0 {
 				tickSize = 0.1 // Default fallback
 			}
-			if job.Side == "LONG" {
-				finalTP = math.Round(entryPrice*(1+t.Config.TpOffset)/tickSize) * tickSize
-			} else {
-				finalTP = math.Round(entryPrice*(1-t.Config.TpOffset)/tickSize) * tickSize
+			// Calculate ATR-based TP as fallback instead of fixed percentage
+			atr := indicators.CalculateATR(t.State.Highs, t.State.Lows, t.State.Closes, t.Config.AtrPeriod)
+			if atr <= 0 {
+				// If ATR calculation fails, use a default fallback
+				t.Logger.Warning("ATR calculation failed in fallback, using default multiplier")
+				atr = 90 // Default value similar to the one in order/order.go
 			}
+			tpMultiplier := t.Config.TPAtrMultiplier
+			tickSize = t.State.Instr.TickSize
+			if tickSize <= 0 {
+				tickSize = 0.1 // Default fallback
+			}
+			if job.Side == "LONG" {
+				finalTP = math.Round((entryPrice + (atr * tpMultiplier))/tickSize) * tickSize
+			} else {
+				finalTP = math.Round((entryPrice - (atr * tpMultiplier))/tickSize) * tickSize
+			}
+			t.Logger.Info("Using ATR-based fallback TP calculation: %.2f", finalTP)
 			t.Logger.Info("Using fallback TP calculation: %.2f", finalTP)
 		}
 		
@@ -474,12 +487,59 @@ func (t *Trader) openPosition(newSide string, price float64) {
 	t.Logger.Info("Position opened: %s %.4f @ %.2f | TP %.2f  SL %.2f", newSide, qty, entry, tp, sl)
 }
 
-// calculateTPSLWithRatio calculates TP/SL with a 2:1 ratio based on 15-minute price projection
-// TP is calculated based on expected price movement in the next 15 minutes
+// calculateTPSLWithRatio calculates TP/SL with ATR-based multipliers
 func (t *Trader) calculateTPSLWithRatio(entryPrice float64, positionSide string) (takeProfit float64, stopLoss float64) {
+	// Calculate ATR using the configured period
+	atr := indicators.CalculateATR(t.State.Highs, t.State.Lows, t.State.Closes, t.Config.AtrPeriod)
+	if atr <= 0 {
+		// Fallback to default behavior if ATR calculation fails
+		t.Logger.Warning("ATR calculation failed, using fallback 15-minute projection")
+		return t.calculateTPSLWithRatioFallback(entryPrice, positionSide)
+	}
+
+	t.Logger.Debug("ATR(%d) calculated for TP/SL: %.4f", t.Config.AtrPeriod, atr)
+
+	// Calculate TP and SL based on ATR multipliers
+	tpMultiplier := t.Config.TPAtrMultiplier
+	slMultiplier := t.Config.SLAtrMultiplier
+
+	if positionSide == "LONG" {
+		// For LONG positions: TP above entry, SL below entry
+		takeProfit = entryPrice + (atr * tpMultiplier)
+		stopLoss = entryPrice - (atr * slMultiplier)
+	} else if positionSide == "SHORT" {
+		// For SHORT positions: TP below entry, SL above entry
+		takeProfit = entryPrice - (atr * tpMultiplier)
+		stopLoss = entryPrice + (atr * slMultiplier)
+	}
+
+	// Ensure TP and SL are properly rounded to tick size
+	if t.State.Instr.TickSize > 0 {
+		takeProfit = math.Round(takeProfit/t.State.Instr.TickSize) * t.State.Instr.TickSize
+		stopLoss = math.Round(stopLoss/t.State.Instr.TickSize) * t.State.Instr.TickSize
+	}
+
+	// Validate that the calculated values make sense
+	tpDistanceActual := math.Abs(takeProfit - entryPrice)
+	slDistanceActual := math.Abs(entryPrice - stopLoss)
+
+	// Calculate the effective ratio
+	ratio := 0.0
+	if slDistanceActual > 0 {
+		ratio = tpDistanceActual / slDistanceActual
+	}
+
+	t.Logger.Debug("ATR-based TP/SL calculation - Entry: %.2f, TP: %.2f, SL: %.2f, TP Dist: %.4f, SL Dist: %.4f, Ratio: %.2f:1 (Target TP: %.2f, SL: %.2f)",
+		entryPrice, takeProfit, stopLoss, tpDistanceActual, slDistanceActual, ratio, tpMultiplier, slMultiplier)
+
+	return takeProfit, stopLoss
+}
+
+// calculateTPSLWithRatioFallback provides the previous 15-minute projection fallback for compatibility
+func (t *Trader) calculateTPSLWithRatioFallback(entryPrice float64, positionSide string) (takeProfit float64, stopLoss float64) {
 	// Calculate TP based on 15-minute price projection
 	takeProfit = t.calculateTPBasedOn15MinProjection(entryPrice, positionSide)
-	
+
 	// Calculate the percentage distance from entry to TP
 	var tpPercentDistance float64
 	if positionSide == "LONG" {
@@ -487,10 +547,10 @@ func (t *Trader) calculateTPSLWithRatio(entryPrice float64, positionSide string)
 	} else {
 		tpPercentDistance = math.Abs((entryPrice - takeProfit) / entryPrice * 100)
 	}
-	
+
 	// Calculate SL distance as half of TP distance (2:1 ratio)
 	slPercentDistance := tpPercentDistance / 2
-	
+
 	// Set SL based on position side to maintain 2:1 ratio
 	if positionSide == "LONG" {
 		// For LONG positions: SL below entry price, TP above entry price
@@ -499,19 +559,19 @@ func (t *Trader) calculateTPSLWithRatio(entryPrice float64, positionSide string)
 		// For SHORT positions: SL above entry price, TP below entry price
 		stopLoss = entryPrice * (1 + slPercentDistance/100)
 	}
-	
+
 	// Validate that we maintain the 2:1 ratio
 	tpDistanceActual := math.Abs(takeProfit - entryPrice)
 	slDistanceActual := math.Abs(entryPrice - stopLoss)
-	
+
 	ratio := 0.0
 	if slDistanceActual > 0 {
 		ratio = tpDistanceActual / slDistanceActual
 	}
-	
-	t.Logger.Debug("TP/SL calculation with 2:1 ratio - Entry: %.2f, TP: %.2f, SL: %.2f, TP Distance: %.4f, SL Distance: %.4f, Actual Ratio: %.2f:1", 
+
+	t.Logger.Debug("TP/SL calculation with 2:1 ratio - Entry: %.2f, TP: %.2f, SL: %.2f, TP Distance: %.4f, SL Distance: %.4f, Actual Ratio: %.2f:1",
 		entryPrice, takeProfit, stopLoss, tpDistanceActual, slDistanceActual, ratio)
-	
+
 	return takeProfit, stopLoss
 }
 
