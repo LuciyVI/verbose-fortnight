@@ -1,0 +1,10 @@
+go-trade
+trading_bot
+integrated_trading_bot
+*.log
+*.log.gz
+*.pid
+*.tmp
+.DS_Store
+go.sum
+coverage.out
