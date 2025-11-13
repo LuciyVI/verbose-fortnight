@@ -16,6 +16,7 @@ import (
 	"verbose-fortnight/models"
 	"verbose-fortnight/order"
 	"verbose-fortnight/position"
+	"verbose-fortnight/strategy/signals"  // Add the signals package import
 	"verbose-fortnight/web_interface"  // Add the web interface import
 )
 
@@ -28,6 +29,13 @@ type Trader struct {
 	PositionManager *position.PositionManager
 	Logger          logging.LoggerInterface
 	WebUI           *web_interface.WebUI  // Add WebUI for broadcasting updates
+	
+	// New architecture components
+	RegimeDetector        *RegimeDetector
+	MultiTimeframeIndicators *MultiTimeframeIndicators
+	SignalScorer          *SignalScorer
+	SignalFilter          *SignalFilter
+	SignalQueueManager    *SignalQueueManager
 }
 
 // NewTrader creates a new trader instance
@@ -805,57 +813,47 @@ func (t *Trader) closeOppositePosition(newSide string) {
 	}
 }
 
-// Trader processes signals and executes trades
+// Trader processes signals and executes trades using the new architecture
 func (t *Trader) Trader() {
-	signalStrength := make(map[string]int)
-	lastSignal := ""
+	t.Logger.Info("Starting trader with new signal system...")
 	
-	for sig := range t.State.SigChan {
-		signalStrength[sig.Kind]++
-		
-		// Prevent consecutive same signals
-		if sig.Kind == lastSignal {
-			if t.Config.Debug {
-				t.Logger.Debug("Skipping duplicate signal: %s", sig.Kind)
-			}
+	for {
+		// Check for signals in the queue
+		signal, ok := t.SignalQueueManager.GetNextSignal()
+		if !ok {
+			// No signals in queue, wait a bit before checking again
+			time.Sleep(100 * time.Millisecond)
 			continue
 		}
-		
-		if t.Config.Debug {
-			t.Logger.Debug("Signal strength: %v", signalStrength)
+
+		// Only process high confidence signals
+		if signal.Confidence < 0.5 {
+			continue
 		}
 
-		// Process LONG signal with proper conflict resolution
-		if sig.Kind == "SMA_LONG" && signalStrength["SMA_LONG"] >= t.Config.SignalStrengthThreshold && t.CheckOrderbookStrength("LONG") {
-			if t.Config.Debug {
-				t.Logger.Debug("Confirmed LONG signal: %d indicators", signalStrength["SMA_LONG"])
-			}
-			
+		// Process LONG signal
+		if signal.Direction == "LONG" {
+			t.Logger.Info("Processing LONG signal with confidence %.2f", signal.Confidence)
+
 			// Check if we have an opposite position that needs to be closed first
 			exists, side, _, _, _ := t.PositionManager.HasOpenPosition()
 			if exists && t.PositionManager.NormalizeSide(side) == "SHORT" {
 				t.Logger.Info("Closing existing SHORT position before opening LONG")
 				t.closeOppositePosition("LONG")
 			}
-			
-			t.HandleLongSignal(sig.ClosePrice)
-			lastSignal = "SMA_LONG"
-			t.resetSignalStrength(&signalStrength)
-		} else if sig.Kind == "SMA_SHORT" && signalStrength["SMA_SHORT"] >= t.Config.SignalStrengthThreshold && t.CheckOrderbookStrength("SHORT") {
-			if t.Config.Debug {
-				t.Logger.Debug("Confirmed SHORT signal: %d indicators", signalStrength["SMA_SHORT"])
-			}
-			
+
+			t.HandleLongSignal(signal.ClosePrice)
+		} else if signal.Direction == "SHORT" {
+			t.Logger.Info("Processing SHORT signal with confidence %.2f", signal.Confidence)
+
 			// Check if we have an opposite position that needs to be closed first
 			exists, side, _, _, _ := t.PositionManager.HasOpenPosition()
 			if exists && t.PositionManager.NormalizeSide(side) == "LONG" {
 				t.Logger.Info("Closing existing LONG position before opening SHORT")
 				t.closeOppositePosition("SHORT")
 			}
-			
-			t.HandleShortSignal(sig.ClosePrice)
-			lastSignal = "SMA_SHORT"
-			t.resetSignalStrength(&signalStrength)
+
+			t.HandleShortSignal(signal.ClosePrice)
 		}
 	}
 }
@@ -979,4 +977,132 @@ func (t *Trader) LogSignalStats() {
 
 	accuracy := float64(correct) / float64(total) * 100
 	t.Logger.Info("Signal stats: %d/%d (%.1f%%)", correct, total, accuracy)
+}
+
+// Initialize the new signal generation components
+func (t *Trader) InitializeNewSignalSystem() {
+	t.Logger.Info("Initializing new signal generation system...")
+	
+	// Initialize new components
+	t.RegimeDetector = NewRegimeDetector()
+	t.MultiTimeframeIndicators = NewMultiTimeframeIndicators()
+	t.SignalScorer = NewSignalScorer()
+	t.SignalFilter = NewSignalFilter()
+	t.SignalQueueManager = NewSignalQueueManager()
+	
+	// Start the new signal generation worker
+	go t.NewSignalGenerationWorker()
+}
+
+// NewSignalGenerationWorker generates signals based on the new architecture
+func (t *Trader) NewSignalGenerationWorker() {
+	t.Logger.Info("Starting New Signal Generation Worker with multi-timeframe analysis...")
+
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		// Update market regime
+		regime := t.RegimeDetector.DetectRegime(t.State.Closes)
+		t.State.MarketRegime = string(regime)
+		t.SignalQueueManager.UpdateRegime(regime)
+		
+		// Update multi-timeframe data
+		t.MultiTimeframeIndicators.data.AddData(signals.Source1Sec, t.State.Closes)
+		
+		// Generate signals for current timeframe (1-second)
+		if len(t.State.Closes) < t.Config.SmaLen {
+			continue
+		}
+
+		closesCopy := append([]float64(nil), t.State.Closes...)
+		cls := closesCopy[len(closesCopy)-1]
+
+		// Calculate all indicators on current timeframe
+		smaVal := indicators.SMA(closesCopy)
+		macdResult := indicators.MACDResult{}
+		macdLine, signalLine := indicators.MACD(closesCopy)
+		macdResult.MACDLine = macdLine
+		macdResult.SignalLine = signalLine
+		macdResult.Histogram = macdLine - signalLine
+		bbBands := indicators.BollingerBands{}
+		bbUpper, bbMiddle, bbLower := indicators.CalculateBollingerBands(closesCopy, 20, 2.0)
+		bbBands.Upper = bbUpper
+		bbBands.Middle = bbMiddle
+		bbBands.Lower = bbLower
+		rsiValues := indicators.RSI(closesCopy, 14)
+		var rsi float64
+		if len(rsiValues) > 0 && !math.IsNaN(rsiValues[len(rsiValues)-1]) {
+			rsi = rsiValues[len(rsiValues)-1]
+		}
+
+		// Score each signal type based on current regime
+		smaSignal := t.SignalScorer.ScoreSMASignal(cls, smaVal, regime, signals.Source1Sec)
+		macdSignal := t.SignalScorer.ScoreMACDSignal(macdResult, regime, signals.Source1Sec)
+		bbSignal := t.SignalScorer.ScoreBollingerSignal(cls, bbBands, regime, signals.Source1Sec)
+		rsiSignal := t.SignalScorer.ScoreRSISignal(rsi, regime, signals.Source1Sec)
+		
+		// Get orderbook signal
+		t.State.ObLock.Lock()
+		var bidDepth, askDepth float64
+		for _, size := range t.State.BidsMap {
+			bidDepth += size
+		}
+		for _, size := range t.State.AsksMap {
+			askDepth += size
+		}
+		t.State.ObLock.Unlock()
+		obSignal := t.SignalScorer.ScoreOrderbookSignal(bidDepth, askDepth, regime, signals.Source1Sec)
+		
+		// Collect all generated signals
+		rawSignals := []signals.Signal{}
+		if smaSignal.Direction != "" {
+			smaSignal.ClosePrice = cls
+			smaSignal.Time = time.Now()
+			rawSignals = append(rawSignals, smaSignal)
+		}
+		if macdSignal.Direction != "" {
+			macdSignal.ClosePrice = cls
+			macdSignal.Time = time.Now()
+			rawSignals = append(rawSignals, macdSignal)
+		}
+		if bbSignal.Direction != "" {
+			bbSignal.ClosePrice = cls
+			bbSignal.Time = time.Now()
+			rawSignals = append(rawSignals, bbSignal)
+		}
+		if rsiSignal.Direction != "" {
+			rsiSignal.ClosePrice = cls
+			rsiSignal.Time = time.Now()
+			rawSignals = append(rawSignals, rsiSignal)
+		}
+		if obSignal.Direction != "" {
+			obSignal.ClosePrice = cls
+			obSignal.Time = time.Now()
+			rawSignals = append(rawSignals, obSignal)
+		}
+
+		// Filter each signal
+		filteredSignals := []signals.Signal{}
+		for _, signal := range rawSignals {
+			filteredSignal, ok := t.SignalFilter.FilterSignal(signal, regime, cls)
+			if ok {
+				// Add to signal buffer for temporal confirmation
+				t.SignalFilter.AddToBuffer(filteredSignal)
+				
+				// Check if signal is confirmed
+				if t.SignalFilter.ConfirmSignal(filteredSignal) {
+					filteredSignals = append(filteredSignals, filteredSignal)
+				}
+			}
+		}
+
+		// Process signal batch and get combined decision
+		if len(filteredSignals) > 0 {
+			combinedSignal, ok := t.SignalQueueManager.ProcessSignalBatch(filteredSignals, 0.3) // Minimum 0.3 confidence
+			if ok {
+				t.Logger.Info("Combined signal generated: %s with confidence %.2f", combinedSignal.Direction, combinedSignal.Confidence)
+			}
+		}
+	}
 }

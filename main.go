@@ -23,6 +23,7 @@ import (
 	"verbose-fortnight/logging"
 	"verbose-fortnight/models"
 	"verbose-fortnight/strategy"
+	"verbose-fortnight/web_interface"
 )
 
 var (
@@ -486,11 +487,14 @@ func main() {
 		}
 	}()
 
+	// Create WebUI
+	webUI := web_interface.NewWebUI(cfg, state)
+	
 	// Create trader
-	trader := strategy.NewTrader(apiClient, cfg, state, logger)
+	trader := strategy.NewTrader(apiClient, cfg, state, logger, webUI)
 
 	// Start indicator and trading goroutines
-	go trader.SMAMovingAverageWorker()
+	trader.InitializeNewSignalSystem() // Initialize the new signal generation system
 	go trader.Trader()
 	go trader.SyncPositionRealTime()
 	go trader.TPWorker() // take profit worker

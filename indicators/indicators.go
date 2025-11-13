@@ -281,3 +281,16 @@ func VolumeWeightedPrice(orderbook map[string]float64, isBuy bool, thresholdQty 
 
 	return 0
 }
+
+// Structure definitions for return types
+type MACDResult struct {
+	MACDLine   float64
+	SignalLine float64
+	Histogram  float64
+}
+
+type BollingerBands struct {
+	Upper  float64
+	Middle float64
+	Lower  float64
+}
