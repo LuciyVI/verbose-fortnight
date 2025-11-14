@@ -190,7 +190,7 @@ func (pm *PositionManager) CancelAllOrders(symbol string) {
 func (pm *PositionManager) GetLastBidPrice() float64 {
 	pm.State.ObLock.Lock()
 	defer pm.State.ObLock.Unlock()
-	
+
 	var min float64
 	for ps := range pm.State.BidsMap {
 		p, _ := strconv.ParseFloat(ps, 64)
@@ -205,7 +205,7 @@ func (pm *PositionManager) GetLastBidPrice() float64 {
 func (pm *PositionManager) GetLastAskPrice() float64 {
 	pm.State.ObLock.Lock()
 	defer pm.State.ObLock.Unlock()
-	
+
 	var max float64
 	for ps := range pm.State.AsksMap {
 		p, _ := strconv.ParseFloat(ps, 64)
@@ -234,14 +234,14 @@ func (pm *PositionManager) CalculatePositionProfit(side string, entryPrice, exit
 	if entryPrice <= 0 || exitPrice <= 0 || qty <= 0 {
 		return 0 // Can't calculate profit without valid prices and quantity
 	}
-	
+
 	var profit float64
 	if side == "LONG" {
 		profit = (exitPrice - entryPrice) * qty
 	} else if side == "SHORT" {
 		profit = (entryPrice - exitPrice) * qty
 	}
-	
+
 	// Update state with profit information
 	pm.State.Lock()
 	pm.State.RealizedPnL += profit
@@ -251,7 +251,7 @@ func (pm *PositionManager) CalculatePositionProfit(side string, entryPrice, exit
 		pm.State.TotalLoss += math.Abs(profit)
 	}
 	pm.State.Unlock()
-	
+
 	return profit
 }
 
@@ -263,4 +263,12 @@ func (pm *PositionManager) GetMax(a, b, c float64) float64 {
 // GetMinValue returns the minimum of three values
 func (pm *PositionManager) GetMin(a, b, c float64) float64 {
 	return math.Min(math.Min(a, b), c)
+}
+
+// FormatPrice rounds a price to the instrument's tick size
+func (pm *PositionManager) FormatPrice(price float64) float64 {
+	if pm.State.Instr.TickSize > 0 {
+		return math.Round(price/pm.State.Instr.TickSize) * pm.State.Instr.TickSize
+	}
+	return price
 }

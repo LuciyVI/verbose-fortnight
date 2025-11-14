@@ -29,7 +29,7 @@ type Trader struct {
 	PositionManager *position.PositionManager
 	Logger          logging.LoggerInterface
 	WebUI           *web_interface.WebUI  // Add WebUI for broadcasting updates
-
+	
 	// New architecture components
 	RegimeDetector        *RegimeDetector
 	MultiTimeframeIndicators *MultiTimeframeIndicators
@@ -42,8 +42,8 @@ type Trader struct {
 func NewTrader(apiClient *api.RESTClient, cfg *config.Config, state *models.State, logger logging.LoggerInterface, webUI *web_interface.WebUI) *Trader {
 	orderManager := order.NewOrderManager(apiClient, cfg, state, logger)
 	positionManager := position.NewPositionManager(apiClient, cfg, state, logger)
-
-	trader := &Trader{
+	
+	return &Trader{
 		APIClient:       apiClient,
 		Config:          cfg,
 		State:           state,
@@ -52,21 +52,6 @@ func NewTrader(apiClient *api.RESTClient, cfg *config.Config, state *models.Stat
 		Logger:          logger,
 		WebUI:           webUI,
 	}
-
-	// Initialize the new signal system components
-	trader.initializeSignalSystem()
-
-	return trader
-}
-
-// initializeSignalSystem initializes all the new signal system components
-func (t *Trader) initializeSignalSystem() {
-	// Initialize new components
-	t.RegimeDetector = NewRegimeDetector()
-	t.MultiTimeframeIndicators = NewMultiTimeframeIndicators()
-	t.SignalScorer = NewSignalScorer()
-	t.SignalFilter = NewSignalFilter()
-	t.SignalQueueManager = NewSignalQueueManager()
 }
 
 // TPWorker processes take profit jobs
@@ -111,26 +96,12 @@ func (t *Trader) TPWorker() {
 			if tickSize <= 0 {
 				tickSize = 0.1 // Default fallback
 			}
-			// Calculate ATR-based TP as fallback instead of fixed percentage
-			atr := indicators.CalculateATR(t.State.Highs, t.State.Lows, t.State.Closes, t.Config.AtrPeriod)
-			if atr <= 0 {
-				// If ATR calculation fails, use a default fallback
-				t.Logger.Warning("ATR calculation failed in fallback, using default multiplier")
-				atr = 90 // Default value similar to the one in order/order.go
-			}
-			tpMultiplier := t.Config.TPAtrMultiplier
-			tickSize = t.State.Instr.TickSize
-			if tickSize <= 0 {
-				tickSize = 0.1 // Default fallback
-			}
-			// Account for commission (0.09% total for entry and exit)
-			commission := entryPrice * 0.0009
 			if job.Side == "LONG" {
-				finalTP = math.Round((entryPrice + (atr * tpMultiplier) + commission)/tickSize) * tickSize
+				finalTP = math.Round(entryPrice*(1+t.Config.TpOffset)/tickSize) * tickSize
 			} else {
-				finalTP = math.Round((entryPrice - (atr * tpMultiplier) - commission)/tickSize) * tickSize
+				finalTP = math.Round(entryPrice*(1-t.Config.TpOffset)/tickSize) * tickSize
 			}
-			t.Logger.Info("Using ATR-based fallback TP calculation: %.2f", finalTP)
+			t.Logger.Info("Using fallback TP calculation: %.2f", finalTP)
 		}
 		
 		// Calculate TP/SL with 2:1 ratio
@@ -341,20 +312,17 @@ func calculateTrendStrength(closes []float64) float64 {
 // HandleLongSignal processes a long signal
 func (t *Trader) HandleLongSignal(closePrice float64) {
 	exists, side, _, _, _ := t.PositionManager.HasOpenPosition()
-	normalizedSide := t.PositionManager.NormalizeSide(side)
+	side = t.PositionManager.NormalizeSide(side)
 	newSide := t.PositionManager.NormalizeSide("LONG")
 
 	if !exists {
-		// No open position, open new long position
 		t.openPosition(newSide, closePrice)
-	} else if normalizedSide == newSide {
-		// Position in the same direction, only adjust TP/SL
+	} else if side == newSide {
 		t.adjustTPSL(closePrice)
-		t.Logger.Info("Confirmed LONG signal received: adjusted TP/SL, current position maintained")
 	} else {
-		// Counter-trend signal, close existing position and open new one
-		t.Logger.Info("Counter-trend signal received: closing %s position, opening LONG position", normalizedSide)
+		// Close opposite position first
 		t.closeOppositePosition(newSide)
+		// Then open new position
 		t.openPosition(newSide, closePrice)
 	}
 }
@@ -362,20 +330,17 @@ func (t *Trader) HandleLongSignal(closePrice float64) {
 // HandleShortSignal processes a short signal
 func (t *Trader) HandleShortSignal(closePrice float64) {
 	exists, side, _, _, _ := t.PositionManager.HasOpenPosition()
-	normalizedSide := t.PositionManager.NormalizeSide(side)
+	side = t.PositionManager.NormalizeSide(side)
 	newSide := t.PositionManager.NormalizeSide("SHORT")
 
 	if !exists {
-		// No open position, open new short position
 		t.openPosition(newSide, closePrice)
-	} else if normalizedSide == newSide {
-		// Position in the same direction, only adjust TP/SL
+	} else if side == newSide {
 		t.adjustTPSLForShort(closePrice)
-		t.Logger.Info("Confirmed SHORT signal received: adjusted TP/SL, current position maintained")
 	} else {
-		// Counter-trend signal, close existing position and open new one
-		t.Logger.Info("Counter-trend signal received: closing %s position, opening SHORT position", normalizedSide)
+		// Close opposite position first
 		t.closeOppositePosition(newSide)
+		// Then open new position
 		t.openPosition(newSide, closePrice)
 	}
 }
@@ -459,22 +424,16 @@ func (t *Trader) openPosition(newSide string, price float64) {
 	}
 	t.Logger.Info("Successfully placed market order to open position %s", newSide)
 
-	// Set TP/SL with 2:1 ratio based on 15-minute projection or dynamic volatility-based calculation
+	// Set TP/SL with 2:1 ratio based on 15-minute projection
 	entry := t.PositionManager.GetLastEntryPrice()
 	if entry == 0 {
 		entry = price
 	}
 
-	var tp, sl float64
-	if t.Config.DynamicTP {
-		// Use dynamic calculation based on market volatility
-		tp, sl = t.calculateDynamicTPSL(entry, newSide)
-		t.Logger.Info("Setting dynamic TP/SL based on volatility: TP=%.2f, SL=%.2f", tp, sl)
-	} else {
-		// Calculate TP/SL with 2:1 ratio based on 15-minute projection
-		tp, sl = t.calculateTPSLWithRatio(entry, newSide)
-		t.Logger.Info("Setting TP/SL with 2:1 ratio: TP=%.2f, SL=%.2f", tp, sl)
-	}
+	// Calculate TP/SL with 2:1 ratio based on 15-minute projection
+	tp, sl := t.calculateTPSLWithRatio(entry, newSide)
+
+	t.Logger.Info("Setting TP/SL with 2:1 ratio: TP=%.2f, SL=%.2f", tp, sl)
 
 	// Update position TP/SL
 	body := map[string]interface{}{
@@ -515,195 +474,12 @@ func (t *Trader) openPosition(newSide string, price float64) {
 	t.Logger.Info("Position opened: %s %.4f @ %.2f | TP %.2f  SL %.2f", newSide, qty, entry, tp, sl)
 }
 
-// calculateTPSLWithRatio calculates TP/SL with ATR-based multipliers
+// calculateTPSLWithRatio calculates TP/SL with a 2:1 ratio based on 15-minute price projection
+// TP is calculated based on expected price movement in the next 15 minutes
 func (t *Trader) calculateTPSLWithRatio(entryPrice float64, positionSide string) (takeProfit float64, stopLoss float64) {
-	// Calculate ATR using the configured period
-	atr := indicators.CalculateATR(t.State.Highs, t.State.Lows, t.State.Closes, t.Config.AtrPeriod)
-	if atr <= 0 {
-		// Fallback to default behavior if ATR calculation fails
-		t.Logger.Warning("ATR calculation failed, using fallback 15-minute projection")
-		return t.calculateTPSLWithRatioFallback(entryPrice, positionSide)
-	}
-
-	t.Logger.Debug("ATR(%d) calculated for TP/SL: %.4f", t.Config.AtrPeriod, atr)
-
-	// Calculate TP and SL based on ATR multipliers
-	tpMultiplier := t.Config.TPAtrMultiplier
-	slMultiplier := t.Config.SLAtrMultiplier
-
-	// Account for commission (0.09% total for entry and exit)
-	commission := 0.0009 // 0.09% commission
-
-	if positionSide == "LONG" {
-		// For LONG positions: TP above entry, SL below entry
-		// Add commission to TP to ensure profit after fees, reduce SL to account for commission
-		takeProfit = entryPrice + (atr * tpMultiplier) + (entryPrice * commission)
-		stopLoss = entryPrice - (atr * slMultiplier) - (entryPrice * commission)
-	} else if positionSide == "SHORT" {
-		// For SHORT positions: TP below entry, SL above entry
-		// Reduce TP to account for commission, increase SL to account for commission
-		takeProfit = entryPrice - (atr * tpMultiplier) - (entryPrice * commission)
-		stopLoss = entryPrice + (atr * slMultiplier) + (entryPrice * commission)
-	}
-
-	// Ensure TP and SL are properly rounded to tick size
-	if t.State.Instr.TickSize > 0 {
-		takeProfit = math.Round(takeProfit/t.State.Instr.TickSize) * t.State.Instr.TickSize
-		stopLoss = math.Round(stopLoss/t.State.Instr.TickSize) * t.State.Instr.TickSize
-	}
-
-	// Validate that the calculated values make sense and are in correct order
-	tpDistanceActual := math.Abs(takeProfit - entryPrice)
-	slDistanceActual := math.Abs(entryPrice - stopLoss)
-
-	// Ensure TP is in profit direction and SL is in loss direction
-	if positionSide == "LONG" {
-		if takeProfit <= entryPrice {
-			takeProfit = entryPrice + (atr * tpMultiplier)
-		}
-		if stopLoss >= entryPrice {
-			stopLoss = entryPrice - (atr * slMultiplier)
-		}
-	} else if positionSide == "SHORT" {
-		if takeProfit >= entryPrice {
-			takeProfit = entryPrice - (atr * tpMultiplier)
-		}
-		if stopLoss <= entryPrice {
-			stopLoss = entryPrice + (atr * slMultiplier)
-		}
-	}
-
-	// Calculate the effective ratio
-	ratio := 0.0
-	if slDistanceActual > 0 {
-		ratio = tpDistanceActual / slDistanceActual
-	}
-
-	t.Logger.Debug("ATR-based TP/SL calculation - Entry: %.2f, TP: %.2f, SL: %.2f, TP Dist: %.4f, SL Dist: %.4f, Ratio: %.2f:1 (Target TP: %.2f, SL: %.2f)",
-		entryPrice, takeProfit, stopLoss, tpDistanceActual, slDistanceActual, ratio, tpMultiplier, slMultiplier)
-
-	return takeProfit, stopLoss
-}
-
-// calculateDynamicTPSL calculates TP/SL based on market volatility using multiple indicators
-func (t *Trader) calculateDynamicTPSL(entryPrice float64, positionSide string) (takeProfit float64, stopLoss float64) {
-	// Calculate multiple volatility measures
-	atr := indicators.CalculateATR(t.State.Highs, t.State.Lows, t.State.Closes, t.Config.AtrPeriod)
-	if atr <= 0 {
-		// Fallback to ATR with default period if calculation fails
-		atr = indicators.CalculateATR(t.State.Highs, t.State.Lows, t.State.Closes, 14)
-		if atr <= 0 {
-			t.Logger.Warning("ATR calculation failed, using standard ATR method")
-			return t.calculateTPSLWithRatio(entryPrice, positionSide)
-		}
-	}
-
-	// Calculate standard deviation as another volatility measure
-	stdDev := indicators.StdDev(t.State.Closes)
-	if stdDev <= 0 && len(t.State.Closes) > 0 {
-		// Calculate standard deviation manually from recent closes
-		mean := indicators.SMA(t.State.Closes)
-		var sum float64
-		for _, c := range t.State.Closes {
-			sum += (c - mean) * (c - mean)
-		}
-		stdDev = math.Sqrt(sum / float64(len(t.State.Closes)))
-	}
-
-	// Calculate Bollinger Bands width as another volatility measure
-	bbUpper, bbMiddle, bbLower := indicators.CalculateBollingerBands(t.State.Closes, t.Config.WindowSize, 2.0)
-	bbWidth := (bbUpper - bbLower) / bbMiddle // Percentage width of the bands
-
-	t.Logger.Debug("Volatility measures - ATR: %.4f, StdDev: %.4f, BBWidth: %.4f", atr, stdDev, bbWidth)
-
-	// Use the highest volatility measure for conservative TP/SL placement
-	var volatilityMeasure float64
-	switch t.State.MarketRegime {
-	case "trend":
-		// In trending markets, use ATR as primary volatility measure
-		volatilityMeasure = atr
-		t.Logger.Debug("Using ATR as volatility measure in trending market")
-	case "range":
-		// In ranging markets, consider both ATR and Bollinger Bands width
-		if bbWidth > 0 && atr > 0 {
-			// Combine ATR and BB width to get a more comprehensive volatility measure
-			volatilityMeasure = math.Max(atr, bbWidth*entryPrice)
-		} else {
-			volatilityMeasure = atr
-		}
-		t.Logger.Debug("Using combined ATR/BB measure as volatility measure in ranging market")
-	default:
-		// Default to ATR if regime is unknown
-		volatilityMeasure = atr
-		t.Logger.Debug("Using ATR as default volatility measure")
-	}
-
-	// Calculate TP and SL based on volatility-adjusted multipliers
-	tpVolMultiplier := t.Config.TPVolatilityMultiplier
-	slVolMultiplier := t.Config.SLVolatilityMultiplier
-
-	// Account for commission (0.09% total for entry and exit)
-	commission := 0.0009 // 0.09% commission
-
-	if positionSide == "LONG" {
-		// For LONG positions: TP above entry, SL below entry
-		// Add commission to TP to ensure profit after fees, reduce SL to account for commission
-		takeProfit = entryPrice + (volatilityMeasure * tpVolMultiplier) + (entryPrice * commission)
-		stopLoss = entryPrice - (volatilityMeasure * slVolMultiplier) - (entryPrice * commission)
-	} else if positionSide == "SHORT" {
-		// For SHORT positions: TP below entry, SL above entry
-		// Reduce TP to account for commission, increase SL to account for commission
-		takeProfit = entryPrice - (volatilityMeasure * tpVolMultiplier) - (entryPrice * commission)
-		stopLoss = entryPrice + (volatilityMeasure * slVolMultiplier) + (entryPrice * commission)
-	}
-
-	// Ensure TP and SL are properly rounded to tick size
-	if t.State.Instr.TickSize > 0 {
-		takeProfit = math.Round(takeProfit/t.State.Instr.TickSize) * t.State.Instr.TickSize
-		stopLoss = math.Round(stopLoss/t.State.Instr.TickSize) * t.State.Instr.TickSize
-	}
-
-	// Validate that the calculated values make sense and are in correct order
-	tpDistanceActual := math.Abs(takeProfit - entryPrice)
-	slDistanceActual := math.Abs(entryPrice - stopLoss)
-
-	// Ensure TP is in profit direction and SL is in loss direction
-	if positionSide == "LONG" {
-		if takeProfit <= entryPrice {
-			takeProfit = entryPrice + (volatilityMeasure * tpVolMultiplier)
-		}
-		if stopLoss >= entryPrice {
-			stopLoss = entryPrice - (volatilityMeasure * slVolMultiplier)
-		}
-	} else if positionSide == "SHORT" {
-		if takeProfit >= entryPrice {
-			takeProfit = entryPrice - (volatilityMeasure * tpVolMultiplier)
-		}
-		if stopLoss <= entryPrice {
-			stopLoss = entryPrice + (volatilityMeasure * slVolMultiplier)
-		}
-	}
-
-	// Calculate the effective ratio
-	ratio := 0.0
-	if slDistanceActual > 0 {
-		ratio = tpDistanceActual / slDistanceActual
-	}
-
-	t.Logger.Debug("Volatility-based TP/SL calculation - Entry: %.2f, TP: %.2f, SL: %.2f, TP Dist: %.4f, SL Dist: %.4f, Ratio: %.2f:1 (Target TP: %.2f, SL: %.2f)",
-		entryPrice, takeProfit, stopLoss, tpDistanceActual, slDistanceActual, ratio, tpVolMultiplier, slVolMultiplier)
-
-	return takeProfit, stopLoss
-}
-
-// calculateTPSLWithRatioFallback provides the previous 15-minute projection fallback for compatibility
-func (t *Trader) calculateTPSLWithRatioFallback(entryPrice float64, positionSide string) (takeProfit float64, stopLoss float64) {
 	// Calculate TP based on 15-minute price projection
 	takeProfit = t.calculateTPBasedOn15MinProjection(entryPrice, positionSide)
-
-	// Account for commission (0.09% total for entry and exit)
-	commission := 0.0009 // 0.09% commission
-
+	
 	// Calculate the percentage distance from entry to TP
 	var tpPercentDistance float64
 	if positionSide == "LONG" {
@@ -711,43 +487,31 @@ func (t *Trader) calculateTPSLWithRatioFallback(entryPrice float64, positionSide
 	} else {
 		tpPercentDistance = math.Abs((entryPrice - takeProfit) / entryPrice * 100)
 	}
-
+	
 	// Calculate SL distance as half of TP distance (2:1 ratio)
 	slPercentDistance := tpPercentDistance / 2
-
+	
 	// Set SL based on position side to maintain 2:1 ratio
 	if positionSide == "LONG" {
 		// For LONG positions: SL below entry price, TP above entry price
 		stopLoss = entryPrice * (1 - slPercentDistance/100)
-		// Add commission to TP to ensure profit after fees, reduce SL to account for commission
-		takeProfit = takeProfit + (entryPrice * commission)
-		stopLoss = stopLoss - (entryPrice * commission)
 	} else {
 		// For SHORT positions: SL above entry price, TP below entry price
 		stopLoss = entryPrice * (1 + slPercentDistance/100)
-		// Reduce TP to account for commission, increase SL to account for commission
-		takeProfit = takeProfit - (entryPrice * commission)
-		stopLoss = stopLoss + (entryPrice * commission)
 	}
-
-	// Ensure TP and SL are properly rounded to tick size
-	if t.State.Instr.TickSize > 0 {
-		takeProfit = math.Round(takeProfit/t.State.Instr.TickSize) * t.State.Instr.TickSize
-		stopLoss = math.Round(stopLoss/t.State.Instr.TickSize) * t.State.Instr.TickSize
-	}
-
+	
 	// Validate that we maintain the 2:1 ratio
 	tpDistanceActual := math.Abs(takeProfit - entryPrice)
 	slDistanceActual := math.Abs(entryPrice - stopLoss)
-
+	
 	ratio := 0.0
 	if slDistanceActual > 0 {
 		ratio = tpDistanceActual / slDistanceActual
 	}
-
-	t.Logger.Debug("TP/SL calculation with 2:1 ratio - Entry: %.2f, TP: %.2f, SL: %.2f, TP Distance: %.4f, SL Distance: %.4f, Actual Ratio: %.2f:1",
+	
+	t.Logger.Debug("TP/SL calculation with 2:1 ratio - Entry: %.2f, TP: %.2f, SL: %.2f, TP Distance: %.4f, SL Distance: %.4f, Actual Ratio: %.2f:1", 
 		entryPrice, takeProfit, stopLoss, tpDistanceActual, slDistanceActual, ratio)
-
+	
 	return takeProfit, stopLoss
 }
 
@@ -833,23 +597,17 @@ func (t *Trader) adjustTPSL(closePrice float64) {
 	
 	atr := indicators.CalculateATR(t.State.Highs, t.State.Lows, t.State.Closes, 14)
 	t.Logger.Debug("ATR(14) calculated for trailing stop: %.4f", atr)
-
-	trailingTP := closePrice + atr*1.5
-	if trailingTP <= curTP {
-		t.Logger.Info("New TP %.2f is not better than current TP %.2f, skipping update", trailingTP, curTP)
+	
+	newTP := closePrice + atr*1.5
+	if newTP <= curTP {
+		t.Logger.Info("New TP %.2f is not better than current TP %.2f, skipping update", newTP, curTP)
 		return
 	}
-
-	var newTP, newSL float64
-	if t.Config.DynamicTP {
-		// Use dynamic calculation based on market volatility
-		newTP, newSL = t.calculateDynamicTPSL(entry, "LONG")
-		t.Logger.Info("Sending dynamic TP/SL update based on volatility: TP %.2f, SL %.2f", newTP, newSL)
-	} else {
-		// Calculate TP/SL with 2:1 ratio based on 15-minute projection
-		newTP, newSL = t.calculateTPSLWithRatio(entry, "LONG")
-		t.Logger.Info("Sending TP/SL update to exchange: TP %.2f, SL %.2f", newTP, newSL)
-	}
+	
+	// Calculate TP/SL with 2:1 ratio based on 15-minute projection
+	newTP, newSL := t.calculateTPSLWithRatio(entry, "LONG")
+	
+	t.Logger.Info("Sending TP/SL update to exchange: TP %.2f, SL %.2f", newTP, newSL)
 	if err := t.PositionManager.UpdatePositionTPSL(t.Config.Symbol, newTP, newSL); err != nil {
 		t.Logger.Error("Error updating TP/SL: %v", err)
 	} else {
@@ -871,24 +629,17 @@ func (t *Trader) adjustTPSLForShort(closePrice float64) {
 		t.Logger.Error("Could not get entry price, skipping TP/SL adjustment")
 		return
 	}
-
-	trailingTP := closePrice * 0.998
-	if trailingTP >= curTP*1.001 { // Protection against small changes
-		t.Logger.Info("New TP %.2f is not better than current TP %.2f, skipping update", trailingTP, curTP)
+	
+	newTP := closePrice * 0.998
+	if newTP >= curTP*1.001 { // Protection against small changes
+		t.Logger.Info("New TP %.2f is not better than current TP %.2f, skipping update", newTP, curTP)
 		return
 	}
-
+	
 	// Calculate TP/SL with 2:1 ratio based on 15-minute projection
-	var newTP, newSL float64
-	if t.Config.DynamicTP {
-		// Use dynamic calculation based on market volatility
-		newTP, newSL = t.calculateDynamicTPSL(entry, "SHORT")
-		t.Logger.Info("Sending dynamic TP/SL update based on volatility: TP %.2f, SL %.2f", newTP, newSL)
-	} else {
-		// Calculate TP/SL with 2:1 ratio based on 15-minute projection
-		newTP, newSL = t.calculateTPSLWithRatio(entry, "SHORT")
-		t.Logger.Info("Sending TP/SL update to exchange: TP %.2f, SL %.2f", newTP, newSL)
-	}
+	newTP, newSL := t.calculateTPSLWithRatio(entry, "SHORT")
+	
+	t.Logger.Info("Sending TP/SL update to exchange: TP %.2f, SL %.2f", newTP, newSL)
 	if err := t.PositionManager.UpdatePositionTPSL(t.Config.Symbol, newTP, newSL); err != nil {
 		t.Logger.Error("adjustTPSLForShort error: %v", err)
 	} else {
@@ -1065,7 +816,7 @@ func (t *Trader) closeOppositePosition(newSide string) {
 // Trader processes signals and executes trades using the new architecture
 func (t *Trader) Trader() {
 	t.Logger.Info("Starting trader with new signal system...")
-
+	
 	for {
 		// Check for signals in the queue
 		signal, ok := t.SignalQueueManager.GetNextSignal()
@@ -1083,9 +834,25 @@ func (t *Trader) Trader() {
 		// Process LONG signal
 		if signal.Direction == "LONG" {
 			t.Logger.Info("Processing LONG signal with confidence %.2f", signal.Confidence)
+
+			// Check if we have an opposite position that needs to be closed first
+			exists, side, _, _, _ := t.PositionManager.HasOpenPosition()
+			if exists && t.PositionManager.NormalizeSide(side) == "SHORT" {
+				t.Logger.Info("Closing existing SHORT position before opening LONG")
+				t.closeOppositePosition("LONG")
+			}
+
 			t.HandleLongSignal(signal.ClosePrice)
 		} else if signal.Direction == "SHORT" {
 			t.Logger.Info("Processing SHORT signal with confidence %.2f", signal.Confidence)
+
+			// Check if we have an opposite position that needs to be closed first
+			exists, side, _, _, _ := t.PositionManager.HasOpenPosition()
+			if exists && t.PositionManager.NormalizeSide(side) == "LONG" {
+				t.Logger.Info("Closing existing LONG position before opening SHORT")
+				t.closeOppositePosition("SHORT")
+			}
+
 			t.HandleShortSignal(signal.ClosePrice)
 		}
 	}
@@ -1215,7 +982,14 @@ func (t *Trader) LogSignalStats() {
 // Initialize the new signal generation components
 func (t *Trader) InitializeNewSignalSystem() {
 	t.Logger.Info("Initializing new signal generation system...")
-
+	
+	// Initialize new components
+	t.RegimeDetector = NewRegimeDetector()
+	t.MultiTimeframeIndicators = NewMultiTimeframeIndicators()
+	t.SignalScorer = NewSignalScorer()
+	t.SignalFilter = NewSignalFilter()
+	t.SignalQueueManager = NewSignalQueueManager()
+	
 	// Start the new signal generation worker
 	go t.NewSignalGenerationWorker()
 }

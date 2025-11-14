@@ -275,7 +275,7 @@ func (om *OrderManager) CalculateTakeProfitBB(side string) float64 {
 	smaVal := indicators.SMA(om.State.Closes)
 	stdVal := indicators.StdDev(om.State.Closes)
 	om.Logger.Debug("BB calculation - SMA: %.2f, StdDev: %.4f", smaVal, stdVal)
-	
+
 	var tp float64
 	if side == "LONG" {
 		tp = smaVal + om.Config.BbMult*stdVal
@@ -284,7 +284,7 @@ func (om *OrderManager) CalculateTakeProfitBB(side string) float64 {
 		tp = smaVal - om.Config.BbMult*stdVal
 		om.Logger.Debug("BB TP calculation for SHORT: %.2f - %.2f*%.4f = %.2f", smaVal, om.Config.BbMult, stdVal, tp)
 	}
-	
+
 	if om.State.Instr.TickSize > 0 {
 		tp = math.Round(tp/om.State.Instr.TickSize) * om.State.Instr.TickSize
 		om.Logger.Debug("Rounded TP to tick size: %.2f", tp)
@@ -296,7 +296,7 @@ func (om *OrderManager) CalculateTakeProfitBB(side string) float64 {
 func (om *OrderManager) CalculateTakeProfitVolume(side string, thresholdQty float64) float64 {
 	om.State.ObLock.Lock()
 	defer om.State.ObLock.Unlock()
-	
+
 	var arr []struct{ p, sz float64 }
 
 	if side == "LONG" && len(om.State.AsksMap) > 0 {
@@ -381,6 +381,30 @@ func (om *OrderManager) CalculateTakeProfitVoting(side string) float64 {
 	default:
 		return 0
 	}
+}
+
+// FormatPrice rounds a price to the instrument's tick size
+func (om *OrderManager) FormatPrice(price float64) float64 {
+	if om.State.Instr.TickSize > 0 {
+		return math.Round(price/om.State.Instr.TickSize) * om.State.Instr.TickSize
+	}
+	return price
+}
+
+// FormatPriceToString formats a price to string with tick size precision
+func (om *OrderManager) FormatPriceToString(price float64) string {
+	if om.State.Instr.TickSize == 0 {
+		return fmt.Sprintf("%.2f", price)
+	}
+
+	decimals := 0
+	tempTickSize := om.State.Instr.TickSize
+	for tempTickSize < 1 {
+		tempTickSize *= 10
+		decimals++
+	}
+
+	return fmt.Sprintf("%."+strconv.Itoa(decimals)+"f", price)
 }
 
 // getLastAskPrice returns the last ask price from orderbook

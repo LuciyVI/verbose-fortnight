@@ -33,6 +33,11 @@ type Config struct {
 	TPAtrMultiplier  float64  // Multiplier for ATR to calculate Take Profit
 	SLAtrMultiplier  float64  // Multiplier for ATR to calculate Stop Loss
 	AtrPeriod        int      // Period for ATR calculation
+	// Advanced volatility-based TP/SL parameters
+	TPVolatilityMultiplier float64  // Multiplier for volatility-based TP calculation
+	SLVolatilityMultiplier float64  // Multiplier for volatility-based SL calculation
+	BollingerTPMultiplier  float64  // Multiplier for bollinger-based TP calculation
+	BollingerSLMultiplier  float64  // Multiplier for bollinger-based SL calculation
 	// Signal confirmation thresholds
 	OrderbookStrengthThreshold float64
 	SignalStrengthThreshold    int
@@ -80,6 +85,11 @@ func LoadConfig() *Config {
 		TPAtrMultiplier: 2.0,      // Default: Take Profit at 2.0 * ATR
 		SLAtrMultiplier: 1.0,      // Default: Stop Loss at 1.0 * ATR
 		AtrPeriod:       14,       // Default ATR period
+		// Advanced volatility-based TP/SL parameters
+		TPVolatilityMultiplier: 2.5,  // Default: Take Profit at 2.5 * volatility measure
+		SLVolatilityMultiplier: 1.0,  // Default: Stop Loss at 1.0 * volatility measure
+		BollingerTPMultiplier:  2.0,  // Default: Bollinger TP multiplier
+		BollingerSLMultiplier:  1.0,  // Default: Bollinger SL multiplier
 		OrderbookStrengthThreshold: 1.05,
 		SignalStrengthThreshold:    2,
 		// Logging defaults

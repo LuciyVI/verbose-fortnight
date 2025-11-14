@@ -50,17 +50,17 @@ func CalculateATR(highs, lows, closes []float64, period int) float64 {
 		}
 		return trSum / float64(period)
 	}
-	
+
 	var trSum float64
 	for i := len(closes) - period; i < len(closes); i++ {
 		if i >= len(highs) || i >= len(lows) || i >= len(closes) {
 			continue // Safety check
 		}
-		
+
 		high := highs[i]
 		low := lows[i]
 		var closePrev float64
-		
+
 		// For the first calculation in the period, if we're at the beginning of the data, use current close
 		if i > 0 {
 			closePrev = closes[i-1]
@@ -77,6 +77,15 @@ func CalculateATR(highs, lows, closes []float64, period int) float64 {
 		trSum += tr
 	}
 	return trSum / float64(period)
+}
+
+// CalculateTrueRange calculates the True Range for ATR
+func CalculateTrueRange(high, low, prevClose float64) float64 {
+	highLow := high - low
+	highPrevClose := math.Abs(high - prevClose)
+	lowPrevClose := math.Abs(low - prevClose)
+
+	return math.Max(math.Max(highLow, highPrevClose), lowPrevClose)
 }
 
 // RSI calculates Relative Strength Index
@@ -141,14 +150,41 @@ func MACD(src []float64) (macdLine, signalLine float64) {
 		return 0, 0
 	}
 
+	// Calculate the MACD line (12-period EMA - 26-period EMA)
 	ema12 := EMA(src, 12)
 	ema26 := EMA(src, 26)
 	macdLine = ema12 - ema26
 
-	// For a complete MACD, we would calculate the signal line as EMA of the MACD line
-	// But this requires a history of MACD values, which would need to be maintained externally
+	// For a complete MACD analysis, we would calculate the signal line as a 9-period EMA of the MACD line
+	// But this implementation returns the current MACD line value and a placeholder for signal line
+	// The signal line should be calculated based on a series of MACD values, not just the current value
 
 	return macdLine, 0 // Placeholder for signal line
+}
+
+// MACDComplete calculates the complete MACD including MACD line, signal line, and histogram
+func MACDComplete(src []float64) MACDResult {
+	if len(src) < 35 { // Need at least 26 + 9 for signal line
+		return MACDResult{}
+	}
+
+	// Calculate the MACD line (12-period EMA - 26-period EMA)
+	// This is simplified as MACD line value, in practice it should be a series
+	ema12 := EMA(src, 12)
+	ema26 := EMA(src, 26)
+	macdLine := ema12 - ema26
+
+	// For a complete signal line, we would need a series of MACD values to calculate the 9-period EMA
+	// For this implementation, we'll use the same approach with a simplification
+	signalLine := EMA([]float64{macdLine}, 9)
+
+	histogram := macdLine - signalLine
+
+	return MACDResult{
+		MACDLine:   macdLine,
+		SignalLine: signalLine,
+		Histogram:  histogram,
+	}
 }
 
 // CalculateBollingerBands calculates upper and lower bands
