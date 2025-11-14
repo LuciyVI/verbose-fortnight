@@ -133,6 +133,15 @@ type State struct {
 	// Volume tracking
 	RecentVolumes  []float64 // Store recent volumes for calculating average/surge detection
 
+	// Position tracking for partial profits
+	PartialTPTriggered bool  // Flag to indicate if partial profit has been taken
+	PartialTPPrice     float64  // Price at which partial profit was triggered
+
+	// Re-entry tracking
+	LastExitPrice      float64  // Price at which the last position was closed
+	LastExitTime       time.Time // Time at which the last position was closed
+	LastExitSide       string    // Side of the last closed position ("LONG" or "SHORT")
+
 	// Channels
 	TPChan      chan TPJob
 	SigChan     chan Signal

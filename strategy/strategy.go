@@ -534,14 +534,33 @@ func (t *Trader) openPosition(newSide string, price float64) {
 	t.Logger.Info("Received response from exchange for /v5/position/trading-stop: Status %d, Body: %s", resp.StatusCode, string(reply))
 
 	t.Logger.Info("Position opened: %s %.4f @ %.2f | TP %.2f  SL %.2f", newSide, qty, entry, tp, sl)
+
+	// Reset partial profit tracking for new position
+	t.State.PartialTPTriggered = false
+	t.State.PartialTPPrice = 0.0
+
+	// Reset exit tracking for new position
+	t.State.LastExitPrice = 0.0
+	t.State.LastExitTime = time.Time{}
+	t.State.LastExitSide = ""
 }
 
-// calculateTPSLWithRatio calculates TP/SL with a 2:1 ratio based on 15-minute price projection
-// TP is calculated based on expected price movement in the next 15 minutes
+// calculateTPSLWithRatio calculates TP/SL with a 2:1 ratio based on 15-minute price projection or ATR
+// If UseDynamicRiskManagement is enabled, uses ATR-based levels; otherwise uses percentage-based
 func (t *Trader) calculateTPSLWithRatio(entryPrice float64, positionSide string) (takeProfit float64, stopLoss float64) {
+	if t.Config.UseDynamicRiskManagement {
+		return t.calculateDynamicTPSL(entryPrice, positionSide)
+	} else {
+		// Fallback to original calculation
+		return t.calculateFixedTPSL(entryPrice, positionSide)
+	}
+}
+
+// calculateFixedTPSL calculates TP/SL with a 2:1 ratio based on 15-minute price projection (original method)
+func (t *Trader) calculateFixedTPSL(entryPrice float64, positionSide string) (takeProfit float64, stopLoss float64) {
 	// Calculate TP based on 15-minute price projection
 	takeProfit = t.calculateTPBasedOn15MinProjection(entryPrice, positionSide)
-	
+
 	// Calculate the percentage distance from entry to TP
 	var tpPercentDistance float64
 	if positionSide == "LONG" {
@@ -549,10 +568,10 @@ func (t *Trader) calculateTPSLWithRatio(entryPrice float64, positionSide string)
 	} else {
 		tpPercentDistance = math.Abs((entryPrice - takeProfit) / entryPrice * 100)
 	}
-	
+
 	// Calculate SL distance as half of TP distance (2:1 ratio)
 	slPercentDistance := tpPercentDistance / 2
-	
+
 	// Set SL based on position side to maintain 2:1 ratio
 	if positionSide == "LONG" {
 		// For LONG positions: SL below entry price, TP above entry price
@@ -561,19 +580,59 @@ func (t *Trader) calculateTPSLWithRatio(entryPrice float64, positionSide string)
 		// For SHORT positions: SL above entry price, TP below entry price
 		stopLoss = entryPrice * (1 + slPercentDistance/100)
 	}
-	
+
 	// Validate that we maintain the 2:1 ratio
 	tpDistanceActual := math.Abs(takeProfit - entryPrice)
 	slDistanceActual := math.Abs(entryPrice - stopLoss)
-	
+
 	ratio := 0.0
 	if slDistanceActual > 0 {
 		ratio = tpDistanceActual / slDistanceActual
 	}
-	
-	t.Logger.Debug("TP/SL calculation with 2:1 ratio - Entry: %.2f, TP: %.2f, SL: %.2f, TP Distance: %.4f, SL Distance: %.4f, Actual Ratio: %.2f:1", 
+
+	t.Logger.Debug("Fixed TP/SL calculation with 2:1 ratio - Entry: %.2f, TP: %.2f, SL: %.2f, TP Distance: %.4f, SL Distance: %.4f, Actual Ratio: %.2f:1",
 		entryPrice, takeProfit, stopLoss, tpDistanceActual, slDistanceActual, ratio)
-	
+
+	return takeProfit, stopLoss
+}
+
+// calculateDynamicTPSL calculates TP/SL based on ATR values
+func (t *Trader) calculateDynamicTPSL(entryPrice float64, positionSide string) (takeProfit float64, stopLoss float64) {
+	// Calculate ATR value
+	if len(t.State.Closes) < t.Config.ATRPeriod {
+		t.Logger.Warning("Not enough data for ATR calculation, using fallback")
+		// Fallback to original method if not enough data for ATR
+		return t.calculateFixedTPSL(entryPrice, positionSide)
+	}
+
+	atr := indicators.CalculateATR(t.State.Highs, t.State.Lows, t.State.Closes, t.Config.ATRPeriod)
+	t.Logger.Debug("Calculated ATR(%d): %.4f for dynamic TP/SL calculation", t.Config.ATRPeriod, atr)
+
+	// Calculate TP and SL based on ATR multipliers
+	tpDistance := atr * t.Config.ATRMultiplierTP
+	slDistance := atr * t.Config.ATRMultiplierSL
+
+	// Set stop loss and take profit based on position side
+	if positionSide == "LONG" {
+		takeProfit = entryPrice + tpDistance
+		stopLoss = entryPrice - slDistance
+	} else {
+		takeProfit = entryPrice - tpDistance
+		stopLoss = entryPrice + slDistance
+	}
+
+	// Validate the ratio
+	tpDistanceActual := math.Abs(takeProfit - entryPrice)
+	slDistanceActual := math.Abs(entryPrice - stopLoss)
+
+	ratio := 0.0
+	if slDistanceActual > 0 {
+		ratio = tpDistanceActual / slDistanceActual
+	}
+
+	t.Logger.Debug("Dynamic ATR-based TP/SL calculation - Entry: %.2f, TP: %.2f, SL: %.2f, ATR: %.4f, TP Dist: %.4f, SL Dist: %.4f, Ratio: %.2f:1",
+		entryPrice, takeProfit, stopLoss, atr, tpDistanceActual, slDistanceActual, ratio)
+
 	return takeProfit, stopLoss
 }
 
@@ -645,7 +704,7 @@ func (t *Trader) calculateTPBasedOn15MinProjection(entryPrice float64, positionS
 // adjustTPSL adjusts TP/SL for long positions with 2:1 ratio
 func (t *Trader) adjustTPSL(closePrice float64) {
 	t.Logger.Info("Adjusting TP/SL for LONG position, current price: %.2f", closePrice)
-	
+
 	exists, side, _, curTP, _ := t.PositionManager.HasOpenPosition()
 	if !exists || t.PositionManager.NormalizeSide(side) != "LONG" {
 		t.Logger.Info("No LONG position found, skipping TP/SL adjustment")
@@ -656,19 +715,31 @@ func (t *Trader) adjustTPSL(closePrice float64) {
 		t.Logger.Error("Could not get entry price, skipping TP/SL adjustment")
 		return
 	}
-	
-	atr := indicators.CalculateATR(t.State.Highs, t.State.Lows, t.State.Closes, 14)
-	t.Logger.Debug("ATR(14) calculated for trailing stop: %.4f", atr)
-	
-	newTP := closePrice + atr*1.5
-	if newTP <= curTP {
-		t.Logger.Info("New TP %.2f is not better than current TP %.2f, skipping update", newTP, curTP)
-		return
+
+	// If not using dynamic risk management, we can implement trailing functionality here
+	// Otherwise, let SyncPositionRealTime handle trailing based on dynamic risk management
+	var newTP, newSL float64
+	if !t.Config.UseDynamicRiskManagement {
+		// Original logic with ATR-based trailing TP
+		atr := indicators.CalculateATR(t.State.Highs, t.State.Lows, t.State.Closes, 14)
+		t.Logger.Debug("ATR(14) calculated for trailing stop: %.4f", atr)
+
+		newTP = closePrice + atr*1.5
+		if newTP <= curTP {
+			t.Logger.Info("New TP %.2f is not better than current TP %.2f, skipping update", newTP, curTP)
+			return
+		}
+		// Calculate new SL maintaining the 2:1 ratio with the new TP
+		if entry != 0 {
+			newSL = entry - (newTP - entry)/2 // 2:1 ratio
+		} else {
+			newTP, newSL = t.calculateTPSLWithRatio(entry, "LONG")
+		}
+	} else {
+		// When using dynamic risk management, recalculate levels based on entry price only
+		newTP, newSL = t.calculateTPSLWithRatio(entry, "LONG")
 	}
-	
-	// Calculate TP/SL with 2:1 ratio based on 15-minute projection
-	newTP, newSL := t.calculateTPSLWithRatio(entry, "LONG")
-	
+
 	t.Logger.Info("Sending TP/SL update to exchange: TP %.2f, SL %.2f", newTP, newSL)
 	if err := t.PositionManager.UpdatePositionTPSL(t.Config.Symbol, newTP, newSL); err != nil {
 		t.Logger.Error("Error updating TP/SL: %v", err)
@@ -680,7 +751,7 @@ func (t *Trader) adjustTPSL(closePrice float64) {
 // adjustTPSLForShort adjusts TP/SL for short positions with 2:1 ratio
 func (t *Trader) adjustTPSLForShort(closePrice float64) {
 	t.Logger.Info("Adjusting TP/SL for SHORT position, current price: %.2f", closePrice)
-	
+
 	exists, side, _, curTP, _ := t.PositionManager.HasOpenPosition()
 	if !exists || side != "SHORT" {
 		t.Logger.Info("No SHORT position found, skipping TP/SL adjustment")
@@ -691,16 +762,27 @@ func (t *Trader) adjustTPSLForShort(closePrice float64) {
 		t.Logger.Error("Could not get entry price, skipping TP/SL adjustment")
 		return
 	}
-	
-	newTP := closePrice * 0.998
-	if newTP >= curTP*1.001 { // Protection against small changes
-		t.Logger.Info("New TP %.2f is not better than current TP %.2f, skipping update", newTP, curTP)
-		return
+
+	// If not using dynamic risk management, we can implement trailing functionality here
+	// Otherwise, let SyncPositionRealTime handle trailing based on dynamic risk management
+	var newTP, newSL float64
+	if !t.Config.UseDynamicRiskManagement {
+		newTP = closePrice * 0.998
+		if newTP >= curTP*1.001 { // Protection against small changes
+			t.Logger.Info("New TP %.2f is not better than current TP %.2f, skipping update", newTP, curTP)
+			return
+		}
+		// Calculate new SL maintaining the 2:1 ratio with the new TP
+		if entry != 0 {
+			newSL = entry + (entry - newTP)/2 // 2:1 ratio for SHORT
+		} else {
+			newTP, newSL = t.calculateTPSLWithRatio(entry, "SHORT")
+		}
+	} else {
+		// When using dynamic risk management, recalculate levels based on entry price only
+		newTP, newSL = t.calculateTPSLWithRatio(entry, "SHORT")
 	}
-	
-	// Calculate TP/SL with 2:1 ratio based on 15-minute projection
-	newTP, newSL := t.calculateTPSLWithRatio(entry, "SHORT")
-	
+
 	t.Logger.Info("Sending TP/SL update to exchange: TP %.2f, SL %.2f", newTP, newSL)
 	if err := t.PositionManager.UpdatePositionTPSL(t.Config.Symbol, newTP, newSL); err != nil {
 		t.Logger.Error("adjustTPSLForShort error: %v", err)
@@ -718,15 +800,41 @@ func (t *Trader) SMAMovingAverageWorker() {
 			continue
 		}
 
-		closesCopy := append([]float64(nil), t.State.Closes...)
-		cls := closesCopy[len(closesCopy)-1]
+		// Choose data source based on signal smoothing configuration
+		var sourceCloses []float64
+		var sourceHighs []float64
+		var sourceLows []float64
+		var latestClose float64
+
+		if t.Config.UseSignalSmoothing && t.Config.SignalSmoothingWindow > 1 {
+			// Use smoothed data based on the configured window
+			sourceCloses = t.getSmoothedCloses(t.Config.SignalSmoothingWindow)
+			sourceHighs = t.getSmoothedHighs(t.Config.SignalSmoothingWindow)
+			sourceLows = t.getSmoothedLows(t.Config.SignalSmoothingWindow)
+			// Get the most recent close price for current reference
+			if len(t.State.Closes) > 0 {
+				latestClose = t.State.Closes[len(t.State.Closes)-1]
+			} else {
+				continue
+			}
+		} else {
+			// Use original data
+			sourceCloses = append([]float64(nil), t.State.Closes...)
+			sourceHighs = append([]float64(nil), t.State.Highs...)
+			sourceLows = append([]float64(nil), t.State.Lows...)
+			if len(sourceCloses) > 0 {
+				latestClose = sourceCloses[len(sourceCloses)-1]
+			} else {
+				continue
+			}
+		}
 
 		// Calculate SMA
-		smaVal := indicators.SMA(closesCopy)
-		t.Logger.Debug("SMA(%d) calculated: %.2f, Current close: %.2f", t.Config.SmaLen, smaVal, cls)
+		smaVal := indicators.SMA(sourceCloses)
+		t.Logger.Debug("SMA(%d) calculated: %.2f, Current close: %.2f", t.Config.SmaLen, smaVal, latestClose)
 
 		// Calculate RSI
-		rsiValues := indicators.RSI(closesCopy, 14)
+		rsiValues := indicators.RSI(sourceCloses, 14)
 		var rsi float64
 		if len(rsiValues) > 0 && !math.IsNaN(rsiValues[len(rsiValues)-1]) {
 			rsi = rsiValues[len(rsiValues)-1]
@@ -734,7 +842,7 @@ func (t *Trader) SMAMovingAverageWorker() {
 		t.Logger.Debug("RSI(14) calculated: %.2f", rsi)
 
 		// Calculate MACD
-		macdLine, signalLine := indicators.MACD(closesCopy)
+		macdLine, signalLine := indicators.MACD(sourceCloses)
 		var macdHist float64
 		if macdLine != 0 {
 			macdHist = macdLine - signalLine
@@ -742,11 +850,11 @@ func (t *Trader) SMAMovingAverageWorker() {
 		t.Logger.Debug("MACD calculated - Line: %.4f, Signal: %.4f, Histogram: %.4f", macdLine, signalLine, macdHist)
 
 		// Calculate ATR
-		atr := indicators.CalculateATR(t.State.Highs, t.State.Lows, t.State.Closes, 14)
+		atr := indicators.CalculateATR(sourceHighs, sourceLows, sourceCloses, 14)
 		t.Logger.Debug("ATR(14) calculated: %.4f", atr)
 
 		// Calculate Bollinger Bands
-		bbUpper, bbMiddle, bbLower := indicators.CalculateBollingerBands(closesCopy, 20, 2.0)
+		bbUpper, bbMiddle, bbLower := indicators.CalculateBollingerBands(sourceCloses, 20, 2.0)
 		t.Logger.Debug("Bollinger Bands calculated - Upper: %.2f, Middle: %.2f, Lower: %.2f", bbUpper, bbMiddle, bbLower)
 
 		hysteresis := 0.005 // 0.5%
@@ -757,12 +865,90 @@ func (t *Trader) SMAMovingAverageWorker() {
 
 		// Generate consolidated signals with weights
 		if t.Config.UseSignalConsolidation {
-			t.generateConsolidatedSignals(closesCopy, cls, smaVal, macdHist, macdLine, signalLine, bbUpper, bbLower, hysteresis)
+			t.generateConsolidatedSignals(sourceCloses, latestClose, smaVal, macdHist, macdLine, signalLine, bbUpper, bbLower, hysteresis)
 		} else {
 			// Original logic for backward compatibility
-			t.generateOriginalSignals(closesCopy, cls, smaVal, macdHist, macdLine, signalLine, bbUpper, bbLower, hysteresis)
+			t.generateOriginalSignals(sourceCloses, latestClose, smaVal, macdHist, macdLine, signalLine, bbUpper, bbLower, hysteresis)
 		}
 	}
+}
+
+// getSmoothedCloses returns smoothed close prices based on a time window
+func (t *Trader) getSmoothedCloses(windowSeconds int) []float64 {
+	if len(t.State.Closes) == 0 {
+		return []float64{}
+	}
+
+	// If window is bigger than available data, return the original data
+	if windowSeconds >= len(t.State.Closes) {
+		return append([]float64(nil), t.State.Closes...) // Copy original data
+	}
+
+	// Calculate the smoothed data based on the window
+	smoothed := make([]float64, len(t.State.Closes)-windowSeconds+1)
+
+	// For each point in the smoothed array, calculate an average over the window
+	for i := windowSeconds - 1; i < len(t.State.Closes); i++ {
+		sum := 0.0
+		for j := 0; j < windowSeconds; j++ {
+			sum += t.State.Closes[i-windowSeconds+1+j]
+		}
+		smoothed[i-windowSeconds+1] = sum / float64(windowSeconds)
+	}
+
+	return smoothed
+}
+
+// getSmoothedHighs returns smoothed high prices based on a time window
+func (t *Trader) getSmoothedHighs(windowSeconds int) []float64 {
+	if len(t.State.Highs) == 0 {
+		return []float64{}
+	}
+
+	// If window is bigger than available data, return the original data
+	if windowSeconds >= len(t.State.Highs) {
+		return append([]float64(nil), t.State.Highs...) // Copy original data
+	}
+
+	// Calculate the smoothed data based on the window
+	smoothed := make([]float64, len(t.State.Highs)-windowSeconds+1)
+
+	// For each point in the smoothed array, calculate an average over the window
+	for i := windowSeconds - 1; i < len(t.State.Highs); i++ {
+		sum := 0.0
+		for j := 0; j < windowSeconds; j++ {
+			sum += t.State.Highs[i-windowSeconds+1+j]
+		}
+		smoothed[i-windowSeconds+1] = sum / float64(windowSeconds)
+	}
+
+	return smoothed
+}
+
+// getSmoothedLows returns smoothed low prices based on a time window
+func (t *Trader) getSmoothedLows(windowSeconds int) []float64 {
+	if len(t.State.Lows) == 0 {
+		return []float64{}
+	}
+
+	// If window is bigger than available data, return the original data
+	if windowSeconds >= len(t.State.Lows) {
+		return append([]float64(nil), t.State.Lows...) // Copy original data
+	}
+
+	// Calculate the smoothed data based on the window
+	smoothed := make([]float64, len(t.State.Lows)-windowSeconds+1)
+
+	// For each point in the smoothed array, calculate an average over the window
+	for i := windowSeconds - 1; i < len(t.State.Lows); i++ {
+		sum := 0.0
+		for j := 0; j < windowSeconds; j++ {
+			sum += t.State.Lows[i-windowSeconds+1+j]
+		}
+		smoothed[i-windowSeconds+1] = sum / float64(windowSeconds)
+	}
+
+	return smoothed
 }
 
 // generateConsolidatedSignals generates signals using weighted consolidation approach
@@ -1167,27 +1353,29 @@ func (t *Trader) closeOppositePosition(newSide string) {
 	side = t.PositionManager.NormalizeSide(side)
 	newSide = t.PositionManager.NormalizeSide(newSide)
 	
+	// Declare exitPrice variable to be accessible outside the condition
+	var exitPrice float64 = 0.0 // Initialize to 0 to handle cases where no position is closed
+
 	// Only close if it's truly the opposite side
 	if side != "" && side != newSide {
 		t.Logger.Info("Closing opposite position: %s", side)
-		
+
 		// Get entry price for profit calculation
 		entryPrice := t.PositionManager.GetLastEntryPrice()
-		
+
 		reduceSide := "Sell"
 		if side == "SHORT" {
 			reduceSide = "Buy"
 		}
-		
+
 		if err := t.OrderManager.PlaceOrderMarket(reduceSide, qty, true); err != nil {
 			t.Logger.Error("Error closing position %s: %v", side, err)
 			return
 		}
-		
+
 		t.Logger.Info("Successfully sent order to close position %s", side)
-		
+
 		// Calculate profit based on current price and entry price
-		var exitPrice float64
 		if side == "LONG" {
 			// For LONG positions, we sell to close
 			exitPrice = t.PositionManager.GetLastBidPrice()
@@ -1195,18 +1383,29 @@ func (t *Trader) closeOppositePosition(newSide string) {
 			// For SHORT positions, we buy to close
 			exitPrice = t.PositionManager.GetLastAskPrice()
 		}
-		
+
 		if exitPrice <= 0 {
 			exitPrice = entryPrice // Fallback if we can't get current price
 		}
-		
+
 		profit := t.PositionManager.CalculatePositionProfit(side, entryPrice, exitPrice, qty)
 		signalType := "CLOSE_LONG"
 		if side == "SHORT" {
 			signalType = "CLOSE_SHORT"
 		}
-		
+
 		t.PositionManager.UpdateSignalStats(signalType, profit)
+	}
+
+	// Reset partial profit tracking when closing any position
+	t.State.PartialTPTriggered = false
+	t.State.PartialTPPrice = 0.0
+
+	// Update exit tracking for smart re-entry (only if we actually closed a position)
+	if side != "" && side != newSide && t.Config.UseSmartReentry {
+		t.State.LastExitPrice = exitPrice
+		t.State.LastExitTime = time.Now()
+		t.State.LastExitSide = side
 	}
 }
 
@@ -1224,12 +1423,23 @@ func (t *Trader) processConsolidatedSignals() {
 	lastSignal := ""
 
 	for consolidatedSig := range t.State.ConsolidatedSigChan {
-		// Prevent consecutive same signals
-		if string(consolidatedSig.Kind) == lastSignal {
-			if t.Config.Debug {
-				t.Logger.Debug("Skipping duplicate consolidated signal: %s", consolidatedSig.Kind)
+		// Apply smart re-entry logic if enabled
+		if t.Config.UseSmartReentry {
+			shouldSkip := t.shouldSkipSignal(consolidatedSig.Kind, consolidatedSig.ClosePrice)
+			if shouldSkip {
+				if t.Config.Debug {
+					t.Logger.Debug("Skipping signal due to smart re-entry logic: %s", consolidatedSig.Kind)
+				}
+				continue
 			}
-			continue
+		} else {
+			// Legacy logic: Prevent consecutive same signals
+			if string(consolidatedSig.Kind) == lastSignal {
+				if t.Config.Debug {
+					t.Logger.Debug("Skipping duplicate consolidated signal: %s", consolidatedSig.Kind)
+				}
+				continue
+			}
 		}
 
 		// Check orderbook strength as additional confirmation
@@ -1258,7 +1468,9 @@ func (t *Trader) processConsolidatedSignals() {
 			}
 
 			t.HandleLongSignal(consolidatedSig.ClosePrice)
-			lastSignal = "LONG"
+			if !t.Config.UseSmartReentry {
+				lastSignal = "LONG"
+			}
 		} else if consolidatedSig.Kind == "SHORT" {
 			// Check if we have an opposite position that needs to be closed first
 			exists, side, _, _, _ := t.PositionManager.HasOpenPosition()
@@ -1268,9 +1480,35 @@ func (t *Trader) processConsolidatedSignals() {
 			}
 
 			t.HandleShortSignal(consolidatedSig.ClosePrice)
-			lastSignal = "SHORT"
+			if !t.Config.UseSmartReentry {
+				lastSignal = "SHORT"
+			}
 		}
 	}
+}
+
+// shouldSkipSignal determines if a signal should be skipped based on smart re-entry logic
+func (t *Trader) shouldSkipSignal(signalKind string, currentPrice float64) bool {
+	// If no previous exit data, don't skip
+	if t.State.LastExitTime.IsZero() {
+		return false
+	}
+
+	// Check if the signal is in the same direction as the last exit
+	if signalKind == t.State.LastExitSide {
+		// Same direction - check if sufficient price movement has happened since exit
+		priceDiff := math.Abs(currentPrice - t.State.LastExitPrice)
+		priceChangePercentage := priceDiff / t.State.LastExitPrice
+
+		if priceChangePercentage < t.Config.ReentryPriceThreshold {
+			// Not enough price movement from exit point - skip signal
+			t.Logger.Debug("Skipping %s signal - insufficient price movement from exit: %.4f%% < %.4f%%",
+				signalKind, priceChangePercentage*100, t.Config.ReentryPriceThreshold*100)
+			return true
+		}
+	}
+
+	return false
 }
 
 // processOriginalSignals handles the original signal processing for backward compatibility
@@ -1281,12 +1519,23 @@ func (t *Trader) processOriginalSignals() {
 	for sig := range t.State.SigChan {
 		signalStrength[sig.Kind]++
 
-		// Prevent consecutive same signals
-		if sig.Kind == lastSignal {
-			if t.Config.Debug {
-				t.Logger.Debug("Skipping duplicate signal: %s", sig.Kind)
+		// Apply smart re-entry logic if enabled
+		if t.Config.UseSmartReentry {
+			shouldSkip := t.shouldSkipSignal(sig.Kind, sig.ClosePrice)
+			if shouldSkip {
+				if t.Config.Debug {
+					t.Logger.Debug("Skipping signal due to smart re-entry logic: %s", sig.Kind)
+				}
+				continue
 			}
-			continue
+		} else {
+			// Legacy logic: Prevent consecutive same signals
+			if sig.Kind == lastSignal {
+				if t.Config.Debug {
+					t.Logger.Debug("Skipping duplicate signal: %s", sig.Kind)
+				}
+				continue
+			}
 		}
 
 		if t.Config.Debug {
@@ -1307,7 +1556,9 @@ func (t *Trader) processOriginalSignals() {
 			}
 
 			t.HandleLongSignal(sig.ClosePrice)
-			lastSignal = "SMA_LONG"
+			if !t.Config.UseSmartReentry {
+				lastSignal = "SMA_LONG"
+			}
 			t.resetSignalStrength(&signalStrength)
 		} else if sig.Kind == "SMA_SHORT" && signalStrength["SMA_SHORT"] >= t.Config.SignalStrengthThreshold && t.CheckOrderbookStrength("SHORT") {
 			if t.Config.Debug {
@@ -1322,7 +1573,9 @@ func (t *Trader) processOriginalSignals() {
 			}
 
 			t.HandleShortSignal(sig.ClosePrice)
-			lastSignal = "SMA_SHORT"
+			if !t.Config.UseSmartReentry {
+				lastSignal = "SMA_SHORT"
+			}
 			t.resetSignalStrength(&signalStrength)
 		}
 	}
@@ -1334,15 +1587,15 @@ func (t *Trader) resetSignalStrength(m *map[string]int) {
 	}
 }
 
-// SyncPositionRealTime implements trailing stop logic
+// SyncPositionRealTime implements trailing stop logic and partial profit taking
 func (t *Trader) SyncPositionRealTime() {
-	t.Logger.Info("Starting trailing stop logic...")
+	t.Logger.Info("Starting trailing stop logic and partial profit management...")
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
 	for range ticker.C {
 		// Current position
-		exists, side, _, tp, sl := t.PositionManager.HasOpenPosition()
+		exists, side, qty, tp, sl := t.PositionManager.HasOpenPosition()
 		if !exists || tp == 0 {
 			continue
 		}
@@ -1362,40 +1615,165 @@ func (t *Trader) SyncPositionRealTime() {
 			continue
 		}
 
-		// Progress toward TP
-		var dist, prog float64
-		if side == "LONG" {
-			dist = tp - entry
-			prog = (price - entry) / dist
+		// Check if we should take partial profits if enabled
+		if t.Config.UsePartialProfitTaking && !t.State.PartialTPTriggered {
+			shouldTakePartial := false
+			partialPrice := 0.0
+
+			if side == "LONG" && price >= tp {
+				shouldTakePartial = true
+				partialPrice = price
+			} else if side == "SHORT" && price <= tp {
+				shouldTakePartial = true
+				partialPrice = price
+			}
+
+			if shouldTakePartial {
+				t.takePartialProfit(side, qty, partialPrice)
+				// Mark that partial profit has been taken
+				t.State.PartialTPTriggered = true
+				t.State.PartialTPPrice = partialPrice
+				t.Logger.Info("Partial profit taken: %s position at price %.2f", side, partialPrice)
+			}
+		}
+
+		// Calculate ATR for trailing stop if dynamic risk management is enabled
+		currentATR := 0.0
+		if t.Config.UseDynamicRiskManagement && len(t.State.Closes) >= t.Config.ATRPeriod {
+			currentATR = indicators.CalculateATR(t.State.Highs, t.State.Lows, t.State.Closes, t.Config.ATRPeriod)
+		}
+
+		// Enhanced trailing stop logic
+		var newStopLoss float64
+		if t.Config.UseDynamicRiskManagement && currentATR > 0 {
+			// Use ATR-based trailing stop
+			atrDistance := currentATR * t.Config.TrailingStopATRMultiplier
+
+			if side == "LONG" {
+				// For LONG positions, trailing stop is below current price but above entry
+				newStopLoss = price - atrDistance
+				// Ensure the trailing stop doesn't go below the original stop loss or entry price
+				if newStopLoss < sl {
+					newStopLoss = sl
+				}
+				if newStopLoss < entry {
+					newStopLoss = entry - (sl - entry) // Maintain original risk distance from entry
+				}
+			} else if side == "SHORT" {
+				// For SHORT positions, trailing stop is above current price but below entry
+				newStopLoss = price + atrDistance
+				// Ensure the trailing stop doesn't go above the original stop loss or entry price
+				if newStopLoss > sl {
+					newStopLoss = sl
+				}
+				if newStopLoss > entry {
+					newStopLoss = entry + (entry - sl) // Maintain original risk distance from entry
+				}
+			}
 		} else {
-			dist = entry - tp
-			prog = (entry - price) / dist
-		}
-		if prog <= 0 {
-			continue
+			// Original trailing stop logic (maintaining 2:1 ratio concept but adjusted as price moves)
+			var dist, prog float64
+			if side == "LONG" {
+				dist = tp - entry
+				prog = (price - entry) / dist
+			} else {
+				dist = entry - tp
+				prog = (entry - price) / dist
+			}
+
+			if prog <= 0 {
+				continue
+			}
+
+			// Target SL: half of the way from entry to TP
+			newStopLoss = entry + prog*dist*0.5
+
+			// Ensure the new stop loss is in the correct position relative to current price and original SL
+			if side == "LONG" && (newStopLoss > sl || newStopLoss > price) {
+				continue // Don't move stop loss if it's not an improvement
+			} else if side == "SHORT" && (newStopLoss < sl || newStopLoss < price) {
+				continue // Don't move stop loss if it's not an improvement
+			}
 		}
 
-		// Target SL: half of the way from entry to TP
-		targetSL := entry + prog*dist*0.5
-		needMove := false
-
-		if side == "LONG" && targetSL > sl {
-			needMove = true
-		} else if side == "SHORT" && targetSL < sl {
-			needMove = true
-		}
-		if !needMove {
-			continue
+		// Update stop-loss if improved
+		needUpdate := false
+		if side == "LONG" && newStopLoss > sl {
+			needUpdate = true
+		} else if side == "SHORT" && newStopLoss < sl {
+			needUpdate = true
 		}
 
-		t.Logger.Info("Trailing stop: updating SL from %.2f to %.2f (%.0f%% way to TP)", sl, targetSL, prog*100)
-		
-		// Update stop-loss
-		if err := t.PositionManager.UpdatePositionTPSL(t.Config.Symbol, tp, targetSL); err != nil {
-			t.Logger.Error("Trailing SL update error: %v", err)
-		} else {
-			t.Logger.Info("SL → %.2f (%.0f%% way to TP)", targetSL, prog*100)
+		if needUpdate {
+			t.Logger.Info("Trailing stop: updating SL from %.2f to %.2f", sl, newStopLoss)
+
+			// Update stop-loss only, keep TP unchanged
+			if err := t.PositionManager.UpdatePositionTPSL(t.Config.Symbol, tp, newStopLoss); err != nil {
+				t.Logger.Error("Trailing SL update error: %v", err)
+			} else {
+				t.Logger.Info("SL → %.2f (trailing)", newStopLoss)
+			}
 		}
+	}
+}
+
+// takePartialProfit handles partial profit taking by reducing position size
+func (t *Trader) takePartialProfit(positionSide string, totalQty float64, currentPrice float64) {
+	if !t.Config.UsePartialProfitTaking {
+		return
+	}
+
+	partialQty := totalQty * t.Config.PartialProfitPercentage
+
+	if partialQty <= 0 {
+		return
+	}
+
+	// Calculate how much of the position remains after partial closure
+	remainingQty := totalQty - partialQty
+
+	orderSide := "Sell"
+	if positionSide == "SHORT" {
+		orderSide = "Buy"
+	}
+
+	t.Logger.Info("Taking partial profit: closing %.4f of %.4f total quantity", partialQty, totalQty)
+
+	// Place order for partial quantity
+	if err := t.OrderManager.PlaceOrderMarket(orderSide, partialQty, true); err != nil {
+		t.Logger.Error("Error taking partial profit: %v", err)
+		return
+	}
+
+	// Get the actual entry price for this part of the position
+	entryPrice := t.PositionManager.GetLastEntryPrice()
+	if entryPrice == 0 {
+		entryPrice = currentPrice // fallback
+	}
+
+	// Calculate profit for the partial closure
+	realExitPrice := currentPrice
+	if positionSide == "LONG" {
+		realExitPrice = t.PositionManager.GetLastBidPrice()
+		if realExitPrice <= 0 {
+			realExitPrice = currentPrice
+		}
+	} else if positionSide == "SHORT" {
+		realExitPrice = t.PositionManager.GetLastAskPrice()
+		if realExitPrice <= 0 {
+			realExitPrice = currentPrice
+		}
+	}
+
+	partialProfit := t.PositionManager.CalculatePositionProfit(positionSide, entryPrice, realExitPrice, partialQty)
+	t.PositionManager.UpdateSignalStats("PARTIAL_"+positionSide, partialProfit)
+
+	t.Logger.Info("Partial profit taken: %.4f units at %.2f, estimated profit: %.2f",
+		partialQty, realExitPrice, partialProfit)
+
+	// If remaining quantity is small, consider closing the entire position
+	if remainingQty < t.State.Instr.MinQty {
+		t.Logger.Info("Remaining position (%.4f) is below minimum quantity, considering full closure", remainingQty)
 	}
 }
 
