@@ -422,6 +422,10 @@ func main() {
 		HigherTimeframeLows:   make([]float64, 0),
 		HigherTimeframeTrend:  "",
 		LastHTFUpdateTime:     time.Time{}, // Zero time value
+		PreviousPrices:        make([]float64, 0),
+		PreviousRSIValues:     make([]float64, 0),
+		PreviousMACDValues:    make([]float64, 0),
+		PreviousMACDSignalValues: make([]float64, 0),
 		MarketRegime: "range", // default
 	}
 

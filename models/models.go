@@ -149,6 +149,12 @@ type State struct {
 	HigherTimeframeTrend  string    // Trend direction on higher timeframe ("up", "down", "neutral")
 	LastHTFUpdateTime     time.Time // Time of last higher timeframe candle update
 
+	// Divergence tracking
+	PreviousPrices         []float64  // Previous prices for divergence detection
+	PreviousRSIValues      []float64  // Previous RSI values for divergence detection
+	PreviousMACDValues     []float64  // Previous MACD values for divergence detection
+	PreviousMACDSignalValues []float64  // Previous MACD signal values for divergence detection
+
 	// Channels
 	TPChan      chan TPJob
 	SigChan     chan Signal
