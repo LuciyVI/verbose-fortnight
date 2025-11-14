@@ -47,6 +47,15 @@ type Config struct {
 	UseRegimeBasedStrategy     bool   // Enable regime-based strategy switching
 	RegimeTrendThreshold       float64 // Threshold for trend detection (0.0 to 1.0)
 	RegimeRangeThreshold       float64 // Threshold for range detection (0.0 to 1.0)
+	// Enhanced order book filtering configuration
+	UseDynamicOrderbookFilter  bool   // Enable dynamic orderbook filtering
+	MinVolumeThreshold         float64 // Minimum volume threshold for confirmation
+	VolumeSpikeMultiplier      float64 // Multiplier to detect volume spikes
+	MinVolatilityThreshold     float64 // Minimum volatility for dynamic threshold adjustment
+	MaxVolatilityThreshold     float64 // Maximum volatility for dynamic threshold adjustment
+	BaseOrderbookThreshold     float64 // Base threshold when volatility is at normal levels
+	HighVolatilityThreshold    float64 // Threshold when volatility is high
+	LowVolatilityThreshold     float64 // Threshold when volatility is low
 	// Logging configuration
 	LogFile       string
 	LogMaxSize    int // megabytes
@@ -84,7 +93,7 @@ func LoadConfig() *Config {
 		TrailPerc:        0.005,
 		Debug:            false,
 		DynamicTP:        false,
-		OrderbookStrengthThreshold: 1.3,
+		OrderbookStrengthThreshold: 1.3, // Base threshold that will be adjusted dynamically if UseDynamicOrderbookFilter is true
 		SignalStrengthThreshold:    2,
 		// Signal consolidation defaults
 		UseSignalConsolidation:     true,  // Enable by default
@@ -101,6 +110,15 @@ func LoadConfig() *Config {
 		UseRegimeBasedStrategy:     true,  // Enable by default
 		RegimeTrendThreshold:       0.6,   // Threshold for trend detection
 		RegimeRangeThreshold:       0.4,   // Threshold for range detection
+		// Enhanced order book filtering defaults
+		UseDynamicOrderbookFilter:  true,  // Enable by default
+		MinVolumeThreshold:         1000.0, // Minimum volume threshold in USDT equivalent
+		VolumeSpikeMultiplier:      2.0,   // 2x the average volume to detect spikes
+		MinVolatilityThreshold:     0.5,   // Minimum volatility (in %) for dynamic adjustment
+		MaxVolatilityThreshold:     5.0,   // Maximum volatility (in %) for dynamic adjustment
+		BaseOrderbookThreshold:     1.3,   // Base threshold when volatility is at normal levels
+		HighVolatilityThreshold:    1.5,   // Higher threshold when volatility is high
+		LowVolatilityThreshold:     1.1,   // Lower threshold when volatility is low
 		// Logging defaults
 		LogFile:       getEnv("LOG_FILE", "trading_bot.log"),
 		LogMaxSize:    10, // 10 MB

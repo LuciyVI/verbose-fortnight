@@ -139,41 +139,89 @@ func (t *Trader) CheckOrderbookStrength(side string) bool {
 
 	// Calculate and log the strength ratio
 	var ratio float64
+	// For LONG signals: bid/ask ratio (want more buying than selling pressure)
+	// For SHORT signals: ask/bid ratio (want more selling than buying pressure)
 	if side == "LONG" && askDepth != 0 {
 		ratio = bidDepth / askDepth
-		t.Logger.Debug("Orderbook strength for LONG: bid/ask ratio = %.2f, threshold = %.2f", ratio, t.Config.OrderbookStrengthThreshold)
 	} else if side == "SHORT" && bidDepth != 0 {
 		ratio = askDepth / bidDepth
-		t.Logger.Debug("Orderbook strength for SHORT: ask/bid ratio = %.2f, threshold = %.2f", ratio, t.Config.OrderbookStrengthThreshold)
 	}
 
-	// Adaptive thresholds based on market regime
+	// Use dynamic threshold if enabled
+	threshold := t.calculateDynamicOrderbookThreshold()
+
+	// Log with dynamic threshold
+	if t.Config.Debug {
+		t.Logger.Debug("Orderbook strength for %s: ratio = %.2f, dynamic threshold = %.2f", side, ratio, threshold)
+	}
+
+	// Check if the basic orderbook condition is met
+	orderbookConditionMet := false
+	orderbookConditionMet = ratio > threshold
+
+	if !orderbookConditionMet {
+		if t.Config.Debug {
+			t.Logger.Debug("Orderbook condition not met for side %s: ratio %.2f <= threshold %.2f", side, ratio, threshold)
+		}
+		return false
+	}
+
+	// If using dynamic filtering, also check volume confirmation
+	if t.Config.UseDynamicOrderbookFilter {
+		// Get the most recent volume data
+		currentVolume := 0.0
+		if len(t.State.RecentVolumes) > 0 {
+			currentVolume = t.State.RecentVolumes[len(t.State.RecentVolumes)-1]
+		}
+
+		// Check if volume is sufficient (either a spike or above minimum threshold)
+		if !t.detectVolumeSpike(currentVolume) {
+			if t.Config.Debug {
+				t.Logger.Debug("Volume confirmation failed for side %s: current volume %.2f not meeting spike criteria", side, currentVolume)
+			}
+			return false
+		}
+
+		if t.Config.Debug {
+			t.Logger.Debug("Volume confirmation passed for side %s: current volume %.2f", side, currentVolume)
+		}
+	}
+
+	// Adaptive thresholds based on market regime (additional check)
 	if t.State.MarketRegime == "trend" {
-		if side == "LONG" && bidDepth/askDepth > t.Config.OrderbookStrengthThreshold {
+		if side == "LONG" && bidDepth/askDepth > threshold {
 			if t.Config.Debug {
 				t.Logger.Debug("Trend: LONG signal confirmed")
 			}
 			return true
-		} else if side == "SHORT" && askDepth/bidDepth > t.Config.OrderbookStrengthThreshold {
+		} else if side == "SHORT" && askDepth/bidDepth > threshold {
 			if t.Config.Debug {
 				t.Logger.Debug("Trend: SHORT signal confirmed")
 			}
 			return true
 		}
 	} else if t.State.MarketRegime == "range" {
-		if side == "LONG" && bidDepth/askDepth > t.Config.OrderbookStrengthThreshold {
+		if side == "LONG" && bidDepth/askDepth > threshold {
 			if t.Config.Debug {
 				t.Logger.Debug("Range: LONG signal confirmed")
 			}
 			return true
-		} else if side == "SHORT" && askDepth/bidDepth > t.Config.OrderbookStrengthThreshold {
+		} else if side == "SHORT" && askDepth/bidDepth > threshold {
 			if t.Config.Debug {
 				t.Logger.Debug("Range: SHORT signal confirmed")
 			}
 			return true
 		}
 	}
-	
+
+	// If not in regime-specific logic, just check the basic condition with dynamic threshold
+	if orderbookConditionMet {
+		if t.Config.Debug {
+			t.Logger.Debug("%s signal confirmed with dynamic threshold: %.2f > %.2f", side, ratio, threshold)
+		}
+		return true
+	}
+
 	t.Logger.Debug("Orderbook strength check failed for side %s in regime %s", side, t.State.MarketRegime)
 	return false
 }
@@ -953,6 +1001,94 @@ func max(a, b int) int {
 	return b
 }
 
+// calculateDynamicOrderbookThreshold calculates threshold based on current market volatility
+func (t *Trader) calculateDynamicOrderbookThreshold() float64 {
+	if !t.Config.UseDynamicOrderbookFilter {
+		return t.Config.OrderbookStrengthThreshold
+	}
+
+	// Calculate current volatility based on recent price movements
+	if len(t.State.Closes) < 20 {
+		return t.Config.BaseOrderbookThreshold
+	}
+
+	recentCloses := t.State.Closes
+	if len(recentCloses) > 100 {
+		recentCloses = recentCloses[len(recentCloses)-100:]
+	}
+
+	// Calculate volatility as coefficient of variation
+	mean := 0.0
+	for _, c := range recentCloses {
+		mean += c
+	}
+	mean /= float64(len(recentCloses))
+
+	var variance float64
+	for _, c := range recentCloses {
+		variance += (c - mean) * (c - mean)
+	}
+	variance /= float64(len(recentCloses))
+	stdDev := math.Sqrt(variance)
+
+	// Calculate coefficient of variation (CV) as a percentage
+	cv := 0.0
+	if mean != 0 {
+		cv = math.Abs(stdDev/mean) * 100
+	}
+
+	// Adjust threshold based on volatility level
+	if cv >= t.Config.MaxVolatilityThreshold {
+		// High volatility market - require stronger orderbook confirmation
+		return t.Config.HighVolatilityThreshold
+	} else if cv <= t.Config.MinVolatilityThreshold {
+		// Low volatility market - allow lower threshold
+		return t.Config.LowVolatilityThreshold
+	} else {
+		// Interpolate threshold between low and base based on volatility
+		if cv < (t.Config.MinVolatilityThreshold+t.Config.MaxVolatilityThreshold)/2 {
+			// Between low volatility and mid-point
+			ratio := (cv - t.Config.MinVolatilityThreshold) /
+			         ((t.Config.MinVolatilityThreshold+t.Config.MaxVolatilityThreshold)/2 - t.Config.MinVolatilityThreshold)
+			return t.Config.LowVolatilityThreshold + ratio*(t.Config.BaseOrderbookThreshold-t.Config.LowVolatilityThreshold)
+		} else {
+			// Between mid-point and high volatility
+			ratio := (cv - (t.Config.MinVolatilityThreshold+t.Config.MaxVolatilityThreshold)/2) /
+			         (t.Config.MaxVolatilityThreshold - (t.Config.MinVolatilityThreshold+t.Config.MaxVolatilityThreshold)/2)
+			return t.Config.BaseOrderbookThreshold + ratio*(t.Config.HighVolatilityThreshold-t.Config.BaseOrderbookThreshold)
+		}
+	}
+}
+
+// calculateAverageVolume calculates the average volume from recent periods
+func (t *Trader) calculateAverageVolume() float64 {
+	if len(t.State.RecentVolumes) == 0 {
+		return 0
+	}
+
+	sum := 0.0
+	for _, vol := range t.State.RecentVolumes {
+		sum += vol
+	}
+	return sum / float64(len(t.State.RecentVolumes))
+}
+
+// detectVolumeSpike checks if current volume exceeds average by the required multiplier
+func (t *Trader) detectVolumeSpike(currentVolume float64) bool {
+	if len(t.State.RecentVolumes) == 0 {
+		// If no historical data, assume no spike
+		return currentVolume > t.Config.MinVolumeThreshold
+	}
+
+	avgVolume := t.calculateAverageVolume()
+	if avgVolume == 0 {
+		return currentVolume > t.Config.MinVolumeThreshold
+	}
+
+	return currentVolume > avgVolume*t.Config.VolumeSpikeMultiplier &&
+		   currentVolume > t.Config.MinVolumeThreshold
+}
+
 // generateOriginalSignals maintains the original logic for backward compatibility
 func (t *Trader) generateOriginalSignals(closesCopy []float64, cls, smaVal, macdHist, macdLine, signalLine, bbUpper, bbLower, hysteresis float64) {
 	// Generate signals based on multiple indicators with priority (RSI temporarily disabled)
@@ -1274,8 +1410,18 @@ func (t *Trader) OnClosedCandle(closePrice float64) {
 	t.State.LongTermHighs = append(t.State.LongTermHighs, closePrice)
 	t.State.LongTermLows = append(t.State.LongTermLows, closePrice)
 
+	// For volume tracking, we'll calculate a simple proxy using ATR * price as an approximation
+	// In a real implementation, we would have access to actual volume data
+	currentATR := indicators.CalculateATR(t.State.Highs, t.State.Lows, t.State.Closes, 14)
+	approximateVolume := currentATR * closePrice // This is a proxy for volume, not actual volume
+
+	// Add to volume tracking with a reasonable cap
+	if approximateVolume > 0 {
+		t.State.RecentVolumes = append(t.State.RecentVolumes, approximateVolume)
+	}
+
 	if t.Config.Debug {
-		t.Logger.Debug("Added price: %.2f, length closes: %d", closePrice, len(t.State.Closes))
+		t.Logger.Debug("Added price: %.2f, length closes: %d, approximate volume: %.2f", closePrice, len(t.State.Closes), approximateVolume)
 	}
 
 	// Log indicator values after adding new candle
@@ -1307,6 +1453,12 @@ func (t *Trader) OnClosedCandle(closePrice float64) {
 		t.State.LongTermCloses = t.State.LongTermCloses[len(t.State.LongTermCloses)-longTermMaxLen:]
 		t.State.LongTermHighs = t.State.LongTermHighs[len(t.State.LongTermHighs)-longTermMaxLen:]
 		t.State.LongTermLows = t.State.LongTermLows[len(t.State.LongTermLows)-longTermMaxLen:]
+	}
+
+	// Maintain volume data with appropriate length
+	volumeMaxLen := 50  // Keep 50 periods of volume data for average calculation
+	if len(t.State.RecentVolumes) > volumeMaxLen {
+		t.State.RecentVolumes = t.State.RecentVolumes[len(t.State.RecentVolumes)-volumeMaxLen:]
 	}
 }
 
