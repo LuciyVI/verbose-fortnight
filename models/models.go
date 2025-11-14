@@ -24,11 +24,28 @@ type TPJob struct {
 	EntryPrice float64
 }
 
+// SignalDetails represents details of a single signal
+type SignalDetails struct {
+	Kind  string  // "SMA_LONG", "MACD_LONG", etc.
+	Weight int    // Weight of this signal
+	Value float64 // Additional value if needed e.g., indicator value
+}
+
 // Signal represents a trading signal
 type Signal struct {
 	Kind       string    // "GC" или "SMA"
 	ClosePrice float64   // цена закрытия свечи
 	Time       time.Time
+}
+
+// ConsolidatedSignal represents a consolidated trading signal with multiple confirmations
+type ConsolidatedSignal struct {
+	Kind           string          // Overall signal type: "LONG" or "SHORT"
+	ClosePrice     float64         // Current close price
+	Time           time.Time
+	SignalDetails  []SignalDetails // All contributing signals
+	TotalWeight    int             // Total weight of all contributing signals
+	SignalSource   string          // Source of the signal: "consolidated" or "original"
 }
 
 // OrderbookMsg represents orderbook message
@@ -111,5 +128,6 @@ type State struct {
 	// Channels
 	TPChan      chan TPJob
 	SigChan     chan Signal
+	ConsolidatedSigChan chan ConsolidatedSignal
 	MarketRegime string
 }
