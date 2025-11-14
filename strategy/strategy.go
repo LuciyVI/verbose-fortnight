@@ -538,6 +538,11 @@ func (t *Trader) openPosition(newSide string, price float64) {
 	// Reset partial profit tracking for new position
 	t.State.PartialTPTriggered = false
 	t.State.PartialTPPrice = 0.0
+
+	// Reset exit tracking for new position
+	t.State.LastExitPrice = 0.0
+	t.State.LastExitTime = time.Time{}
+	t.State.LastExitSide = ""
 }
 
 // calculateTPSLWithRatio calculates TP/SL with a 2:1 ratio based on 15-minute price projection or ATR
@@ -795,15 +800,41 @@ func (t *Trader) SMAMovingAverageWorker() {
 			continue
 		}
 
-		closesCopy := append([]float64(nil), t.State.Closes...)
-		cls := closesCopy[len(closesCopy)-1]
+		// Choose data source based on signal smoothing configuration
+		var sourceCloses []float64
+		var sourceHighs []float64
+		var sourceLows []float64
+		var latestClose float64
+
+		if t.Config.UseSignalSmoothing && t.Config.SignalSmoothingWindow > 1 {
+			// Use smoothed data based on the configured window
+			sourceCloses = t.getSmoothedCloses(t.Config.SignalSmoothingWindow)
+			sourceHighs = t.getSmoothedHighs(t.Config.SignalSmoothingWindow)
+			sourceLows = t.getSmoothedLows(t.Config.SignalSmoothingWindow)
+			// Get the most recent close price for current reference
+			if len(t.State.Closes) > 0 {
+				latestClose = t.State.Closes[len(t.State.Closes)-1]
+			} else {
+				continue
+			}
+		} else {
+			// Use original data
+			sourceCloses = append([]float64(nil), t.State.Closes...)
+			sourceHighs = append([]float64(nil), t.State.Highs...)
+			sourceLows = append([]float64(nil), t.State.Lows...)
+			if len(sourceCloses) > 0 {
+				latestClose = sourceCloses[len(sourceCloses)-1]
+			} else {
+				continue
+			}
+		}
 
 		// Calculate SMA
-		smaVal := indicators.SMA(closesCopy)
-		t.Logger.Debug("SMA(%d) calculated: %.2f, Current close: %.2f", t.Config.SmaLen, smaVal, cls)
+		smaVal := indicators.SMA(sourceCloses)
+		t.Logger.Debug("SMA(%d) calculated: %.2f, Current close: %.2f", t.Config.SmaLen, smaVal, latestClose)
 
 		// Calculate RSI
-		rsiValues := indicators.RSI(closesCopy, 14)
+		rsiValues := indicators.RSI(sourceCloses, 14)
 		var rsi float64
 		if len(rsiValues) > 0 && !math.IsNaN(rsiValues[len(rsiValues)-1]) {
 			rsi = rsiValues[len(rsiValues)-1]
@@ -811,7 +842,7 @@ func (t *Trader) SMAMovingAverageWorker() {
 		t.Logger.Debug("RSI(14) calculated: %.2f", rsi)
 
 		// Calculate MACD
-		macdLine, signalLine := indicators.MACD(closesCopy)
+		macdLine, signalLine := indicators.MACD(sourceCloses)
 		var macdHist float64
 		if macdLine != 0 {
 			macdHist = macdLine - signalLine
@@ -819,11 +850,11 @@ func (t *Trader) SMAMovingAverageWorker() {
 		t.Logger.Debug("MACD calculated - Line: %.4f, Signal: %.4f, Histogram: %.4f", macdLine, signalLine, macdHist)
 
 		// Calculate ATR
-		atr := indicators.CalculateATR(t.State.Highs, t.State.Lows, t.State.Closes, 14)
+		atr := indicators.CalculateATR(sourceHighs, sourceLows, sourceCloses, 14)
 		t.Logger.Debug("ATR(14) calculated: %.4f", atr)
 
 		// Calculate Bollinger Bands
-		bbUpper, bbMiddle, bbLower := indicators.CalculateBollingerBands(closesCopy, 20, 2.0)
+		bbUpper, bbMiddle, bbLower := indicators.CalculateBollingerBands(sourceCloses, 20, 2.0)
 		t.Logger.Debug("Bollinger Bands calculated - Upper: %.2f, Middle: %.2f, Lower: %.2f", bbUpper, bbMiddle, bbLower)
 
 		hysteresis := 0.005 // 0.5%
@@ -834,12 +865,90 @@ func (t *Trader) SMAMovingAverageWorker() {
 
 		// Generate consolidated signals with weights
 		if t.Config.UseSignalConsolidation {
-			t.generateConsolidatedSignals(closesCopy, cls, smaVal, macdHist, macdLine, signalLine, bbUpper, bbLower, hysteresis)
+			t.generateConsolidatedSignals(sourceCloses, latestClose, smaVal, macdHist, macdLine, signalLine, bbUpper, bbLower, hysteresis)
 		} else {
 			// Original logic for backward compatibility
-			t.generateOriginalSignals(closesCopy, cls, smaVal, macdHist, macdLine, signalLine, bbUpper, bbLower, hysteresis)
+			t.generateOriginalSignals(sourceCloses, latestClose, smaVal, macdHist, macdLine, signalLine, bbUpper, bbLower, hysteresis)
 		}
 	}
+}
+
+// getSmoothedCloses returns smoothed close prices based on a time window
+func (t *Trader) getSmoothedCloses(windowSeconds int) []float64 {
+	if len(t.State.Closes) == 0 {
+		return []float64{}
+	}
+
+	// If window is bigger than available data, return the original data
+	if windowSeconds >= len(t.State.Closes) {
+		return append([]float64(nil), t.State.Closes...) // Copy original data
+	}
+
+	// Calculate the smoothed data based on the window
+	smoothed := make([]float64, len(t.State.Closes)-windowSeconds+1)
+
+	// For each point in the smoothed array, calculate an average over the window
+	for i := windowSeconds - 1; i < len(t.State.Closes); i++ {
+		sum := 0.0
+		for j := 0; j < windowSeconds; j++ {
+			sum += t.State.Closes[i-windowSeconds+1+j]
+		}
+		smoothed[i-windowSeconds+1] = sum / float64(windowSeconds)
+	}
+
+	return smoothed
+}
+
+// getSmoothedHighs returns smoothed high prices based on a time window
+func (t *Trader) getSmoothedHighs(windowSeconds int) []float64 {
+	if len(t.State.Highs) == 0 {
+		return []float64{}
+	}
+
+	// If window is bigger than available data, return the original data
+	if windowSeconds >= len(t.State.Highs) {
+		return append([]float64(nil), t.State.Highs...) // Copy original data
+	}
+
+	// Calculate the smoothed data based on the window
+	smoothed := make([]float64, len(t.State.Highs)-windowSeconds+1)
+
+	// For each point in the smoothed array, calculate an average over the window
+	for i := windowSeconds - 1; i < len(t.State.Highs); i++ {
+		sum := 0.0
+		for j := 0; j < windowSeconds; j++ {
+			sum += t.State.Highs[i-windowSeconds+1+j]
+		}
+		smoothed[i-windowSeconds+1] = sum / float64(windowSeconds)
+	}
+
+	return smoothed
+}
+
+// getSmoothedLows returns smoothed low prices based on a time window
+func (t *Trader) getSmoothedLows(windowSeconds int) []float64 {
+	if len(t.State.Lows) == 0 {
+		return []float64{}
+	}
+
+	// If window is bigger than available data, return the original data
+	if windowSeconds >= len(t.State.Lows) {
+		return append([]float64(nil), t.State.Lows...) // Copy original data
+	}
+
+	// Calculate the smoothed data based on the window
+	smoothed := make([]float64, len(t.State.Lows)-windowSeconds+1)
+
+	// For each point in the smoothed array, calculate an average over the window
+	for i := windowSeconds - 1; i < len(t.State.Lows); i++ {
+		sum := 0.0
+		for j := 0; j < windowSeconds; j++ {
+			sum += t.State.Lows[i-windowSeconds+1+j]
+		}
+		smoothed[i-windowSeconds+1] = sum / float64(windowSeconds)
+	}
+
+	return smoothed
 }
 
 // generateConsolidatedSignals generates signals using weighted consolidation approach
@@ -1244,27 +1353,29 @@ func (t *Trader) closeOppositePosition(newSide string) {
 	side = t.PositionManager.NormalizeSide(side)
 	newSide = t.PositionManager.NormalizeSide(newSide)
 	
+	// Declare exitPrice variable to be accessible outside the condition
+	var exitPrice float64 = 0.0 // Initialize to 0 to handle cases where no position is closed
+
 	// Only close if it's truly the opposite side
 	if side != "" && side != newSide {
 		t.Logger.Info("Closing opposite position: %s", side)
-		
+
 		// Get entry price for profit calculation
 		entryPrice := t.PositionManager.GetLastEntryPrice()
-		
+
 		reduceSide := "Sell"
 		if side == "SHORT" {
 			reduceSide = "Buy"
 		}
-		
+
 		if err := t.OrderManager.PlaceOrderMarket(reduceSide, qty, true); err != nil {
 			t.Logger.Error("Error closing position %s: %v", side, err)
 			return
 		}
-		
+
 		t.Logger.Info("Successfully sent order to close position %s", side)
-		
+
 		// Calculate profit based on current price and entry price
-		var exitPrice float64
 		if side == "LONG" {
 			// For LONG positions, we sell to close
 			exitPrice = t.PositionManager.GetLastBidPrice()
@@ -1272,23 +1383,30 @@ func (t *Trader) closeOppositePosition(newSide string) {
 			// For SHORT positions, we buy to close
 			exitPrice = t.PositionManager.GetLastAskPrice()
 		}
-		
+
 		if exitPrice <= 0 {
 			exitPrice = entryPrice // Fallback if we can't get current price
 		}
-		
+
 		profit := t.PositionManager.CalculatePositionProfit(side, entryPrice, exitPrice, qty)
 		signalType := "CLOSE_LONG"
 		if side == "SHORT" {
 			signalType = "CLOSE_SHORT"
 		}
-		
+
 		t.PositionManager.UpdateSignalStats(signalType, profit)
 	}
 
 	// Reset partial profit tracking when closing any position
 	t.State.PartialTPTriggered = false
 	t.State.PartialTPPrice = 0.0
+
+	// Update exit tracking for smart re-entry (only if we actually closed a position)
+	if side != "" && side != newSide && t.Config.UseSmartReentry {
+		t.State.LastExitPrice = exitPrice
+		t.State.LastExitTime = time.Now()
+		t.State.LastExitSide = side
+	}
 }
 
 // Trader processes signals and executes trades
@@ -1305,12 +1423,23 @@ func (t *Trader) processConsolidatedSignals() {
 	lastSignal := ""
 
 	for consolidatedSig := range t.State.ConsolidatedSigChan {
-		// Prevent consecutive same signals
-		if string(consolidatedSig.Kind) == lastSignal {
-			if t.Config.Debug {
-				t.Logger.Debug("Skipping duplicate consolidated signal: %s", consolidatedSig.Kind)
+		// Apply smart re-entry logic if enabled
+		if t.Config.UseSmartReentry {
+			shouldSkip := t.shouldSkipSignal(consolidatedSig.Kind, consolidatedSig.ClosePrice)
+			if shouldSkip {
+				if t.Config.Debug {
+					t.Logger.Debug("Skipping signal due to smart re-entry logic: %s", consolidatedSig.Kind)
+				}
+				continue
 			}
-			continue
+		} else {
+			// Legacy logic: Prevent consecutive same signals
+			if string(consolidatedSig.Kind) == lastSignal {
+				if t.Config.Debug {
+					t.Logger.Debug("Skipping duplicate consolidated signal: %s", consolidatedSig.Kind)
+				}
+				continue
+			}
 		}
 
 		// Check orderbook strength as additional confirmation
@@ -1339,7 +1468,9 @@ func (t *Trader) processConsolidatedSignals() {
 			}
 
 			t.HandleLongSignal(consolidatedSig.ClosePrice)
-			lastSignal = "LONG"
+			if !t.Config.UseSmartReentry {
+				lastSignal = "LONG"
+			}
 		} else if consolidatedSig.Kind == "SHORT" {
 			// Check if we have an opposite position that needs to be closed first
 			exists, side, _, _, _ := t.PositionManager.HasOpenPosition()
@@ -1349,9 +1480,35 @@ func (t *Trader) processConsolidatedSignals() {
 			}
 
 			t.HandleShortSignal(consolidatedSig.ClosePrice)
-			lastSignal = "SHORT"
+			if !t.Config.UseSmartReentry {
+				lastSignal = "SHORT"
+			}
 		}
 	}
+}
+
+// shouldSkipSignal determines if a signal should be skipped based on smart re-entry logic
+func (t *Trader) shouldSkipSignal(signalKind string, currentPrice float64) bool {
+	// If no previous exit data, don't skip
+	if t.State.LastExitTime.IsZero() {
+		return false
+	}
+
+	// Check if the signal is in the same direction as the last exit
+	if signalKind == t.State.LastExitSide {
+		// Same direction - check if sufficient price movement has happened since exit
+		priceDiff := math.Abs(currentPrice - t.State.LastExitPrice)
+		priceChangePercentage := priceDiff / t.State.LastExitPrice
+
+		if priceChangePercentage < t.Config.ReentryPriceThreshold {
+			// Not enough price movement from exit point - skip signal
+			t.Logger.Debug("Skipping %s signal - insufficient price movement from exit: %.4f%% < %.4f%%",
+				signalKind, priceChangePercentage*100, t.Config.ReentryPriceThreshold*100)
+			return true
+		}
+	}
+
+	return false
 }
 
 // processOriginalSignals handles the original signal processing for backward compatibility
@@ -1362,12 +1519,23 @@ func (t *Trader) processOriginalSignals() {
 	for sig := range t.State.SigChan {
 		signalStrength[sig.Kind]++
 
-		// Prevent consecutive same signals
-		if sig.Kind == lastSignal {
-			if t.Config.Debug {
-				t.Logger.Debug("Skipping duplicate signal: %s", sig.Kind)
+		// Apply smart re-entry logic if enabled
+		if t.Config.UseSmartReentry {
+			shouldSkip := t.shouldSkipSignal(sig.Kind, sig.ClosePrice)
+			if shouldSkip {
+				if t.Config.Debug {
+					t.Logger.Debug("Skipping signal due to smart re-entry logic: %s", sig.Kind)
+				}
+				continue
 			}
-			continue
+		} else {
+			// Legacy logic: Prevent consecutive same signals
+			if sig.Kind == lastSignal {
+				if t.Config.Debug {
+					t.Logger.Debug("Skipping duplicate signal: %s", sig.Kind)
+				}
+				continue
+			}
 		}
 
 		if t.Config.Debug {
@@ -1388,7 +1556,9 @@ func (t *Trader) processOriginalSignals() {
 			}
 
 			t.HandleLongSignal(sig.ClosePrice)
-			lastSignal = "SMA_LONG"
+			if !t.Config.UseSmartReentry {
+				lastSignal = "SMA_LONG"
+			}
 			t.resetSignalStrength(&signalStrength)
 		} else if sig.Kind == "SMA_SHORT" && signalStrength["SMA_SHORT"] >= t.Config.SignalStrengthThreshold && t.CheckOrderbookStrength("SHORT") {
 			if t.Config.Debug {
@@ -1403,7 +1573,9 @@ func (t *Trader) processOriginalSignals() {
 			}
 
 			t.HandleShortSignal(sig.ClosePrice)
-			lastSignal = "SMA_SHORT"
+			if !t.Config.UseSmartReentry {
+				lastSignal = "SMA_SHORT"
+			}
 			t.resetSignalStrength(&signalStrength)
 		}
 	}

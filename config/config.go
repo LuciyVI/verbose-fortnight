@@ -64,6 +64,12 @@ type Config struct {
 	PartialProfitPercentage    float64 // Percentage of position to close when TP hit (e.g., 0.5 = 50%)
 	TrailingStopATRMultiplier  float64 // ATR multiplier for trailing stop (e.g., 1.0 times ATR)
 	UsePartialProfitTaking     bool    // Enable partial profit taking before trailing the rest
+	// Signal smoothing configuration
+	UseSignalSmoothing         bool    // Enable signal smoothing over time windows
+	SignalSmoothingWindow      int     // Time window in seconds for signal smoothing (e.g., 30 seconds)
+	// Smart re-entry configuration
+	UseSmartReentry            bool    // Enable smart re-entry after position closure
+	ReentryPriceThreshold      float64 // Minimum price movement from exit before re-entry (e.g., 0.005 = 0.5%)
 	// Logging configuration
 	LogFile       string
 	LogMaxSize    int // megabytes
@@ -135,6 +141,12 @@ func LoadConfig() *Config {
 		PartialProfitPercentage:    0.5,   // Close 50% when TP hit
 		TrailingStopATRMultiplier:  1.0,   // Trailing stop at 1x ATR
 		UsePartialProfitTaking:     true,  // Enable partial profit taking by default
+		// Signal smoothing defaults
+		UseSignalSmoothing:         true,  // Enable by default
+		SignalSmoothingWindow:      30,    // Use 30-second window for smoothing
+		// Smart re-entry defaults
+		UseSmartReentry:            true,  // Enable by default
+		ReentryPriceThreshold:      0.005, // 0.5% price movement required for re-entry
 		// Logging defaults
 		LogFile:       getEnv("LOG_FILE", "trading_bot.log"),
 		LogMaxSize:    10, // 10 MB
