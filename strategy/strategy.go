@@ -16,8 +16,8 @@ import (
 	"verbose-fortnight/models"
 	"verbose-fortnight/order"
 	"verbose-fortnight/position"
-	"verbose-fortnight/strategy/signals"  // Add the signals package import
-	"verbose-fortnight/web_interface"  // Add the web interface import
+	"verbose-fortnight/strategy/signals" // Add the signals package import
+	"verbose-fortnight/web_interface"    // Add the web interface import
 )
 
 // Trader handles trading logic and signal processing
@@ -28,14 +28,14 @@ type Trader struct {
 	OrderManager    *order.OrderManager
 	PositionManager *position.PositionManager
 	Logger          logging.LoggerInterface
-	WebUI           *web_interface.WebUI  // Add WebUI for broadcasting updates
+	WebUI           *web_interface.WebUI // Add WebUI for broadcasting updates
 
 	// New architecture components
-	RegimeDetector        *RegimeDetector
+	RegimeDetector           *RegimeDetector
 	MultiTimeframeIndicators *MultiTimeframeIndicators
-	SignalScorer          *SignalScorer
-	SignalFilter          *SignalFilter
-	SignalQueueManager    *SignalQueueManager
+	SignalScorer             *SignalScorer
+	SignalFilter             *SignalFilter
+	SignalQueueManager       *SignalQueueManager
 }
 
 // NewTrader creates a new trader instance
@@ -72,16 +72,16 @@ func (t *Trader) initializeSignalSystem() {
 // TPWorker processes take profit jobs
 func (t *Trader) TPWorker() {
 	t.Logger.Info("Starting TP worker to process take profit jobs...")
-	
+
 	for job := range t.State.TPChan {
 		t.Logger.Info("Received TP job: Side=%s, Qty=%.4f, EntryPrice=%.2f", job.Side, job.Qty, job.EntryPrice)
-		
+
 		exists, side, qty, _, _ := t.PositionManager.HasOpenPosition()
 		if !exists || t.PositionManager.NormalizeSide(job.Side) != t.PositionManager.NormalizeSide(side) || job.Qty != qty {
 			t.Logger.Info("Position mismatch, skipping TP job")
 			continue
 		}
-		
+
 		// Calculate TP based on 15-minute price projection
 		t.Logger.Debug("Calculating TP based on 15-minute price projection...")
 		entryPrice := job.EntryPrice
@@ -92,11 +92,11 @@ func (t *Trader) TPWorker() {
 			t.Logger.Error("Cannot find entry price - skipping TP")
 			continue
 		}
-		
+
 		// Use our new 15-minute projection method
 		finalTP := t.calculateTPBasedOn15MinProjection(entryPrice, job.Side)
 		t.Logger.Info("TP calculated using 15-minute projection: %.2f", finalTP)
-		
+
 		if finalTP == 0 || math.IsNaN(finalTP) {
 			entryPrice := job.EntryPrice
 			if entryPrice == 0 {
@@ -126,13 +126,13 @@ func (t *Trader) TPWorker() {
 			// Account for commission (0.09% total for entry and exit)
 			commission := entryPrice * 0.0009
 			if job.Side == "LONG" {
-				finalTP = math.Round((entryPrice + (atr * tpMultiplier) + commission)/tickSize) * tickSize
+				finalTP = math.Round((entryPrice+(atr*tpMultiplier)+commission)/tickSize) * tickSize
 			} else {
-				finalTP = math.Round((entryPrice - (atr * tpMultiplier) - commission)/tickSize) * tickSize
+				finalTP = math.Round((entryPrice-(atr*tpMultiplier)-commission)/tickSize) * tickSize
 			}
 			t.Logger.Info("Using ATR-based fallback TP calculation: %.2f", finalTP)
 		}
-		
+
 		// Calculate TP/SL with 2:1 ratio
 		entryPrice = job.EntryPrice
 		if entryPrice == 0 {
@@ -141,15 +141,15 @@ func (t *Trader) TPWorker() {
 		if entryPrice == 0 {
 			entryPrice = finalTP // Fallback if we can't get entry price
 		}
-		
+
 		// Apply 2:1 ratio between TP and SL based on 15-minute projection
 		finalTP, _ = t.calculateTPSLWithRatio(entryPrice, job.Side)
-		
+
 		orderSide := "Sell"
 		if job.Side == "SHORT" {
 			orderSide = "Buy"
 		}
-		
+
 		t.Logger.Info("Placing take profit order: %s, Qty=%.4f, Price=%.2f", orderSide, job.Qty, finalTP)
 		if err := t.OrderManager.PlaceTakeProfitOrder(orderSide, job.Qty, finalTP); err != nil {
 			t.Logger.Error("Error placing TP: %v", err)
@@ -213,7 +213,7 @@ func (t *Trader) CheckOrderbookStrength(side string) bool {
 			return true
 		}
 	}
-	
+
 	t.Logger.Debug("Orderbook strength check failed for side %s in regime %s", side, t.State.MarketRegime)
 	return false
 }
@@ -230,14 +230,14 @@ func (t *Trader) DetectMarketRegime() {
 	// Calculate multiple metrics for better regime detection
 	rangePerc := calculateRangePercentage(recent)
 	t.Logger.Debug("Range percentage calculated: %.2f", rangePerc)
-	
+
 	volatilityRegime := detectVolatilityRegime(t.State.Closes)
 	t.Logger.Debug("Volatility regime detected: %s", volatilityRegime)
-	
+
 	trendStrength := calculateTrendStrength(recent)
 	t.Logger.Debug("Trend strength calculated: %.2f", trendStrength)
 
-	t.Logger.Info("Market regime metrics - RangePerc: %.2f, VolatilityRegime: %s, TrendStrength: %.2f", 
+	t.Logger.Info("Market regime metrics - RangePerc: %.2f, VolatilityRegime: %s, TrendStrength: %.2f",
 		rangePerc, volatilityRegime, trendStrength)
 
 	// Combine multiple signals for final determination
@@ -264,14 +264,14 @@ func calculateRangePercentage(closes []float64) float64 {
 	if len(closes) == 0 {
 		return 0
 	}
-	
+
 	maxHigh := indicators.MaxSlice(closes)
 	minLow := indicators.MinSlice(closes)
-	
+
 	if minLow <= 0 {
 		return 0
 	}
-	
+
 	return (maxHigh - minLow) / minLow * 100
 }
 
@@ -283,32 +283,32 @@ func detectVolatilityRegime(closes []float64) string {
 
 	// Use the most recent 20 closes to calculate recent volatility
 	recent := closes[len(closes)-20:]
-	
+
 	// Calculate standard deviation as a volatility measure
 	mean := 0.0
 	for _, c := range recent {
 		mean += c
 	}
 	mean /= float64(len(recent))
-	
+
 	var variance float64
 	for _, c := range recent {
 		variance += (c - mean) * (c - mean)
 	}
 	variance /= float64(len(recent))
 	stdDev := math.Sqrt(variance)
-	
+
 	// Calculate coefficient of variation
 	if mean != 0 {
 		cv := stdDev / math.Abs(mean) * 100
-		
+
 		if cv > 5.0 { // High threshold for high volatility in crypto
 			return "high"
 		} else {
 			return "low"
 		}
 	}
-	
+
 	return "unknown"
 }
 
@@ -317,23 +317,23 @@ func calculateTrendStrength(closes []float64) float64 {
 	if len(closes) < 2 {
 		return 0
 	}
-	
+
 	totalChange := math.Abs(closes[len(closes)-1] - closes[0])
 	totalDistance := 0.0
-	
+
 	// Sum of absolute changes between each candle to see total movement vs net trend
 	for i := 1; i < len(closes); i++ {
 		totalDistance += math.Abs(closes[i] - closes[i-1])
 	}
-	
+
 	if totalDistance == 0 {
 		return 0
 	}
-	
+
 	// A strong trend would have totalChange close to totalDistance
 	// A ranging market would have totalDistance much larger than totalChange
 	trendRatio := totalChange / totalDistance
-	
+
 	// Normalize to 0-1 scale
 	return math.Min(trendRatio*2, 1.0) // Multiply by 2 to increase sensitivity
 }
@@ -383,17 +383,17 @@ func (t *Trader) HandleShortSignal(closePrice float64) {
 // openPosition opens a new position
 func (t *Trader) openPosition(newSide string, price float64) {
 	t.Logger.Info("Attempting to open new position: %s @ price %.2f", newSide, price)
-	
+
 	// Close opposite position if it exists and calculate profit
 	if exists, side, qty, _, _ := t.PositionManager.HasOpenPosition(); exists {
 		side = t.PositionManager.NormalizeSide(side)
 		newSide = t.PositionManager.NormalizeSide(newSide)
 		if side != "" && side != newSide && qty > 0 {
 			t.Logger.Info("Closing opposite position: %s", side)
-			
+
 			// Get entry price for profit calculation
 			entryPrice := t.PositionManager.GetLastEntryPrice()
-			
+
 			reduceSide := "Sell"
 			if side == "SHORT" {
 				reduceSide = "Buy"
@@ -425,11 +425,11 @@ func (t *Trader) openPosition(newSide string, price float64) {
 				t.Logger.Error("Error closing position %s: %v", side, err)
 				return
 			}
-			
+
 			t.Logger.Info("Successfully sent order to close position %s", side)
-			
+
 			// Calculate profit based on current price and entry price
-			exitPrice := price  // Using the current price as the exit price
+			exitPrice := price // Using the current price as the exit price
 			if side == "LONG" {
 				// For LONG positions, we sell to close, so we might get a slightly lower price
 				exitPrice = t.PositionManager.GetLastBidPrice()
@@ -443,13 +443,13 @@ func (t *Trader) openPosition(newSide string, price float64) {
 					exitPrice = price
 				}
 			}
-			
+
 			profit := t.PositionManager.CalculatePositionProfit(side, entryPrice, exitPrice, qty)
 			signalType := "CLOSE_LONG"
 			if side == "SHORT" {
 				signalType = "CLOSE_SHORT"
 			}
-			
+
 			t.PositionManager.UpdateSignalStats(signalType, profit)
 		}
 	}
@@ -523,10 +523,10 @@ func (t *Trader) openPosition(newSide string, price float64) {
 
 	raw, _ := json.Marshal(body)
 	ts := fmt.Sprintf("%d", time.Now().UnixMilli())
-	
+
 	// Log outgoing request
 	t.Logger.Info("Sending POST request to exchange: /v5/position/trading-stop, Body: %s", string(raw))
-	
+
 	req, _ := http.NewRequest("POST", t.Config.DemoRESTHost+"/v5/position/trading-stop", bytes.NewReader(raw))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-BAPI-API-KEY", t.Config.APIKey)
@@ -541,13 +541,16 @@ func (t *Trader) openPosition(newSide string, price float64) {
 		return
 	}
 	defer resp.Body.Close()
-	
+
 	reply, _ := io.ReadAll(resp.Body)
-	
+
 	// Log incoming response
 	t.Logger.Info("Received response from exchange for /v5/position/trading-stop: Status %d, Body: %s", resp.StatusCode, string(reply))
 
 	t.Logger.Info("Position opened: %s %.4f @ %.2f | TP %.2f  SL %.2f", newSide, qty, entry, tp, sl)
+
+	// Reset trailing stop flag for new position - trailing stop should only start after TP is modified
+	t.State.TrailingActive = false
 }
 
 // calculateTPSLWithRatio calculates TP/SL with ATR-based multipliers
@@ -798,33 +801,33 @@ func (t *Trader) calculateTPBasedOn15MinProjection(entryPrice float64, positionS
 		}
 		return entryPrice * (1 - defaultTPPerc)
 	}
-	
+
 	// Use the last 15 minutes of data (15 one-minute candles)
 	recentCloses := t.State.Closes
 	if len(recentCloses) > 15 {
 		recentCloses = recentCloses[len(recentCloses)-15:]
 	}
-	
+
 	// Calculate average price movement per minute
 	priceChanges := make([]float64, len(recentCloses)-1)
 	for i := 1; i < len(recentCloses); i++ {
 		priceChanges[i-1] = recentCloses[i] - recentCloses[i-1]
 	}
-	
+
 	// Calculate average movement per minute
 	avgMovementPerMin := 0.0
 	for _, change := range priceChanges {
 		avgMovementPerMin += change
 	}
 	avgMovementPerMin /= float64(len(priceChanges))
-	
+
 	// Project movement for 15 minutes
 	projectedMovement := avgMovementPerMin * 15
-	
+
 	// Apply momentum factor to make projections more realistic
 	momentumFactor := 0.7 // Reduce projection to account for mean reversion
 	projectedMovement *= momentumFactor
-	
+
 	// Calculate TP based on position side
 	var tpPrice float64
 	if positionSide == "LONG" {
@@ -832,11 +835,11 @@ func (t *Trader) calculateTPBasedOn15MinProjection(entryPrice float64, positionS
 	} else {
 		tpPrice = entryPrice + projectedMovement // Note: for SHORT, negative movement means price goes down
 	}
-	
+
 	// Ensure TP is reasonable (at least 0.1% away from entry)
 	minTPDistance := entryPrice * 0.001
 	actualTPDistance := math.Abs(tpPrice - entryPrice)
-	
+
 	if actualTPDistance < minTPDistance {
 		if positionSide == "LONG" {
 			tpPrice = entryPrice * (1 + 0.001) // 0.1% above entry
@@ -844,17 +847,17 @@ func (t *Trader) calculateTPBasedOn15MinProjection(entryPrice float64, positionS
 			tpPrice = entryPrice * (1 - 0.001) // 0.1% below entry
 		}
 	}
-	
-	t.Logger.Debug("15-minute TP projection - Entry: %.2f, Avg movement/minute: %.4f, Projected movement: %.4f, TP: %.2f", 
+
+	t.Logger.Debug("15-minute TP projection - Entry: %.2f, Avg movement/minute: %.4f, Projected movement: %.4f, TP: %.2f",
 		entryPrice, avgMovementPerMin, projectedMovement, tpPrice)
-	
+
 	return tpPrice
 }
 
 // adjustTPSL adjusts TP/SL for long positions with 2:1 ratio
 func (t *Trader) adjustTPSL(closePrice float64) {
 	t.Logger.Info("Adjusting TP/SL for LONG position, current price: %.2f", closePrice)
-	
+
 	exists, side, _, curTP, _ := t.PositionManager.HasOpenPosition()
 	if !exists || t.PositionManager.NormalizeSide(side) != "LONG" {
 		t.Logger.Info("No LONG position found, skipping TP/SL adjustment")
@@ -865,7 +868,7 @@ func (t *Trader) adjustTPSL(closePrice float64) {
 		t.Logger.Error("Could not get entry price, skipping TP/SL adjustment")
 		return
 	}
-	
+
 	atr := indicators.CalculateATR(t.State.Highs, t.State.Lows, t.State.Closes, 14)
 	t.Logger.Debug("ATR(14) calculated for trailing stop: %.4f", atr)
 
@@ -895,7 +898,7 @@ func (t *Trader) adjustTPSL(closePrice float64) {
 // adjustTPSLForShort adjusts TP/SL for short positions with 2:1 ratio
 func (t *Trader) adjustTPSLForShort(closePrice float64) {
 	t.Logger.Info("Adjusting TP/SL for SHORT position, current price: %.2f", closePrice)
-	
+
 	exists, side, _, curTP, _ := t.PositionManager.HasOpenPosition()
 	if !exists || side != "SHORT" {
 		t.Logger.Info("No SHORT position found, skipping TP/SL adjustment")
@@ -934,7 +937,7 @@ func (t *Trader) adjustTPSLForShort(closePrice float64) {
 // SMAMovingAverageWorker generates signals based on SMA, MACD and other indicators
 func (t *Trader) SMAMovingAverageWorker() {
 	t.Logger.Info("Starting SMA Moving Average Worker...")
-	
+
 	for range time.Tick(1 * time.Second) {
 		if len(t.State.Closes) < t.Config.SmaLen {
 			continue
@@ -981,31 +984,31 @@ func (t *Trader) SMAMovingAverageWorker() {
 		// Primary: SMA, Secondary: MACD, Tertiary: Golden Cross, Quaternary: Bollinger Bands
 		longSignal := false
 		shortSignal := false
-		
+
 		// Primary signal: SMA crossing without RSI confirmation (RSI temporarily disabled) - INVERTED LOGIC
-		if cls > smaVal*(1+hysteresis) {  // Inverted: was <, now >
-			t.Logger.Debug("Primary SHORT signal (inverted): Close %.2f > SMA(%.2f) * (1+%.3f) = %.2f", 
+		if cls > smaVal*(1+hysteresis) { // Inverted: was <, now >
+			t.Logger.Debug("Primary SHORT signal (inverted): Close %.2f > SMA(%.2f) * (1+%.3f) = %.2f",
 				cls, smaVal, hysteresis, smaVal*(1+hysteresis))
 			shortSignal = true
-		} else if cls < smaVal*(1-hysteresis) {  // Inverted: was >, now <
-			t.Logger.Debug("Primary LONG signal (inverted): Close %.2f < SMA(%.2f) * (1-%.3f) = %.2f", 
+		} else if cls < smaVal*(1-hysteresis) { // Inverted: was >, now <
+			t.Logger.Debug("Primary LONG signal (inverted): Close %.2f < SMA(%.2f) * (1-%.3f) = %.2f",
 				cls, smaVal, hysteresis, smaVal*(1-hysteresis))
 			longSignal = true
 		}
-		
+
 		// Secondary signals: MACD confirmation - INVERTED LOGIC
 		if !longSignal && !shortSignal {
 			if macdHist < 0 && macdLine < signalLine { // Bearish MACD (inverted from bullish)
-				t.Logger.Debug("Secondary SHORT signal (inverted from bullish MACD): Histogram(%.4f) < 0 and MACD(%.4f) < Signal(%.4f)", 
+				t.Logger.Debug("Secondary SHORT signal (inverted from bullish MACD): Histogram(%.4f) < 0 and MACD(%.4f) < Signal(%.4f)",
 					macdHist, macdLine, signalLine)
 				shortSignal = true
 			} else if macdHist > 0 && macdLine > signalLine { // Bullish MACD (inverted from bearish)
-				t.Logger.Debug("Secondary LONG signal (inverted from bearish MACD): Histogram(%.4f) > 0 and MACD(%.4f) > Signal(%.4f)", 
+				t.Logger.Debug("Secondary LONG signal (inverted from bearish MACD): Histogram(%.4f) > 0 and MACD(%.4f) > Signal(%.4f)",
 					macdHist, macdLine, signalLine)
 				longSignal = true
 			}
 		}
-		
+
 		// Tertiary signals: Death cross (opposite of golden cross) without RSI
 		if !longSignal && !shortSignal {
 			if indicators.DeathCross(closesCopy) {
@@ -1050,22 +1053,22 @@ func (t *Trader) closeOppositePosition(newSide string) {
 	if !exists {
 		return
 	}
-	
+
 	side = t.PositionManager.NormalizeSide(side)
 	newSide = t.PositionManager.NormalizeSide(newSide)
-	
+
 	// Only close if it's truly the opposite side
 	if side != "" && side != newSide {
 		t.Logger.Info("Closing opposite position: %s", side)
-		
+
 		// Get entry price for profit calculation
 		entryPrice := t.PositionManager.GetLastEntryPrice()
-		
+
 		reduceSide := "Sell"
 		if side == "SHORT" {
 			reduceSide = "Buy"
 		}
-		
+
 		// Get current price to determine limit order placement
 		var currentPrice float64
 		if side == "LONG" {
@@ -1103,9 +1106,9 @@ func (t *Trader) closeOppositePosition(newSide string) {
 			t.Logger.Error("Error closing position %s: %v", side, err)
 			return
 		}
-		
+
 		t.Logger.Info("Successfully sent order to close position %s", side)
-		
+
 		// Calculate profit based on current price and entry price
 		var exitPrice float64
 		if side == "LONG" {
@@ -1115,17 +1118,17 @@ func (t *Trader) closeOppositePosition(newSide string) {
 			// For SHORT positions, we buy to close
 			exitPrice = t.PositionManager.GetLastAskPrice()
 		}
-		
+
 		if exitPrice <= 0 {
 			exitPrice = entryPrice // Fallback if we can't get current price
 		}
-		
+
 		profit := t.PositionManager.CalculatePositionProfit(side, entryPrice, exitPrice, qty)
 		signalType := "CLOSE_LONG"
 		if side == "SHORT" {
 			signalType = "CLOSE_SHORT"
 		}
-		
+
 		t.PositionManager.UpdateSignalStats(signalType, profit)
 	}
 }
@@ -1193,7 +1196,12 @@ func (t *Trader) SyncPositionRealTime() {
 			continue
 		}
 
-		// Calculate progress toward TP
+		// Check if trailing stop is active (to ensure trailing stop only triggers after TP change)
+		if !t.State.TrailingActive {
+			continue // Don't trigger trailing stop until TP has been modified
+		}
+
+		// Progress toward TP
 		var dist, prog float64
 		if side == "LONG" {
 			dist = tp - entry
@@ -1214,10 +1222,10 @@ func (t *Trader) SyncPositionRealTime() {
 		if side == "LONG" {
 			// For LONG: SL should be above entry, following price movement
 			// Move SL to halfway between entry and current price, but not above current price
-			midpoint := entry + (price - entry) * 0.5
+			midpoint := entry + (price-entry)*0.5
 			// Ensure SL doesn't go beyond current price (with small buffer) and is above entry
 			targetSL = math.Max(midpoint, entry)
-			if targetSL >= price * 0.999 { // Small buffer to avoid being triggered immediately
+			if targetSL >= price*0.999 { // Small buffer to avoid being triggered immediately
 				targetSL = price * 0.999
 			}
 			// Only update if new SL is higher than current SL
@@ -1227,10 +1235,10 @@ func (t *Trader) SyncPositionRealTime() {
 		} else {
 			// For SHORT: SL should be below entry, following price movement
 			// Move SL to halfway between entry and current price, but not below current price
-			midpoint := entry - (entry - price) * 0.5
+			midpoint := entry - (entry-price)*0.5
 			// Ensure SL doesn't go beyond current price (with small buffer) and is below entry
 			targetSL = math.Min(midpoint, entry)
-			if targetSL <= price * 1.001 { // Small buffer to avoid being triggered immediately
+			if targetSL <= price*1.001 { // Small buffer to avoid being triggered immediately
 				targetSL = price * 1.001
 			}
 			// Only update if new SL is lower than current SL (better for short positions)
@@ -1270,8 +1278,8 @@ func (t *Trader) OnClosedCandle(closePrice float64) {
 		}
 		macdLine, _ := indicators.MACD(t.State.Closes)
 		bbUpper, bbMiddle, bbLower := indicators.CalculateBollingerBands(t.State.Closes, 20, 2.0)
-		
-		t.Logger.Debug("Indicators updated - SMA: %.2f, RSI: %.2f, MACD: %.4f, BB: %.2f/%.2f/%.2f", 
+
+		t.Logger.Debug("Indicators updated - SMA: %.2f, RSI: %.2f, MACD: %.4f, BB: %.2f/%.2f/%.2f",
 			smaVal, rsi, macdLine, bbLower, bbMiddle, bbUpper)
 	}
 
@@ -1320,10 +1328,10 @@ func (t *Trader) NewSignalGenerationWorker() {
 		regime := t.RegimeDetector.DetectRegime(t.State.Closes)
 		t.State.MarketRegime = string(regime)
 		t.SignalQueueManager.UpdateRegime(regime)
-		
+
 		// Update multi-timeframe data
 		t.MultiTimeframeIndicators.data.AddData(signals.Source1Sec, t.State.Closes)
-		
+
 		// Generate signals for current timeframe (1-second)
 		if len(t.State.Closes) < t.Config.SmaLen {
 			continue
@@ -1355,7 +1363,7 @@ func (t *Trader) NewSignalGenerationWorker() {
 		macdSignal := t.SignalScorer.ScoreMACDSignal(macdResult, regime, signals.Source1Sec)
 		bbSignal := t.SignalScorer.ScoreBollingerSignal(cls, bbBands, regime, signals.Source1Sec)
 		rsiSignal := t.SignalScorer.ScoreRSISignal(rsi, regime, signals.Source1Sec)
-		
+
 		// Get orderbook signal
 		t.State.ObLock.Lock()
 		var bidDepth, askDepth float64
@@ -1367,7 +1375,7 @@ func (t *Trader) NewSignalGenerationWorker() {
 		}
 		t.State.ObLock.Unlock()
 		obSignal := t.SignalScorer.ScoreOrderbookSignal(bidDepth, askDepth, regime, signals.Source1Sec)
-		
+
 		// Collect all generated signals
 		rawSignals := []signals.Signal{}
 		if smaSignal.Direction != "" {
@@ -1403,7 +1411,7 @@ func (t *Trader) NewSignalGenerationWorker() {
 			if ok {
 				// Add to signal buffer for temporal confirmation
 				t.SignalFilter.AddToBuffer(filteredSignal)
-				
+
 				// Check if signal is confirmed
 				if t.SignalFilter.ConfirmSignal(filteredSignal) {
 					filteredSignals = append(filteredSignals, filteredSignal)

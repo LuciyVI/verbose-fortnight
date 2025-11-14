@@ -146,7 +146,7 @@ func (pm *PositionManager) UpdatePositionTPSL(symbol string, tp, sl float64) err
 	
 	// Log incoming response
 	pm.Logger.Info("Received response from exchange for %s: Status %d, Body: %s", path, resp.StatusCode, string(reply))
-	
+
 	var r struct {
 		RetCode int    `json:"retCode"`
 		RetMsg  string `json:"retMsg"`
@@ -154,6 +154,12 @@ func (pm *PositionManager) UpdatePositionTPSL(symbol string, tp, sl float64) err
 	if json.Unmarshal(reply, &r) != nil || r.RetCode != 0 {
 		pm.Logger.Error("Error in TP/SL update response: %d: %s", r.RetCode, r.RetMsg)
 		return fmt.Errorf("error updating TP/SL: %d: %s", r.RetCode, r.RetMsg)
+	}
+
+	// If TP was updated, record the time and activate trailing stop
+	if tp != 0 {
+		pm.State.LastTPUpdate = time.Now()
+		pm.State.TrailingActive = true
 	}
 
 	return nil

@@ -112,4 +112,8 @@ type State struct {
 	TPChan      chan TPJob
 	SigChan     chan Signal
 	MarketRegime string
+
+	// Take profit tracking
+	LastTPUpdate   time.Time
+	TrailingActive bool
 }
