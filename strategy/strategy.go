@@ -857,11 +857,9 @@ func (t *Trader) SMAMovingAverageWorker() {
 		bbUpper, bbMiddle, bbLower := indicators.CalculateBollingerBands(sourceCloses, 20, 2.0)
 		t.Logger.Debug("Bollinger Bands calculated - Upper: %.2f, Middle: %.2f, Lower: %.2f", bbUpper, bbMiddle, bbLower)
 
-		hysteresis := 0.005 // 0.5%
-		if t.State.MarketRegime == "trend" {
-			hysteresis = 0.01 // Wider hysteresis in trend
-		}
-		t.Logger.Debug("Current market regime: %s, hysteresis: %.3f", t.State.MarketRegime, hysteresis)
+		// Calculate hysteresis based on ATR if dynamic thresholds are enabled, otherwise use regime-based approach
+		hysteresis := t.calculateDynamicHysteresis(atr, latestClose)
+		t.Logger.Debug("Current market regime: %s, ATR: %.4f, hysteresis: %.3f", t.State.MarketRegime, atr, hysteresis)
 
 		// Generate consolidated signals with weights
 		if t.Config.UseSignalConsolidation {
@@ -2081,6 +2079,39 @@ func (t *Trader) checkHigherTimeframeTrend(signalDirection string) bool {
 
 	// If signal is against the higher timeframe trend, reject it
 	return false
+}
+
+// calculateDynamicHysteresis calculates the hysteresis value based on current volatility (ATR)
+func (t *Trader) calculateDynamicHysteresis(currentATR, currentPrice float64) float64 {
+	// If dynamic thresholds are disabled, use the traditional regime-based approach
+	if !t.Config.UseDynamicThresholds {
+		hysteresis := 0.005 // 0.5%
+		if t.State.MarketRegime == "trend" {
+			hysteresis = 0.01 // Wider hysteresis in trend
+		}
+		return hysteresis
+	}
+
+	// If ATR is 0 or invalid, use base hysteresis
+	if currentATR <= 0 {
+		return t.Config.SignalBaseVolatilityHysteresis
+	}
+
+	// Calculate ATR as percentage of current price
+	atrPercentage := currentATR / currentPrice
+
+	// Use smooth interpolation between thresholds for more granular adjustment
+	if atrPercentage <= t.Config.SignalLowATRThreshold {
+		return t.Config.SignalLowVolatilityHysteresis
+	} else if atrPercentage >= t.Config.SignalHighATRThreshold {
+		return t.Config.SignalHighVolatilityHysteresis
+	} else {
+		// Perform linear interpolation between thresholds to determine appropriate hysteresis
+		// The hysteresis should increase with volatility between the thresholds
+		ratio := (atrPercentage - t.Config.SignalLowATRThreshold) /
+		         (t.Config.SignalHighATRThreshold - t.Config.SignalLowATRThreshold)
+		return t.Config.SignalLowVolatilityHysteresis + ratio*(t.Config.SignalHighVolatilityHysteresis - t.Config.SignalLowVolatilityHysteresis)
+	}
 }
 
 // LogSignalStats logs signal statistics

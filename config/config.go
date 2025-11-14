@@ -78,6 +78,13 @@ type Config struct {
 	UseMultiTimeframeFilter      bool    // Enable multi-timeframe trend filtering
 	HigherTimeframeInterval      int     // Higher timeframe interval in minutes (e.g., 5 for 5-min, 15 for 15-min)
 	HigherTimeframeTrendThreshold float64 // Threshold for determining trend on higher timeframe (e.g., using EMA, SMA)
+	// Dynamic threshold adjustment configuration
+	UseDynamicThresholds         bool    // Enable dynamic threshold adjustment based on volatility
+	SignalLowATRThreshold        float64 // ATR threshold for low volatility (below which we use tighter thresholds)
+	SignalHighATRThreshold       float64 // ATR threshold for high volatility (above which we use wider thresholds)
+	SignalLowVolatilityHysteresis      float64 // Hysteresis value when volatility is low
+	SignalHighVolatilityHysteresis     float64 // Hysteresis value when volatility is high
+	SignalBaseVolatilityHysteresis     float64 // Base hysteresis value when volatility is at normal levels
 	// Logging configuration
 	LogFile       string
 	LogMaxSize    int // megabytes
@@ -163,6 +170,13 @@ func LoadConfig() *Config {
 		UseMultiTimeframeFilter:      true,  // Enable by default
 		HigherTimeframeInterval:      5,     // 5-minute timeframe as higher timeframe
 		HigherTimeframeTrendThreshold: 200,  // 200-period indicator for trend determination
+		// Dynamic threshold adjustment defaults
+		UseDynamicThresholds:         true,  // Enable by default
+		SignalLowATRThreshold:        0.003, // Low volatility threshold (0.3% ATR as percentage of price)
+		SignalHighATRThreshold:       0.015, // High volatility threshold (1.5% ATR as percentage of price)
+		SignalLowVolatilityHysteresis:      0.003, // Tighter hysteresis for low volatility (0.3%)
+		SignalHighVolatilityHysteresis:     0.012, // Wider hysteresis for high volatility (1.2%)
+		SignalBaseVolatilityHysteresis:     0.007, // Base hysteresis for normal volatility (0.7%)
 		// Logging defaults
 		LogFile:       getEnv("LOG_FILE", "trading_bot.log"),
 		LogMaxSize:    10, // 10 MB
