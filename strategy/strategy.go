@@ -1030,14 +1030,20 @@ func (t *Trader) generateConsolidatedSignals(closesCopy []float64, cls, smaVal, 
 		totalWeight += t.Config.QuaternarySignalWeight
 	}
 
-	// Apply regime-based strategy if enabled
-	if t.Config.UseRegimeBasedStrategy {
-		signalDetails = t.filterSignalsByRegime(signalDetails)
-	}
+	// Apply multi-factor filtering if enabled
+	if t.Config.UseMultiFactorFilter {
+		// Apply multi-factor filtering requirements
+		signalDetails = t.applyMultiFactorFilter(signalDetails)
+	} else {
+		// Apply regime-based strategy if enabled
+		if t.Config.UseRegimeBasedStrategy {
+			signalDetails = t.filterSignalsByRegime(signalDetails)
+		}
 
-	// Apply higher-order trend filter if enabled
-	if t.Config.UseHigherTrendFilter {
-		signalDetails = t.filterSignalsByHigherTrend(signalDetails)
+		// Apply higher-order trend filter if enabled
+		if t.Config.UseHigherTrendFilter {
+			signalDetails = t.filterSignalsByHigherTrend(signalDetails)
+		}
 	}
 
 	// Determine overall signal direction based on weights after filtering
@@ -1081,6 +1087,96 @@ func (t *Trader) generateConsolidatedSignals(closesCopy []float64, cls, smaVal, 
 
 		t.State.ConsolidatedSigChan <- consolidatedSignal
 	}
+}
+
+// applyMultiFactorFilter applies multi-factor filtering that requires multiple simultaneous confirmations
+func (t *Trader) applyMultiFactorFilter(signalDetails []models.SignalDetails) []models.SignalDetails {
+	// First apply the existing filters
+	filteredDetails := signalDetails
+
+	if t.Config.UseRegimeBasedStrategy {
+		filteredDetails = t.filterSignalsByRegime(filteredDetails)
+	}
+
+	if t.Config.UseHigherTrendFilter {
+		filteredDetails = t.filterSignalsByHigherTrend(filteredDetails)
+	}
+
+	// Separate signals by type and direction
+	longPrimarySignals := 0
+	longSecondarySignals := 0
+	shortPrimarySignals := 0
+	shortSecondarySignals := 0
+
+	for _, signal := range filteredDetails {
+		switch signal.Kind {
+		case "SMA_LONG", "BB_LONG", "GOLDEN_CROSS_LONG":
+			longPrimarySignals++
+		case "MACD_LONG":
+			longSecondarySignals++
+		case "SMA_SHORT", "BB_SHORT":
+			shortPrimarySignals++
+		case "MACD_SHORT":
+			shortSecondarySignals++
+		}
+	}
+
+	// Create new filtered list based on multi-factor requirements
+	validatedDetails := []models.SignalDetails{}
+
+	for _, signal := range filteredDetails {
+		signalValid := false
+
+		// Determine if signal is valid based on multi-factor requirements
+		if signal.Kind == "SMA_LONG" || signal.Kind == "BB_LONG" || signal.Kind == "GOLDEN_CROSS_LONG" || signal.Kind == "MACD_LONG" {
+			// For LONG signals, validate that we have sufficient primary and secondary confirmations
+			if longPrimarySignals >= t.Config.RequiredPrimarySignals && longSecondarySignals >= t.Config.RequiredSecondarySignals {
+				signalValid = true
+			}
+		} else if signal.Kind == "SMA_SHORT" || signal.Kind == "BB_SHORT" || signal.Kind == "MACD_SHORT" {
+			// For SHORT signals, validate that we have sufficient primary and secondary confirmations
+			if shortPrimarySignals >= t.Config.RequiredPrimarySignals && shortSecondarySignals >= t.Config.RequiredSecondarySignals {
+				signalValid = true
+			}
+		}
+
+		if signalValid {
+			validatedDetails = append(validatedDetails, signal)
+		} else {
+			t.Logger.Debug("Multi-factor filter rejected signal: %s", signal.Kind)
+		}
+	}
+
+	// Only generate a signal if we have enough confirmations for the overall direction
+	// Count valid primary and secondary signals for each direction
+	validLongPrimary := 0
+	validLongSecondary := 0
+	validShortPrimary := 0
+	validShortSecondary := 0
+
+	for _, signal := range validatedDetails {
+		switch signal.Kind {
+		case "SMA_LONG", "BB_LONG", "GOLDEN_CROSS_LONG":
+			validLongPrimary++
+		case "MACD_LONG":
+			validLongSecondary++
+		case "SMA_SHORT", "BB_SHORT":
+			validShortPrimary++
+		case "MACD_SHORT":
+			validShortSecondary++
+		}
+	}
+
+	// If we don't meet the minimum requirements for either direction, return an empty list
+	longValid := validLongPrimary >= t.Config.RequiredPrimarySignals && validLongSecondary >= t.Config.RequiredSecondarySignals
+	shortValid := validShortPrimary >= t.Config.RequiredPrimarySignals && validShortSecondary >= t.Config.RequiredSecondarySignals
+
+	if !longValid && !shortValid {
+		t.Logger.Debug("Multi-factor filter: insufficient confirmations for any direction")
+		return []models.SignalDetails{}
+	}
+
+	return validatedDetails
 }
 
 // filterSignalsByRegime applies different weights or filters signals based on market regime
