@@ -1538,6 +1538,15 @@ func (t *Trader) processConsolidatedSignals() {
 			}
 		}
 
+		// Check higher timeframe trend filter
+		if !t.checkHigherTimeframeTrend(consolidatedSig.Kind) {
+			if t.Config.Debug {
+				t.Logger.Debug("Higher timeframe filter rejected %s signal - opposite to HTF trend: %s",
+					consolidatedSig.Kind, t.State.HigherTimeframeTrend)
+			}
+			continue
+		}
+
 		// Check orderbook strength as additional confirmation
 		if !t.CheckOrderbookStrength(consolidatedSig.Kind) {
 			if t.Config.Debug {
@@ -1639,7 +1648,8 @@ func (t *Trader) processOriginalSignals() {
 		}
 
 		// Process LONG signal with proper conflict resolution
-		if sig.Kind == "SMA_LONG" && signalStrength["SMA_LONG"] >= t.Config.SignalStrengthThreshold && t.CheckOrderbookStrength("LONG") {
+		if sig.Kind == "SMA_LONG" && signalStrength["SMA_LONG"] >= t.Config.SignalStrengthThreshold &&
+			t.checkHigherTimeframeTrend("LONG") && t.CheckOrderbookStrength("LONG") {
 			if t.Config.Debug {
 				t.Logger.Debug("Confirmed LONG signal: %d indicators", signalStrength["SMA_LONG"])
 			}
@@ -1656,7 +1666,8 @@ func (t *Trader) processOriginalSignals() {
 				lastSignal = "SMA_LONG"
 			}
 			t.resetSignalStrength(&signalStrength)
-		} else if sig.Kind == "SMA_SHORT" && signalStrength["SMA_SHORT"] >= t.Config.SignalStrengthThreshold && t.CheckOrderbookStrength("SHORT") {
+		} else if sig.Kind == "SMA_SHORT" && signalStrength["SMA_SHORT"] >= t.Config.SignalStrengthThreshold &&
+			t.checkHigherTimeframeTrend("SHORT") && t.CheckOrderbookStrength("SHORT") {
 			if t.Config.Debug {
 				t.Logger.Debug("Confirmed SHORT signal: %d indicators", signalStrength["SMA_SHORT"])
 			}
@@ -1934,6 +1945,142 @@ func (t *Trader) OnClosedCandle(closePrice float64) {
 	if len(t.State.RecentVolumes) > volumeMaxLen {
 		t.State.RecentVolumes = t.State.RecentVolumes[len(t.State.RecentVolumes)-volumeMaxLen:]
 	}
+
+	// Aggregate data for higher timeframe if multi-timeframe filter is enabled
+	if t.Config.UseMultiTimeframeFilter {
+		t.aggregateHigherTimeframeData(closePrice)
+	}
+
+	// Maintain higher timeframe data with appropriate length
+	if t.Config.UseMultiTimeframeFilter {
+		maxHTFLength := 500  // Keep 500 higher timeframe candles
+		if len(t.State.HigherTimeframeCloses) > maxHTFLength {
+			t.State.HigherTimeframeCloses = t.State.HigherTimeframeCloses[len(t.State.HigherTimeframeCloses)-maxHTFLength:]
+			t.State.HigherTimeframeHighs = t.State.HigherTimeframeHighs[len(t.State.HigherTimeframeHighs)-maxHTFLength:]
+			t.State.HigherTimeframeLows = t.State.HigherTimeframeLows[len(t.State.HigherTimeframeLows)-maxHTFLength:]
+		}
+	}
+}
+
+// aggregateHigherTimeframeData aggregates 1-minute data into higher timeframe candles
+func (t *Trader) aggregateHigherTimeframeData(currentPrice float64) {
+	// Get the current time to determine if we need to create a new higher timeframe candle
+	now := time.Now()
+
+	// Check if we need to start a new timeframe period
+	if t.State.LastHTFUpdateTime.IsZero() {
+		// First update - initialize the higher timeframe candle
+		t.State.HigherTimeframeCloses = append(t.State.HigherTimeframeCloses, currentPrice)
+		t.State.HigherTimeframeHighs = append(t.State.HigherTimeframeHighs, currentPrice)
+		t.State.HigherTimeframeLows = append(t.State.HigherTimeframeLows, currentPrice)
+		t.State.LastHTFUpdateTime = now
+	} else {
+		// Calculate time difference to determine if we need a new candle
+		timeDiff := now.Sub(t.State.LastHTFUpdateTime)
+		timeDiffMinutes := int(timeDiff.Minutes())
+
+		// If enough time has passed to start a new higher timeframe candle
+		if timeDiffMinutes >= t.Config.HigherTimeframeInterval {
+			// Create a new higher timeframe candle
+			t.State.HigherTimeframeCloses = append(t.State.HigherTimeframeCloses, currentPrice)
+			t.State.HigherTimeframeHighs = append(t.State.HigherTimeframeHighs, currentPrice)
+			t.State.HigherTimeframeLows = append(t.State.HigherTimeframeLows, currentPrice)
+			t.State.LastHTFUpdateTime = now
+		} else {
+			// Update the current higher timeframe candle
+			lastIdx := len(t.State.HigherTimeframeCloses) - 1
+			if lastIdx >= 0 {
+				// Update high and low if necessary
+				if currentPrice > t.State.HigherTimeframeHighs[lastIdx] {
+					t.State.HigherTimeframeHighs[lastIdx] = currentPrice
+				}
+				if currentPrice < t.State.HigherTimeframeLows[lastIdx] {
+					t.State.HigherTimeframeLows[lastIdx] = currentPrice
+				}
+				// The close is always the most recent price
+				t.State.HigherTimeframeCloses[lastIdx] = currentPrice
+			}
+		}
+	}
+
+	// Update the higher timeframe trend based on the latest data
+	t.updateHigherTimeframeTrend()
+}
+
+// updateHigherTimeframeTrend determines the trend on the higher timeframe
+func (t *Trader) updateHigherTimeframeTrend() {
+	if len(t.State.HigherTimeframeCloses) < 2 {
+		return
+	}
+
+	// Calculate the trend based on comparison to moving average
+	maPeriod := int(t.Config.HigherTimeframeTrendThreshold)
+	if maPeriod <= 0 {
+		maPeriod = 20 // Default to 20 if threshold is not set properly
+	}
+
+	// Only calculate if we have enough data
+	if len(t.State.HigherTimeframeCloses) < maPeriod {
+		// If not enough data for MA, use shorter period or simple comparison
+		latestClose := t.State.HigherTimeframeCloses[len(t.State.HigherTimeframeCloses)-1]
+		previousClose := t.State.HigherTimeframeCloses[len(t.State.HigherTimeframeCloses)-2]
+
+		if latestClose > previousClose {
+			t.State.HigherTimeframeTrend = "up"
+		} else if latestClose < previousClose {
+			t.State.HigherTimeframeTrend = "down"
+		} else {
+			t.State.HigherTimeframeTrend = "neutral"
+		}
+		return
+	}
+
+	// Calculate moving average
+	htfCloses := t.State.HigherTimeframeCloses
+	if len(htfCloses) > maPeriod {
+		htfCloses = htfCloses[len(htfCloses)-maPeriod:]
+	}
+
+	ma := indicators.SMA(htfCloses)
+	latestClose := t.State.HigherTimeframeCloses[len(t.State.HigherTimeframeCloses)-1]
+
+	// Add hysteresis to prevent frequent trend changes
+	hysteresis := 0.001 // 0.1% hysteresis
+
+	if latestClose > ma*(1+hysteresis) {
+		t.State.HigherTimeframeTrend = "up"
+	} else if latestClose < ma*(1-hysteresis) {
+		t.State.HigherTimeframeTrend = "down"
+	}
+	// If the price is within the hysteresis band, keep the previous trend
+}
+
+// checkHigherTimeframeTrend checks if the signal aligns with the higher timeframe trend
+func (t *Trader) checkHigherTimeframeTrend(signalDirection string) bool {
+	if !t.Config.UseMultiTimeframeFilter {
+		return true // If disabled, allow all signals
+	}
+
+	// If we don't have enough data yet, allow the signal
+	if t.State.HigherTimeframeTrend == "" {
+		return true
+	}
+
+	// Only allow signals in the direction of the higher timeframe trend
+	if signalDirection == "LONG" && t.State.HigherTimeframeTrend == "up" {
+		return true
+	} else if signalDirection == "SHORT" && t.State.HigherTimeframeTrend == "down" {
+		return true
+	}
+
+	// For neutral trend, we can allow both directions or implement a different strategy
+	// Currently allowing all signals if the trend is neutral
+	if t.State.HigherTimeframeTrend == "neutral" {
+		return true
+	}
+
+	// If signal is against the higher timeframe trend, reject it
+	return false
 }
 
 // LogSignalStats logs signal statistics

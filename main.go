@@ -417,6 +417,11 @@ func main() {
 		LastExitPrice: 0.0,
 		LastExitTime: time.Time{}, // Zero time value
 		LastExitSide: "",
+		HigherTimeframeCloses: make([]float64, 0),
+		HigherTimeframeHighs:  make([]float64, 0),
+		HigherTimeframeLows:   make([]float64, 0),
+		HigherTimeframeTrend:  "",
+		LastHTFUpdateTime:     time.Time{}, // Zero time value
 		MarketRegime: "range", // default
 	}
 

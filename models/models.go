@@ -142,6 +142,13 @@ type State struct {
 	LastExitTime       time.Time // Time at which the last position was closed
 	LastExitSide       string    // Side of the last closed position ("LONG" or "SHORT")
 
+	// Multi-timeframe analysis
+	HigherTimeframeCloses []float64 // Closes for higher timeframe (e.g., 5-min candles aggregated from 1-min)
+	HigherTimeframeHighs  []float64 // Highs for higher timeframe
+	HigherTimeframeLows   []float64 // Lows for higher timeframe
+	HigherTimeframeTrend  string    // Trend direction on higher timeframe ("up", "down", "neutral")
+	LastHTFUpdateTime     time.Time // Time of last higher timeframe candle update
+
 	// Channels
 	TPChan      chan TPJob
 	SigChan     chan Signal
