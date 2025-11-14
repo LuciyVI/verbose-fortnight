@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"strings"
 	"time"
 
 	"verbose-fortnight/api"
@@ -545,10 +546,12 @@ func (t *Trader) openPosition(newSide string, price float64) {
 	t.State.LastExitSide = ""
 }
 
-// calculateTPSLWithRatio calculates TP/SL with a 2:1 ratio based on 15-minute price projection or ATR
-// If UseDynamicRiskManagement is enabled, uses ATR-based levels; otherwise uses percentage-based
+// calculateTPSLWithRatio calculates TP/SL with configured ratios based on ATR or price projection
+// If UseAdaptiveTargets is enabled, uses ATR-based levels; otherwise follows existing strategies
 func (t *Trader) calculateTPSLWithRatio(entryPrice float64, positionSide string) (takeProfit float64, stopLoss float64) {
-	if t.Config.UseDynamicRiskManagement {
+	if t.Config.UseAdaptiveTargets {
+		return t.calculateATRBasedTPSL(entryPrice, positionSide)
+	} else if t.Config.UseDynamicRiskManagement {
 		return t.calculateDynamicTPSL(entryPrice, positionSide)
 	} else {
 		// Fallback to original calculation
@@ -631,6 +634,61 @@ func (t *Trader) calculateDynamicTPSL(entryPrice float64, positionSide string) (
 	}
 
 	t.Logger.Debug("Dynamic ATR-based TP/SL calculation - Entry: %.2f, TP: %.2f, SL: %.2f, ATR: %.4f, TP Dist: %.4f, SL Dist: %.4f, Ratio: %.2f:1",
+		entryPrice, takeProfit, stopLoss, atr, tpDistanceActual, slDistanceActual, ratio)
+
+	return takeProfit, stopLoss
+}
+
+// calculateATRBasedTPSL calculates TP/SL based on ATR values
+func (t *Trader) calculateATRBasedTPSL(entryPrice float64, positionSide string) (takeProfit float64, stopLoss float64) {
+	// Calculate ATR value
+	if len(t.State.Closes) < t.Config.ATRPeriod {
+		t.Logger.Warning("Not enough data for ATR calculation, using fallback")
+		// Fallback to original method if not enough data for ATR
+		return t.calculateFixedTPSL(entryPrice, positionSide)
+	}
+
+	atr := indicators.CalculateATR(t.State.Highs, t.State.Lows, t.State.Closes, t.Config.ATRPeriod)
+	t.Logger.Debug("Calculated ATR(%d): %.4f for adaptive TP/SL calculation", t.Config.ATRPeriod, atr)
+
+	// Calculate TP and SL based on ATR multipliers
+	tpDistance := atr * t.Config.ATRMultipleTP
+	slDistance := atr * t.Config.ATRMultipleSL
+
+	// Apply minimum distance checks if configured
+	if t.Config.MinTPDistancePercent > 0 {
+		minTPDistance := entryPrice * t.Config.MinTPDistancePercent
+		if tpDistance < minTPDistance {
+			tpDistance = minTPDistance
+		}
+	}
+
+	if t.Config.MinSLDistancePercent > 0 {
+		minSLDistance := entryPrice * t.Config.MinSLDistancePercent
+		if slDistance < minSLDistance {
+			slDistance = minSLDistance
+		}
+	}
+
+	// Set stop loss and take profit based on position side
+	if positionSide == "LONG" {
+		takeProfit = entryPrice + tpDistance
+		stopLoss = entryPrice - slDistance
+	} else {
+		takeProfit = entryPrice - tpDistance
+		stopLoss = entryPrice + slDistance
+	}
+
+	// Validate the ratio
+	tpDistanceActual := math.Abs(takeProfit - entryPrice)
+	slDistanceActual := math.Abs(entryPrice - stopLoss)
+
+	ratio := 0.0
+	if slDistanceActual > 0 {
+		ratio = tpDistanceActual / slDistanceActual
+	}
+
+	t.Logger.Debug("ATR-based adaptive TP/SL calculation - Entry: %.2f, TP: %.2f, SL: %.2f, ATR: %.4f, TP Dist: %.4f, SL Dist: %.4f, Ratio: %.2f:1",
 		entryPrice, takeProfit, stopLoss, atr, tpDistanceActual, slDistanceActual, ratio)
 
 	return takeProfit, stopLoss
@@ -1715,6 +1773,9 @@ func (t *Trader) SyncPositionRealTime() {
 	defer ticker.Stop()
 
 	for range ticker.C {
+		// Process trailing for remaining partial positions first
+		t.processTrailingForRemainingPositions()
+
 		// Current position
 		exists, side, qty, tp, sl := t.PositionManager.HasOpenPosition()
 		if !exists || tp == 0 {
@@ -1758,16 +1819,35 @@ func (t *Trader) SyncPositionRealTime() {
 			}
 		}
 
-		// Calculate ATR for trailing stop if dynamic risk management is enabled
+		// Calculate ATR for trailing stop if risk management is enabled
 		currentATR := 0.0
-		if t.Config.UseDynamicRiskManagement && len(t.State.Closes) >= t.Config.ATRPeriod {
+		if (t.Config.UseDynamicRiskManagement || t.Config.UseAdaptiveTargets) && len(t.State.Closes) >= t.Config.ATRPeriod {
 			currentATR = indicators.CalculateATR(t.State.Highs, t.State.Lows, t.State.Closes, t.Config.ATRPeriod)
 		}
 
 		// Enhanced trailing stop logic
 		var newStopLoss float64
-		if t.Config.UseDynamicRiskManagement && currentATR > 0 {
+		if t.Config.UseAdaptiveTargets && currentATR > 0 {
 			// Use ATR-based trailing stop
+			atrDistance := currentATR * t.Config.TrailingATRMultiplier
+
+			if side == "LONG" {
+				// For LONG positions, trailing stop is below current price
+				newStopLoss = price - atrDistance
+				// Ensure the trailing stop doesn't go below the original stop loss
+				if newStopLoss < sl {
+					newStopLoss = sl
+				}
+			} else if side == "SHORT" {
+				// For SHORT positions, trailing stop is above current price
+				newStopLoss = price + atrDistance
+				// Ensure the trailing stop doesn't go above the original stop loss
+				if newStopLoss > sl {
+					newStopLoss = sl
+				}
+			}
+		} else if t.Config.UseDynamicRiskManagement && currentATR > 0 {
+			// Use ATR-based trailing stop from old system
 			atrDistance := currentATR * t.Config.TrailingStopATRMultiplier
 
 			if side == "LONG" {
@@ -1838,6 +1918,100 @@ func (t *Trader) SyncPositionRealTime() {
 	}
 }
 
+// processTrailingForRemainingPositions handles trailing for positions remaining after partial profit-taking
+func (t *Trader) processTrailingForRemainingPositions() {
+	// Loop through all active trailing positions
+	for key, isActive := range t.State.ActiveTrailingPositions {
+		if !isActive {
+			continue
+		}
+
+		var currentPrice float64
+		var positionType string // Extract position type from key
+
+		// This is a simplified extraction - in practice, you might want to store more structured data
+		if strings.Contains(key, "_LONG_") {
+			positionType = "LONG"
+			currentPrice = t.PositionManager.GetLastBidPrice()
+		} else if strings.Contains(key, "_SHORT_") {
+			positionType = "SHORT"
+			currentPrice = t.PositionManager.GetLastAskPrice()
+		} else {
+			// If we can't determine position type from the key, skip
+			continue
+		}
+
+		if currentPrice <= 0 {
+			continue
+		}
+
+		// Get current trailing level
+		currentLevel, ok := t.State.TrailingStopLevels[key]
+		if !ok {
+			continue
+		}
+
+		var newTrailingLevel float64
+		trailTriggered := false
+
+		// Calculate new trailing level based on ATR if using adaptive targets
+		if t.Config.UseAdaptiveTargets {
+			// Calculate ATR value
+			atr := indicators.CalculateATR(t.State.Highs, t.State.Lows, t.State.Closes, t.Config.ATRPeriod)
+			trailingDistance := atr * t.Config.TrailingATRMultiplier
+
+			if positionType == "LONG" {
+				// For LONG position, trail stop below current price
+				newTrailingLevel = currentPrice - trailingDistance
+				// Only move up if it's beneficial (higher than current trailing level)
+				if newTrailingLevel > currentLevel {
+					trailTriggered = true
+				} else {
+					continue // Don't move trailing stop lower
+				}
+			} else if positionType == "SHORT" {
+				// For SHORT position, trail stop above current price
+				newTrailingLevel = currentPrice + trailingDistance
+				// Only move down if it's beneficial (lower than current trailing level)
+				if newTrailingLevel < currentLevel {
+					trailTriggered = true
+				} else {
+					continue // Don't move trailing stop higher
+				}
+			}
+		} else {
+			// Use fixed percentage-based trailing
+			trailingDistance := currentPrice * 0.005 // Default 0.5%
+
+			if positionType == "LONG" {
+				newTrailingLevel = currentPrice - trailingDistance
+				if newTrailingLevel > currentLevel {
+					trailTriggered = true
+				} else {
+					continue // Don't move trailing stop lower
+				}
+			} else if positionType == "SHORT" {
+				newTrailingLevel = currentPrice + trailingDistance
+				if newTrailingLevel < currentLevel {
+					trailTriggered = true
+				} else {
+					continue // Don't move trailing stop higher
+				}
+			}
+		}
+
+		if trailTriggered {
+			// Update the trailing stop level in state
+			t.State.TrailingStopLevels[key] = newTrailingLevel
+			t.Logger.Info("Trailing stop updated for remaining position [%s]: new level %.2f", key, newTrailingLevel)
+
+			// Here you would place an actual stop order on the exchange if needed
+			// (this depends on what the UpdatePositionTPSL function does)
+			// For now, we just update our record of the trailing level
+		}
+	}
+}
+
 // takePartialProfit handles partial profit taking by reducing position size
 func (t *Trader) takePartialProfit(positionSide string, totalQty float64, currentPrice float64) {
 	if !t.Config.UsePartialProfitTaking {
@@ -1892,10 +2066,52 @@ func (t *Trader) takePartialProfit(positionSide string, totalQty float64, curren
 	t.Logger.Info("Partial profit taken: %.4f units at %.2f, estimated profit: %.2f",
 		partialQty, realExitPrice, partialProfit)
 
-	// If remaining quantity is small, consider closing the entire position
-	if remainingQty < t.State.Instr.MinQty {
-		t.Logger.Info("Remaining position (%.4f) is below minimum quantity, considering full closure", remainingQty)
+	// If remaining quantity is substantial and partial trailing is enabled, set up trailing for the remaining position
+	if remainingQty > 0 && remainingQty >= t.State.Instr.MinQty && t.Config.EnablePartialTrailing {
+		t.Logger.Info("Remaining position of %.4f units, setting up trailing for remainder", remainingQty)
+
+		t.setupTrailingForRemainingPosition(positionSide, remainingQty, currentPrice)
+	} else {
+		t.Logger.Info("Remaining position (%.4f) is too small or trailing disabled, not setting up trailing", remainingQty)
 	}
+
+	// Reset partial TP tracking for the new setup
+	t.State.PartialTPTriggered = false
+	t.State.PartialTPPrice = 0.0
+}
+
+// setupTrailingForRemainingPosition sets up trailing stops for the remaining portion of a position
+func (t *Trader) setupTrailingForRemainingPosition(positionSide string, remainingQty float64, currentPrice float64) {
+	if !t.Config.EnablePartialTrailing {
+		return
+	}
+
+	// Calculate trailing levels based on ATR if adaptive targets are enabled
+	var trailingDistance float64
+	if t.Config.UseAdaptiveTargets {
+		// Calculate ATR value
+		atr := indicators.CalculateATR(t.State.Highs, t.State.Lows, t.State.Closes, t.Config.ATRPeriod)
+		// Use configured ATR multiplier for trailing
+		trailingDistance = atr * t.Config.TrailingATRMultiplier
+	} else {
+		// Use a percentage-based distance if not using adaptive targets
+		trailingDistance = currentPrice * 0.005 // Default 0.5% trailing distance
+	}
+
+	var initialTrailingLevel float64
+	if positionSide == "LONG" {
+		initialTrailingLevel = currentPrice - trailingDistance
+	} else {
+		initialTrailingLevel = currentPrice + trailingDistance
+	}
+
+	// Create a unique key for this trailing position
+	positionKey := fmt.Sprintf("%s_%.4f_%d", positionSide, remainingQty, time.Now().Unix())
+	t.State.ActiveTrailingPositions[positionKey] = true
+	t.State.TrailingStopLevels[positionKey] = initialTrailingLevel
+
+	t.Logger.Info("Set up trailing stop for remaining position: %.4f units, initial trailing level: %.2f",
+		remainingQty, initialTrailingLevel)
 }
 
 // OnClosedCandle processes a closed candle

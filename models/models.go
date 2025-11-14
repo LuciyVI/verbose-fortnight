@@ -155,6 +155,12 @@ type State struct {
 	PreviousMACDValues     []float64  // Previous MACD values for divergence detection
 	PreviousMACDSignalValues []float64  // Previous MACD signal values for divergence detection
 
+	// Partial profit and trailing tracking
+	ActiveTrailingPositions map[string]bool  // Track which positions are in trailing mode
+	PartialProfitTriggers   map[string]bool  // Track if partial profit has been triggered
+	TrailingStopLevels      map[string]float64 // Current trailing stop levels for positions
+	TrailingTakeProfitLevels map[string]float64 // Current trailing TP levels for positions
+
 	// Channels
 	TPChan      chan TPJob
 	SigChan     chan Signal

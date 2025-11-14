@@ -426,6 +426,10 @@ func main() {
 		PreviousRSIValues:     make([]float64, 0),
 		PreviousMACDValues:    make([]float64, 0),
 		PreviousMACDSignalValues: make([]float64, 0),
+		ActiveTrailingPositions: make(map[string]bool),
+		PartialProfitTriggers:   make(map[string]bool),
+		TrailingStopLevels:      make(map[string]float64),
+		TrailingTakeProfitLevels: make(map[string]float64),
 		MarketRegime: "range", // default
 	}
 
