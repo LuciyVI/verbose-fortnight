@@ -1193,7 +1193,7 @@ func (t *Trader) SyncPositionRealTime() {
 			continue
 		}
 
-		// Progress toward TP
+		// Calculate progress toward TP
 		var dist, prog float64
 		if side == "LONG" {
 			dist = tp - entry
@@ -1202,30 +1202,50 @@ func (t *Trader) SyncPositionRealTime() {
 			dist = entry - tp
 			prog = (entry - price) / dist
 		}
-		if prog <= 0 {
+
+		// Only proceed if we've moved at least to the threshold toward TP
+		if prog < t.Config.TrailThreshold || prog <= 0 {
 			continue
 		}
 
-		// Target SL: half of the way from entry to TP
-		targetSL := entry + prog*dist*0.5
-		needMove := false
-
-		if side == "LONG" && targetSL > sl {
-			needMove = true
-		} else if side == "SHORT" && targetSL < sl {
-			needMove = true
+		// Calculate dynamic trailing stop
+		// Move SL to a percentage of the way from entry to current price (at least 50% of the way to TP)
+		var targetSL float64
+		if side == "LONG" {
+			// For LONG: SL should be above entry, following price movement
+			// Move SL to halfway between entry and current price, but not above current price
+			midpoint := entry + (price - entry) * 0.5
+			// Ensure SL doesn't go beyond current price (with small buffer) and is above entry
+			targetSL = math.Max(midpoint, entry)
+			if targetSL >= price * 0.999 { // Small buffer to avoid being triggered immediately
+				targetSL = price * 0.999
+			}
+			// Only update if new SL is higher than current SL
+			if targetSL <= sl {
+				continue
+			}
+		} else {
+			// For SHORT: SL should be below entry, following price movement
+			// Move SL to halfway between entry and current price, but not below current price
+			midpoint := entry - (entry - price) * 0.5
+			// Ensure SL doesn't go beyond current price (with small buffer) and is below entry
+			targetSL = math.Min(midpoint, entry)
+			if targetSL <= price * 1.001 { // Small buffer to avoid being triggered immediately
+				targetSL = price * 1.001
+			}
+			// Only update if new SL is lower than current SL (better for short positions)
+			if targetSL >= sl {
+				continue
+			}
 		}
-		if !needMove {
-			continue
-		}
 
-		t.Logger.Info("Trailing stop: updating SL from %.2f to %.2f (%.0f%% way to TP)", sl, targetSL, prog*100)
-		
+		t.Logger.Info("Trailing stop: updating SL from %.2f to %.2f (current price: %.2f, progress to TP: %.0f%%)", sl, targetSL, price, prog*100)
+
 		// Update stop-loss
 		if err := t.PositionManager.UpdatePositionTPSL(t.Config.Symbol, tp, targetSL); err != nil {
 			t.Logger.Error("Trailing SL update error: %v", err)
 		} else {
-			t.Logger.Info("SL → %.2f (%.0f%% way to TP)", targetSL, prog*100)
+			t.Logger.Info("SL → %.2f (progress to TP: %.0f%%)", targetSL, prog*100)
 		}
 	}
 }

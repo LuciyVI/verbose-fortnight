@@ -27,6 +27,7 @@ type Config struct {
 	SmaLen           int
 	SlPerc           float64
 	TrailPerc        float64
+	TrailThreshold   float64  // Threshold at which to start trailing (e.g., 0.5 for 50%)
 	Debug            bool
 	DynamicTP        bool
 	// ATR-based parameters for dynamic TP/SL
@@ -79,6 +80,7 @@ func LoadConfig() *Config {
 		SmaLen:           20,
 		SlPerc:           0.004,  // Reduced to 0.4% to create 2:1 R/R ratio with TP of 0.8%
 		TrailPerc:        0.005,  // Keep trailing stop at 0.5% but adjust how it's applied
+		TrailThreshold:   0.5,    // Start trailing at 50% of the way to TP
 		Debug:            false,
 		DynamicTP:        false,
 		// ATR-based parameters for dynamic TP/SL
