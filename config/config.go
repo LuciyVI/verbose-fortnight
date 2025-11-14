@@ -56,6 +56,14 @@ type Config struct {
 	BaseOrderbookThreshold     float64 // Base threshold when volatility is at normal levels
 	HighVolatilityThreshold    float64 // Threshold when volatility is high
 	LowVolatilityThreshold     float64 // Threshold when volatility is low
+	// Dynamic risk management configuration
+	UseDynamicRiskManagement   bool    // Enable dynamic risk management based on ATR
+	ATRMultiplierSL            float64 // ATR multiplier for stop loss (e.g., 1.5 times ATR)
+	ATRMultiplierTP            float64 // ATR multiplier for take profit (e.g., 3 times ATR for 2:1 ratio)
+	ATRPeriod                  int     // ATR period for calculation (default 14)
+	PartialProfitPercentage    float64 // Percentage of position to close when TP hit (e.g., 0.5 = 50%)
+	TrailingStopATRMultiplier  float64 // ATR multiplier for trailing stop (e.g., 1.0 times ATR)
+	UsePartialProfitTaking     bool    // Enable partial profit taking before trailing the rest
 	// Logging configuration
 	LogFile       string
 	LogMaxSize    int // megabytes
@@ -119,6 +127,14 @@ func LoadConfig() *Config {
 		BaseOrderbookThreshold:     1.3,   // Base threshold when volatility is at normal levels
 		HighVolatilityThreshold:    1.5,   // Higher threshold when volatility is high
 		LowVolatilityThreshold:     1.1,   // Lower threshold when volatility is low
+		// Dynamic risk management defaults
+		UseDynamicRiskManagement:   true,  // Enable by default
+		ATRMultiplierSL:            1.5,   // Stop loss at 1.5x ATR
+		ATRMultiplierTP:            3.0,   // Take profit at 3x ATR (2:1 ratio with SL)
+		ATRPeriod:                  14,    // Use 14-period ATR
+		PartialProfitPercentage:    0.5,   // Close 50% when TP hit
+		TrailingStopATRMultiplier:  1.0,   // Trailing stop at 1x ATR
+		UsePartialProfitTaking:     true,  // Enable partial profit taking by default
 		// Logging defaults
 		LogFile:       getEnv("LOG_FILE", "trading_bot.log"),
 		LogMaxSize:    10, // 10 MB
