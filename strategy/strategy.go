@@ -398,7 +398,30 @@ func (t *Trader) openPosition(newSide string, price float64) {
 			if side == "SHORT" {
 				reduceSide = "Buy"
 			}
-			if err := t.OrderManager.PlaceOrderMarket(reduceSide, qty, true); err != nil {
+			// Get current price to determine limit order placement
+			currentPrice := price
+			if side == "LONG" {
+				// For closing LONG, we sell, so place order at or below current price
+				currentPrice = t.PositionManager.GetLastBidPrice()
+				if currentPrice <= 0 {
+					currentPrice = price
+				}
+				// Place slightly below current bid to ensure execution
+				currentPrice = currentPrice * 0.9995
+			} else if side == "SHORT" {
+				// For closing SHORT, we buy, so place order at or above current price
+				currentPrice = t.PositionManager.GetLastAskPrice()
+				if currentPrice <= 0 {
+					currentPrice = price
+				}
+				// Place slightly above current ask to ensure execution
+				currentPrice = currentPrice * 1.0005
+			}
+
+			// Format price according to tick size
+			currentPrice = t.OrderManager.FormatPrice(currentPrice)
+
+			if err := t.OrderManager.PlaceOrderLimit(reduceSide, qty, currentPrice, true); err != nil {
 				t.Logger.Error("Error closing position %s: %v", side, err)
 				return
 			}
@@ -447,17 +470,29 @@ func (t *Trader) openPosition(newSide string, price float64) {
 		return
 	}
 
-	// Place market order
+	// Place limit order at the current price
 	orderSide := "Buy"
+	orderPrice := price // Use the price that triggered the signal
 	if t.PositionManager.NormalizeSide(newSide) == "SHORT" {
 		orderSide = "Sell"
+		// For SHORT position, we want to sell at the current price or better (higher)
+		// Adjust slightly to ensure order gets filled
+		orderPrice = price * 1.001 // Place order slightly above current price for better execution
+	} else {
+		// For LONG position, we want to buy at the current price or better (lower)
+		// Adjust slightly to ensure order gets filled
+		orderPrice = price * 0.999 // Place order slightly below current price for better execution
 	}
-	t.Logger.Info("Placing market order: %s %.4f", orderSide, qty)
-	if err := t.OrderManager.PlaceOrderMarket(orderSide, qty, false); err != nil {
+
+	// Format price according to tick size
+	orderPrice = t.OrderManager.FormatPrice(orderPrice)
+
+	t.Logger.Info("Placing limit order: %s %.4f @ %.2f", orderSide, qty, orderPrice)
+	if err := t.OrderManager.PlaceOrderLimit(orderSide, qty, orderPrice, false); err != nil {
 		t.Logger.Error("Error opening position %s: %v", newSide, err)
 		return
 	}
-	t.Logger.Info("Successfully placed market order to open position %s", newSide)
+	t.Logger.Info("Successfully placed limit order to open position %s", newSide)
 
 	// Set TP/SL with 2:1 ratio based on 15-minute projection or dynamic volatility-based calculation
 	entry := t.PositionManager.GetLastEntryPrice()
@@ -1031,7 +1066,40 @@ func (t *Trader) closeOppositePosition(newSide string) {
 			reduceSide = "Buy"
 		}
 		
-		if err := t.OrderManager.PlaceOrderMarket(reduceSide, qty, true); err != nil {
+		// Get current price to determine limit order placement
+		var currentPrice float64
+		if side == "LONG" {
+			// For closing LONG, we sell, so place order at or below current price
+			currentPrice = t.PositionManager.GetLastBidPrice()
+			if currentPrice <= 0 {
+				// Fallback: use the most recent close price if bid price unavailable
+				if len(t.State.Closes) > 0 {
+					currentPrice = t.State.Closes[len(t.State.Closes)-1]
+				} else {
+					currentPrice = t.PositionManager.GetLastEntryPrice()
+				}
+			}
+			// Place slightly below current bid to ensure execution
+			currentPrice = currentPrice * 0.9995
+		} else if side == "SHORT" {
+			// For closing SHORT, we buy, so place order at or above current price
+			currentPrice = t.PositionManager.GetLastAskPrice()
+			if currentPrice <= 0 {
+				// Fallback: use the most recent close price if ask price unavailable
+				if len(t.State.Closes) > 0 {
+					currentPrice = t.State.Closes[len(t.State.Closes)-1]
+				} else {
+					currentPrice = t.PositionManager.GetLastEntryPrice()
+				}
+			}
+			// Place slightly above current ask to ensure execution
+			currentPrice = currentPrice * 1.0005
+		}
+
+		// Format price according to tick size
+		currentPrice = t.OrderManager.FormatPrice(currentPrice)
+
+		if err := t.OrderManager.PlaceOrderLimit(reduceSide, qty, currentPrice, true); err != nil {
 			t.Logger.Error("Error closing position %s: %v", side, err)
 			return
 		}

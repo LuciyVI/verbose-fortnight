@@ -68,10 +68,10 @@ func (om *OrderManager) PlaceOrderMarket(side string, qty float64, reduceOnly bo
 
 	raw, _ := json.Marshal(body)
 	ts := fmt.Sprintf("%d", time.Now().UnixMilli())
-	
+
 	// Log outgoing request
 	om.Logger.Info("Sending POST request to exchange: %s, Body: %s", path, string(raw))
-	
+
 	req, _ := http.NewRequest("POST", om.Config.DemoRESTHost+path, bytes.NewReader(raw))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-BAPI-API-KEY", om.Config.APIKey)
@@ -79,16 +79,16 @@ func (om *OrderManager) PlaceOrderMarket(side string, qty float64, reduceOnly bo
 	req.Header.Set("X-BAPI-RECV-WINDOW", om.Config.RecvWindow)
 	req.Header.Set("X-BAPI-SIGN-TYPE", "2")
 	req.Header.Set("X-BAPI-SIGN", om.APIClient.SignREST(om.Config.APISecret, ts, om.Config.APIKey, om.Config.RecvWindow, string(raw)))
-	
+
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		om.Logger.Error("Failed to send POST request to exchange: %v", err)
 		return err
 	}
 	defer resp.Body.Close()
-	
+
 	reply, _ := io.ReadAll(resp.Body)
-	
+
 	// Log incoming response
 	om.Logger.Info("Received response from exchange for %s: Status %d, Body: %s", path, resp.StatusCode, string(reply))
 
@@ -101,6 +101,64 @@ func (om *OrderManager) PlaceOrderMarket(side string, qty float64, reduceOnly bo
 		return fmt.Errorf("error placing market order: %d: %s", r.RetCode, r.RetMsg)
 	}
 	om.Logger.Info("Market %s %.4f OK", side, qty)
+	return nil
+}
+
+// PlaceOrderLimit places a limit order
+func (om *OrderManager) PlaceOrderLimit(side string, qty, price float64, reduceOnly bool) error {
+	if side == "" {
+		return fmt.Errorf("invalid side: empty")
+	}
+	const path = "/v5/order/create"
+	body := map[string]interface{}{
+		"category":    "linear",
+		"symbol":      om.Config.Symbol,
+		"side":        side,
+		"orderType":   "Limit",
+		"qty":         om.FormatQty(qty, om.State.Instr.QtyStep),
+		"price":       om.FormatPriceToString(price),
+		"timeInForce": "GTC", // Good till cancelled
+		"positionIdx": 0,
+	}
+	if reduceOnly {
+		body["reduceOnly"] = true
+	}
+
+	raw, _ := json.Marshal(body)
+	ts := fmt.Sprintf("%d", time.Now().UnixMilli())
+
+	// Log outgoing request
+	om.Logger.Info("Sending POST request to exchange: %s, Body: %s", path, string(raw))
+
+	req, _ := http.NewRequest("POST", om.Config.DemoRESTHost+path, bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-BAPI-API-KEY", om.Config.APIKey)
+	req.Header.Set("X-BAPI-TIMESTAMP", ts)
+	req.Header.Set("X-BAPI-RECV-WINDOW", om.Config.RecvWindow)
+	req.Header.Set("X-BAPI-SIGN-TYPE", "2")
+	req.Header.Set("X-BAPI-SIGN", om.APIClient.SignREST(om.Config.APISecret, ts, om.Config.APIKey, om.Config.RecvWindow, string(raw)))
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		om.Logger.Error("Failed to send POST request to exchange: %v", err)
+		return err
+	}
+	defer resp.Body.Close()
+
+	reply, _ := io.ReadAll(resp.Body)
+
+	// Log incoming response
+	om.Logger.Info("Received response from exchange for %s: Status %d, Body: %s", path, resp.StatusCode, string(reply))
+
+	var r struct {
+		RetCode int    `json:"retCode"`
+		RetMsg  string `json:"retMsg"`
+	}
+	if json.Unmarshal(reply, &r) != nil || r.RetCode != 0 {
+		om.Logger.Error("Error in limit order response: %d: %s", r.RetCode, r.RetMsg)
+		return fmt.Errorf("error placing limit order: %d: %s", r.RetCode, r.RetMsg)
+	}
+	om.Logger.Info("Limit %s %.4f @ %.2f OK", side, qty, price)
 	return nil
 }
 
