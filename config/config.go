@@ -70,6 +70,10 @@ type Config struct {
 	// Smart re-entry configuration
 	UseSmartReentry            bool    // Enable smart re-entry after position closure
 	ReentryPriceThreshold      float64 // Minimum price movement from exit before re-entry (e.g., 0.005 = 0.5%)
+	// Multi-factor filtering configuration
+	UseMultiFactorFilter         bool    // Enable multi-factor filtering with simultaneous confirmations
+	RequiredPrimarySignals       int     // Number of primary signals required (e.g., 1 for SMA, 2 for SMA+BB)
+	RequiredSecondarySignals     int     // Number of secondary signals required (e.g., 1 for MACD, 2 for MACD+RSI)
 	// Logging configuration
 	LogFile       string
 	LogMaxSize    int // megabytes
@@ -147,6 +151,10 @@ func LoadConfig() *Config {
 		// Smart re-entry defaults
 		UseSmartReentry:            true,  // Enable by default
 		ReentryPriceThreshold:      0.005, // 0.5% price movement required for re-entry
+		// Multi-factor filtering defaults
+		UseMultiFactorFilter:         true,  // Enable by default
+		RequiredPrimarySignals:       1,     // Require at least 1 primary signal
+		RequiredSecondarySignals:     1,     // Require at least 1 secondary signal
 		// Logging defaults
 		LogFile:       getEnv("LOG_FILE", "trading_bot.log"),
 		LogMaxSize:    10, // 10 MB
