@@ -85,6 +85,13 @@ type Config struct {
 	SignalLowVolatilityHysteresis      float64 // Hysteresis value when volatility is low
 	SignalHighVolatilityHysteresis     float64 // Hysteresis value when volatility is high
 	SignalBaseVolatilityHysteresis     float64 // Base hysteresis value when volatility is at normal levels
+	// RSI-based filtering configuration
+	UseRSIFilter                    bool    // Enable RSI-based signal filtering
+	RSIOverboughtLevel              float64 // RSI level considered overbought (e.g., 70)
+	RSIOversoldLevel                float64 // RSI level considered oversold (e.g., 30)
+	UseRSIDivergenceFilter          bool    // Enable RSI divergence filtering
+	UseMACDDivergenceFilter         bool    // Enable MACD divergence filtering
+	DivergenceLookbackPeriod        int     // Lookback period for divergence detection (e.g., 10 periods)
 	// Logging configuration
 	LogFile       string
 	LogMaxSize    int // megabytes
@@ -177,6 +184,13 @@ func LoadConfig() *Config {
 		SignalLowVolatilityHysteresis:      0.003, // Tighter hysteresis for low volatility (0.3%)
 		SignalHighVolatilityHysteresis:     0.012, // Wider hysteresis for high volatility (1.2%)
 		SignalBaseVolatilityHysteresis:     0.007, // Base hysteresis for normal volatility (0.7%)
+		// RSI-based filtering defaults
+		UseRSIFilter:                       true,  // Enable by default
+		RSIOverboughtLevel:                 70.0,  // RSI level considered overbought
+		RSIOversoldLevel:                   30.0,  // RSI level considered oversold
+		UseRSIDivergenceFilter:             true,  // Enable by default
+		UseMACDDivergenceFilter:            true,  // Enable by default
+		DivergenceLookbackPeriod:           10,    // Lookback period for divergence detection
 		// Logging defaults
 		LogFile:       getEnv("LOG_FILE", "trading_bot.log"),
 		LogMaxSize:    10, // 10 MB

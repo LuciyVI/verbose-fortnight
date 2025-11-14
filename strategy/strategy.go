@@ -863,10 +863,10 @@ func (t *Trader) SMAMovingAverageWorker() {
 
 		// Generate consolidated signals with weights
 		if t.Config.UseSignalConsolidation {
-			t.generateConsolidatedSignals(sourceCloses, latestClose, smaVal, macdHist, macdLine, signalLine, bbUpper, bbLower, hysteresis)
+			t.generateConsolidatedSignals(sourceCloses, latestClose, smaVal, macdHist, macdLine, signalLine, bbUpper, bbLower, hysteresis, rsi)
 		} else {
 			// Original logic for backward compatibility
-			t.generateOriginalSignals(sourceCloses, latestClose, smaVal, macdHist, macdLine, signalLine, bbUpper, bbLower, hysteresis)
+			t.generateOriginalSignals(sourceCloses, latestClose, smaVal, macdHist, macdLine, signalLine, bbUpper, bbLower, hysteresis, rsi)
 		}
 	}
 }
@@ -950,7 +950,7 @@ func (t *Trader) getSmoothedLows(windowSeconds int) []float64 {
 }
 
 // generateConsolidatedSignals generates signals using weighted consolidation approach
-func (t *Trader) generateConsolidatedSignals(closesCopy []float64, cls, smaVal, macdHist, macdLine, signalLine, bbUpper, bbLower, hysteresis float64) {
+func (t *Trader) generateConsolidatedSignals(closesCopy []float64, cls, smaVal, macdHist, macdLine, signalLine, bbUpper, bbLower, hysteresis, rsi float64) {
 	// Identify all possible signals with their weights
 	signalDetails := []models.SignalDetails{}
 	var totalWeight int
@@ -1071,8 +1071,24 @@ func (t *Trader) generateConsolidatedSignals(closesCopy []float64, cls, smaVal, 
 			return
 		}
 
-		t.Logger.Info("Consolidated %s signal generated - Total Weight: %d, Long Weight: %d, Short Weight: %d, Close: %.2f",
-			overallSignal, totalWeight, longWeight, shortWeight, cls)
+		// Apply RSI-based filtering
+		if !t.checkRSIConditions(rsi, overallSignal) {
+			if t.Config.Debug {
+				t.Logger.Debug("RSI filter rejected %s signal, RSI value: %.2f", overallSignal, rsi)
+			}
+			return
+		}
+
+		// Apply divergence filtering
+		if !t.checkDivergences(cls, rsi, macdHist, signalLine, overallSignal) {
+			if t.Config.Debug {
+				t.Logger.Debug("Divergence filter rejected %s signal", overallSignal)
+			}
+			return
+		}
+
+		t.Logger.Info("Consolidated %s signal generated - Total Weight: %d, Long Weight: %d, Short Weight: %d, Close: %.2f, RSI: %.2f",
+			overallSignal, totalWeight, longWeight, shortWeight, cls, rsi)
 
 		consolidatedSignal := models.ConsolidatedSignal{
 			Kind:           overallSignal,
@@ -1370,7 +1386,7 @@ func (t *Trader) detectVolumeSpike(currentVolume float64) bool {
 }
 
 // generateOriginalSignals maintains the original logic for backward compatibility
-func (t *Trader) generateOriginalSignals(closesCopy []float64, cls, smaVal, macdHist, macdLine, signalLine, bbUpper, bbLower, hysteresis float64) {
+func (t *Trader) generateOriginalSignals(closesCopy []float64, cls, smaVal, macdHist, macdLine, signalLine, bbUpper, bbLower, hysteresis, rsi float64) {
 	// Generate signals based on multiple indicators with priority (RSI temporarily disabled)
 	// Primary: SMA, Secondary: MACD, Tertiary: Golden Cross, Quaternary: Bollinger Bands
 	longSignal := false
@@ -2092,11 +2108,6 @@ func (t *Trader) calculateDynamicHysteresis(currentATR, currentPrice float64) fl
 		return hysteresis
 	}
 
-	// If ATR is 0 or invalid, use base hysteresis
-	if currentATR <= 0 {
-		return t.Config.SignalBaseVolatilityHysteresis
-	}
-
 	// Calculate ATR as percentage of current price
 	atrPercentage := currentATR / currentPrice
 
@@ -2112,6 +2123,199 @@ func (t *Trader) calculateDynamicHysteresis(currentATR, currentPrice float64) fl
 		         (t.Config.SignalHighATRThreshold - t.Config.SignalLowATRThreshold)
 		return t.Config.SignalLowVolatilityHysteresis + ratio*(t.Config.SignalHighVolatilityHysteresis - t.Config.SignalLowVolatilityHysteresis)
 	}
+}
+
+// checkRSIConditions checks if RSI conditions allow the signal
+func (t *Trader) checkRSIConditions(rsiValue float64, signalDirection string) bool {
+	if !t.Config.UseRSIFilter || math.IsNaN(rsiValue) {
+		return true // If RSI filter is disabled or RSI is invalid, allow the signal
+	}
+
+	// When RSI is overbought (>70), don't allow LONG signals as price might reverse
+	if signalDirection == "LONG" && rsiValue > t.Config.RSIOverboughtLevel {
+		t.Logger.Debug("RSI overbought filter: LONG signal rejected, RSI %.2f > %.2f", rsiValue, t.Config.RSIOverboughtLevel)
+		return false
+	}
+
+	// When RSI is oversold (<30), don't allow SHORT signals as price might reverse
+	if signalDirection == "SHORT" && rsiValue < t.Config.RSIOversoldLevel {
+		t.Logger.Debug("RSI oversold filter: SHORT signal rejected, RSI %.2f < %.2f", rsiValue, t.Config.RSIOversoldLevel)
+		return false
+	}
+
+	return true
+}
+
+// checkDivergences checks for potential divergences between price and indicators
+func (t *Trader) checkDivergences(closePrice, rsiValue, macdValue, macdSignalValue float64, signalDirection string) bool {
+	if !t.Config.UseRSIDivergenceFilter && !t.Config.UseMACDDivergenceFilter {
+		return true // If divergence filters are disabled, allow the signal
+	}
+
+	// Add current values to the tracking arrays
+	t.State.PreviousPrices = append(t.State.PreviousPrices, closePrice)
+	t.State.PreviousRSIValues = append(t.State.PreviousRSIValues, rsiValue)
+	t.State.PreviousMACDValues = append(t.State.PreviousMACDValues, macdValue)
+	t.State.PreviousMACDSignalValues = append(t.State.PreviousMACDSignalValues, macdSignalValue)
+
+	// Maintain only the required lookback period
+	maxLength := t.Config.DivergenceLookbackPeriod + 1 // +1 for current value
+	if len(t.State.PreviousPrices) > maxLength {
+		t.State.PreviousPrices = t.State.PreviousPrices[len(t.State.PreviousPrices)-maxLength:]
+		t.State.PreviousRSIValues = t.State.PreviousRSIValues[len(t.State.PreviousRSIValues)-maxLength:]
+		t.State.PreviousMACDValues = t.State.PreviousMACDValues[len(t.State.PreviousMACDValues)-maxLength:]
+		t.State.PreviousMACDSignalValues = t.State.PreviousMACDSignalValues[len(t.State.PreviousMACDSignalValues)-maxLength:]
+	}
+
+	// Only check for divergences if we have enough data
+	if len(t.State.PreviousPrices) < t.Config.DivergenceLookbackPeriod+1 {
+		return true
+	}
+
+	// Check for RSI divergences if enabled
+	if t.Config.UseRSIDivergenceFilter {
+		if t.hasRSIDivergence(signalDirection) {
+			t.Logger.Debug("RSI divergence detected, rejecting %s signal", signalDirection)
+			return false
+		}
+	}
+
+	// Check for MACD divergences if enabled
+	if t.Config.UseMACDDivergenceFilter {
+		if t.hasMACDDivergence(signalDirection) {
+			t.Logger.Debug("MACD divergence detected, rejecting %s signal", signalDirection)
+			return false
+		}
+	}
+
+	return true
+}
+
+// hasRSIDivergence checks for divergences between price and RSI
+func (t *Trader) hasRSIDivergence(signalDirection string) bool {
+	if len(t.State.PreviousPrices) < 3 || len(t.State.PreviousRSIValues) < 3 {
+		return false
+	}
+
+	lookback := t.Config.DivergenceLookbackPeriod
+	if len(t.State.PreviousPrices) < lookback {
+		lookback = len(t.State.PreviousPrices) - 1
+	}
+
+	if signalDirection == "LONG" {
+		// For long signals, check for bullish divergence (higher low in price but lower low in RSI)
+		for i := len(t.State.PreviousPrices) - lookback; i < len(t.State.PreviousPrices)-1; i++ {
+			if i > 0 {
+				// Check if price made a higher low but RSI made a lower low
+				if t.State.PreviousPrices[i] < t.State.PreviousPrices[i-1] && // Price made lower low
+				   t.State.PreviousRSIValues[i] > t.State.PreviousRSIValues[i-1] { // RSI made higher low (divergence)
+					// This is bearish divergence, not bullish, so we don't care for long signals
+				} else if t.State.PreviousPrices[i] > t.State.PreviousPrices[i-1] && // Price made higher low
+				        t.State.PreviousRSIValues[i] < t.State.PreviousRSIValues[i-1] { // RSI made lower low (divergence)
+					// Bullish divergence: price makes higher low but RSI makes lower low - this contradicts
+					// Actually we want: price makes higher low and RSI makes lower low -> bearish div
+					// Or: price makes lower low and RSI makes higher low -> bullish div
+
+					// For LONG signal, we look for bullish divergence: price makes lower low but RSI makes higher low
+					if t.State.PreviousPrices[i] > t.State.PreviousPrices[i-1] && // Price made higher low (recent is higher than earlier)
+					   t.State.PreviousRSIValues[i] < t.State.PreviousRSIValues[i-1] { // RSI made lower low (recent is lower than earlier)
+						// This is not bullish divergence, this is bearish
+					}
+				}
+			}
+		}
+
+		// Simpler approach: check if price made new high but RSI didn't
+		recentPrice := t.State.PreviousPrices[len(t.State.PreviousPrices)-1]
+		recentRSI := t.State.PreviousRSIValues[len(t.State.PreviousRSIValues)-1]
+
+		// Find highest price in lookback period
+		priceHighest := recentPrice
+		rsiAtPriceHigh := recentRSI
+		for i := len(t.State.PreviousPrices) - lookback; i < len(t.State.PreviousPrices)-1; i++ {
+			if t.State.PreviousPrices[i] > priceHighest {
+				priceHighest = t.State.PreviousPrices[i]
+				rsiAtPriceHigh = t.State.PreviousRSIValues[i]
+			}
+		}
+
+		// If recent price is new high but RSI is not confirming (lower than at previous high), there's bearish divergence
+		if recentPrice > priceHighest && recentRSI < rsiAtPriceHigh {
+			return true // Bearish divergence detected against long signal
+		}
+	} else if signalDirection == "SHORT" {
+		// For short signals, check for bearish divergence (lower high in price but higher high in RSI)
+		recentPrice := t.State.PreviousPrices[len(t.State.PreviousPrices)-1]
+		recentRSI := t.State.PreviousRSIValues[len(t.State.PreviousRSIValues)-1]
+
+		// Find lowest price in lookback period
+		priceLowest := recentPrice
+		rsiAtPriceLow := recentRSI
+		for i := len(t.State.PreviousPrices) - lookback; i < len(t.State.PreviousPrices)-1; i++ {
+			if t.State.PreviousPrices[i] < priceLowest {
+				priceLowest = t.State.PreviousPrices[i]
+				rsiAtPriceLow = t.State.PreviousRSIValues[i]
+			}
+		}
+
+		// If recent price is new low but RSI is not confirming (higher than at previous low), there's bullish divergence
+		if recentPrice < priceLowest && recentRSI > rsiAtPriceLow {
+			return true // Bullish divergence detected against short signal
+		}
+	}
+
+	return false
+}
+
+// hasMACDDivergence checks for divergences between price and MACD
+func (t *Trader) hasMACDDivergence(signalDirection string) bool {
+	if len(t.State.PreviousPrices) < 3 || len(t.State.PreviousMACDValues) < 3 {
+		return false
+	}
+
+	lookback := t.Config.DivergenceLookbackPeriod
+	if len(t.State.PreviousPrices) < lookback {
+		lookback = len(t.State.PreviousPrices) - 1
+	}
+
+	recentPrice := t.State.PreviousPrices[len(t.State.PreviousPrices)-1]
+	recentMACD := t.State.PreviousMACDValues[len(t.State.PreviousMACDValues)-1]
+
+	if signalDirection == "LONG" {
+		// For long signals, check if price made new high but MACD didn't confirm
+		// Find highest price in lookback period
+		priceHighest := recentPrice
+		macdAtPriceHigh := recentMACD
+		for i := len(t.State.PreviousPrices) - lookback; i < len(t.State.PreviousPrices)-1; i++ {
+			if t.State.PreviousPrices[i] > priceHighest {
+				priceHighest = t.State.PreviousPrices[i]
+				macdAtPriceHigh = t.State.PreviousMACDValues[i]
+			}
+		}
+
+		// If recent price is new high but MACD is lower than at previous high, there's bearish divergence
+		if recentPrice > priceHighest && recentMACD < macdAtPriceHigh {
+			return true // Bearish divergence detected against long signal
+		}
+	} else if signalDirection == "SHORT" {
+		// For short signals, check if price made new low but MACD didn't confirm
+		// Find lowest price in lookback period
+		priceLowest := recentPrice
+		macdAtPriceLow := recentMACD
+		for i := len(t.State.PreviousPrices) - lookback; i < len(t.State.PreviousPrices)-1; i++ {
+			if t.State.PreviousPrices[i] < priceLowest {
+				priceLowest = t.State.PreviousPrices[i]
+				macdAtPriceLow = t.State.PreviousMACDValues[i]
+			}
+		}
+
+		// If recent price is new low but MACD is higher than at previous low, there's bullish divergence
+		if recentPrice < priceLowest && recentMACD > macdAtPriceLow {
+			return true // Bullish divergence detected against short signal
+		}
+	}
+
+	return false
 }
 
 // LogSignalStats logs signal statistics
