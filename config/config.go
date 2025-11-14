@@ -74,6 +74,10 @@ type Config struct {
 	UseMultiFactorFilter         bool    // Enable multi-factor filtering with simultaneous confirmations
 	RequiredPrimarySignals       int     // Number of primary signals required (e.g., 1 for SMA, 2 for SMA+BB)
 	RequiredSecondarySignals     int     // Number of secondary signals required (e.g., 1 for MACD, 2 for MACD+RSI)
+	// Multi-timeframe analysis configuration
+	UseMultiTimeframeFilter      bool    // Enable multi-timeframe trend filtering
+	HigherTimeframeInterval      int     // Higher timeframe interval in minutes (e.g., 5 for 5-min, 15 for 15-min)
+	HigherTimeframeTrendThreshold float64 // Threshold for determining trend on higher timeframe (e.g., using EMA, SMA)
 	// Logging configuration
 	LogFile       string
 	LogMaxSize    int // megabytes
@@ -155,6 +159,10 @@ func LoadConfig() *Config {
 		UseMultiFactorFilter:         true,  // Enable by default
 		RequiredPrimarySignals:       1,     // Require at least 1 primary signal
 		RequiredSecondarySignals:     1,     // Require at least 1 secondary signal
+		// Multi-timeframe analysis defaults
+		UseMultiTimeframeFilter:      true,  // Enable by default
+		HigherTimeframeInterval:      5,     // 5-minute timeframe as higher timeframe
+		HigherTimeframeTrendThreshold: 200,  // 200-period indicator for trend determination
 		// Logging defaults
 		LogFile:       getEnv("LOG_FILE", "trading_bot.log"),
 		LogMaxSize:    10, // 10 MB
