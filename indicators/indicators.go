@@ -19,6 +19,22 @@ func SMA(data []float64) float64 {
 	return result
 }
 
+// SMAWithPeriod calculates Simple Moving Average with a specific period
+func SMAWithPeriod(data []float64, period int) float64 {
+	if len(data) < period || period <= 0 {
+		return 0
+	}
+
+	// Use the last 'period' number of elements
+	startIndex := len(data) - period
+	sum := 0.0
+	for i := startIndex; i < len(data); i++ {
+		sum += data[i]
+	}
+	result := sum / float64(period)
+	return result
+}
+
 // StdDev calculates standard deviation
 func StdDev(data []float64) float64 {
 	if len(data) == 0 {

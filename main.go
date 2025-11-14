@@ -408,6 +408,9 @@ func main() {
 		TPChan:    make(chan models.TPJob, 8),
 		SigChan:   make(chan models.Signal, 32),
 		ConsolidatedSigChan: make(chan models.ConsolidatedSignal, 32),
+		LongTermCloses: make([]float64, 0),
+		LongTermHighs:  make([]float64, 0),
+		LongTermLows:   make([]float64, 0),
 		MarketRegime: "range", // default
 	}
 
