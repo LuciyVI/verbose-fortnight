@@ -130,6 +130,9 @@ type State struct {
 	TotalLoss      float64
 	sync.RWMutex
 
+	// Volume tracking
+	RecentVolumes  []float64 // Store recent volumes for calculating average/surge detection
+
 	// Channels
 	TPChan      chan TPJob
 	SigChan     chan Signal

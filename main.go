@@ -411,6 +411,7 @@ func main() {
 		LongTermCloses: make([]float64, 0),
 		LongTermHighs:  make([]float64, 0),
 		LongTermLows:   make([]float64, 0),
+		RecentVolumes: make([]float64, 0),
 		MarketRegime: "range", // default
 	}
 
