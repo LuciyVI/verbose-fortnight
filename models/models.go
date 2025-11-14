@@ -116,4 +116,15 @@ type State struct {
 	// Take profit tracking
 	LastTPUpdate   time.Time
 	TrailingActive bool
+
+	// Trailing stop state variables
+	LastTrailingPrice float64    // Price at which last trailing stop update occurred
+	LastTrailingUpdate time.Time // Time of last trailing stop update
+	MaxPriceSinceEntry float64   // Maximum price since entry for Chandelier trailing
+	MinPriceSinceEntry float64   // Minimum price since entry for Chandelier trailing
+	// Price tracking for smoothing (max price over time window)
+	PriceWindow []struct {
+		Price float64
+		Time  time.Time
+	}
 }

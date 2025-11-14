@@ -1168,9 +1168,9 @@ func (t *Trader) resetSignalStrength(m *map[string]int) {
 	}
 }
 
-// SyncPositionRealTime implements trailing stop logic
+// SyncPositionRealTime implements optimized trailing stop logic
 func (t *Trader) SyncPositionRealTime() {
-	t.Logger.Info("Starting trailing stop logic...")
+	t.Logger.Info("Starting optimized trailing stop logic...")
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
@@ -1201,7 +1201,57 @@ func (t *Trader) SyncPositionRealTime() {
 			continue // Don't trigger trailing stop until TP has been modified
 		}
 
-		// Progress toward TP
+		// Update max/min prices since entry for Chandelier trailing
+		if t.State.MaxPriceSinceEntry == 0 || (side == "LONG" && price > t.State.MaxPriceSinceEntry) {
+			t.State.MaxPriceSinceEntry = price
+		}
+		if t.State.MinPriceSinceEntry == 0 || (side == "SHORT" && price < t.State.MinPriceSinceEntry) {
+			t.State.MinPriceSinceEntry = price
+		}
+
+		// Add current price to the price window for smoothing (max price over time window)
+		now := time.Now()
+		pricePoint := struct {
+			Price float64
+			Time  time.Time
+		}{Price: price, Time: now}
+
+		// Add to the window
+		t.State.PriceWindow = append(t.State.PriceWindow, pricePoint)
+
+		// Clean up old entries (older than 30 seconds by default)
+		var newWindow []struct {
+			Price float64
+			Time  time.Time
+		}
+		for _, pp := range t.State.PriceWindow {
+			if now.Sub(pp.Time).Seconds() <= 30 { // 30-second window
+				newWindow = append(newWindow, pp)
+			}
+		}
+		t.State.PriceWindow = newWindow
+
+		// For smoothing, use the max/min price in the time window
+		var smoothedPrice float64
+		if side == "LONG" {
+			// For long positions, use the maximum price in the window
+			smoothedPrice = price
+			for _, pp := range t.State.PriceWindow {
+				if pp.Price > smoothedPrice {
+					smoothedPrice = pp.Price
+				}
+			}
+		} else {
+			// For short positions, use the minimum price in the window
+			smoothedPrice = price
+			for _, pp := range t.State.PriceWindow {
+				if pp.Price < smoothedPrice {
+					smoothedPrice = pp.Price
+				}
+			}
+		}
+
+		// Calculate progress toward TP
 		var dist, prog float64
 		if side == "LONG" {
 			dist = tp - entry
@@ -1216,44 +1266,96 @@ func (t *Trader) SyncPositionRealTime() {
 			continue
 		}
 
-		// Calculate dynamic trailing stop
-		// Move SL to a percentage of the way from entry to current price (at least 50% of the way to TP)
-		var targetSL float64
-		if side == "LONG" {
-			// For LONG: SL should be above entry, following price movement
-			// Move SL to halfway between entry and current price, but not above current price
-			midpoint := entry + (price-entry)*0.5
-			// Ensure SL doesn't go beyond current price (with small buffer) and is above entry
-			targetSL = math.Max(midpoint, entry)
-			if targetSL >= price*0.999 { // Small buffer to avoid being triggered immediately
-				targetSL = price * 0.999
-			}
-			// Only update if new SL is higher than current SL
-			if targetSL <= sl {
-				continue
+		// Check if smoothed price has moved enough to trigger trailing stop update (event-driven approach)
+		priceMoved := false
+		if t.State.LastTrailingPrice != 0 {
+			priceChangePerc := math.Abs(smoothedPrice-t.State.LastTrailingPrice) / t.State.LastTrailingPrice
+			if priceChangePerc >= t.Config.TrailStepPerc {
+				priceMoved = true
 			}
 		} else {
-			// For SHORT: SL should be below entry, following price movement
-			// Move SL to halfway between entry and current price, but not below current price
-			midpoint := entry - (entry-price)*0.5
-			// Ensure SL doesn't go beyond current price (with small buffer) and is below entry
-			targetSL = math.Min(midpoint, entry)
-			if targetSL <= price*1.001 { // Small buffer to avoid being triggered immediately
-				targetSL = price * 1.001
-			}
-			// Only update if new SL is lower than current SL (better for short positions)
-			if targetSL >= sl {
-				continue
-			}
+			// For the first time, set the initial value without updating the stop
+			t.State.LastTrailingPrice = smoothedPrice
+			continue
 		}
 
-		t.Logger.Info("Trailing stop: updating SL from %.2f to %.2f (current price: %.2f, progress to TP: %.0f%%)", sl, targetSL, price, prog*100)
+		// Only trail if we've reached the minimum profit threshold (using smoothed price)
+		currentProfitPerc := math.Abs(smoothedPrice-entry) / entry
+		if currentProfitPerc < t.Config.TrailMinProfit {
+			continue
+		}
+
+		// Only trail if we've reached the threshold toward TP (using smoothed price)
+		var distSmoothed, progSmoothed float64
+		if side == "LONG" {
+			distSmoothed = tp - entry
+			progSmoothed = (smoothedPrice - entry) / distSmoothed
+		} else {
+			distSmoothed = entry - tp
+			progSmoothed = (entry - smoothedPrice) / distSmoothed
+		}
+		if progSmoothed < t.Config.TrailThreshold {
+			continue
+		}
+
+		// Skip if price hasn't moved enough since last trailing update
+		if !priceMoved {
+			continue
+		}
+
+		// Calculate new trailing stop using Chandelier method with ATR
+		atr := indicators.CalculateATR(t.State.Highs, t.State.Lows, t.State.Closes, t.Config.AtrPeriod)
+		if atr <= 0 {
+			// Fallback to standard ATR if calculation fails
+			atr = indicators.CalculateATR(t.State.Highs, t.State.Lows, t.State.Closes, 14)
+		}
+		if atr <= 0 {
+			continue // Skip if ATR still can't be calculated
+		}
+
+		var targetSL float64
+		if side == "LONG" {
+			// For LONG positions: Chandelier trailing stop below the highest high since entry
+			chandelierStop := t.State.MaxPriceSinceEntry - (atr * t.Config.ATRMultiplier)
+			// Use the higher of the original method or chandelier method to be more protective
+			originalMethod := entry + progSmoothed*dist*0.5
+			targetSL = math.Max(originalMethod, chandelierStop)
+			// Ensure the new SL is higher than the current SL (and above entry)
+			targetSL = math.Max(targetSL, sl)
+			targetSL = math.Max(targetSL, entry)
+		} else {
+			// For SHORT positions: Chandelier trailing stop above the lowest low since entry
+			chandelierStop := t.State.MinPriceSinceEntry + (atr * t.Config.ATRMultiplier)
+			// Use the lower of the original method or chandelier method to be more protective
+			originalMethod := entry - progSmoothed*dist*0.5
+			targetSL = math.Min(originalMethod, chandelierStop)
+			// Ensure the new SL is lower than the current SL (and below entry)
+			targetSL = math.Min(targetSL, sl)
+			targetSL = math.Min(targetSL, entry)
+		}
+
+		// Check if the new stop level is actually an improvement
+		needMove := false
+		if side == "LONG" && targetSL > sl {
+			needMove = true
+		} else if side == "SHORT" && targetSL < sl {
+			needMove = true
+		}
+
+		if !needMove {
+			continue
+		}
+
+		t.Logger.Info("Trailing stop: updating SL from %.2f to %.2f (current price: %.2f, smoothed price: %.2f, progress to TP: %.0f%%)", sl, targetSL, price, smoothedPrice, progSmoothed*100)
 
 		// Update stop-loss
 		if err := t.PositionManager.UpdatePositionTPSL(t.Config.Symbol, tp, targetSL); err != nil {
 			t.Logger.Error("Trailing SL update error: %v", err)
 		} else {
-			t.Logger.Info("SL → %.2f (progress to TP: %.0f%%)", targetSL, prog*100)
+			t.Logger.Info("SL → %.2f (progress to TP: %.0f%%)", targetSL, progSmoothed*100)
+			// Update the state for event-driven approach
+			t.State.LastTrailingPrice = smoothedPrice
+			t.State.LastTrailingUpdate = time.Now()
 		}
 	}
 }

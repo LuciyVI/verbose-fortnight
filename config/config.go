@@ -27,18 +27,21 @@ type Config struct {
 	SmaLen           int
 	SlPerc           float64
 	TrailPerc        float64
-	TrailThreshold   float64  // Threshold at which to start trailing (e.g., 0.5 for 50%)
+	TrailThreshold   float64 // Threshold at which to start trailing (e.g., 0.5 for 50%)
+	TrailMinProfit   float64 // Minimum profit before starting to trail
+	TrailStepPerc    float64 // Minimum price movement percentage to trigger trailing stop update
+	ATRMultiplier    float64 // Multiplier for ATR in Chandelier trailing stop
 	Debug            bool
 	DynamicTP        bool
 	// ATR-based parameters for dynamic TP/SL
-	TPAtrMultiplier  float64  // Multiplier for ATR to calculate Take Profit
-	SLAtrMultiplier  float64  // Multiplier for ATR to calculate Stop Loss
-	AtrPeriod        int      // Period for ATR calculation
+	TPAtrMultiplier float64 // Multiplier for ATR to calculate Take Profit
+	SLAtrMultiplier float64 // Multiplier for ATR to calculate Stop Loss
+	AtrPeriod       int     // Period for ATR calculation
 	// Advanced volatility-based TP/SL parameters
-	TPVolatilityMultiplier float64  // Multiplier for volatility-based TP calculation
-	SLVolatilityMultiplier float64  // Multiplier for volatility-based SL calculation
-	BollingerTPMultiplier  float64  // Multiplier for bollinger-based TP calculation
-	BollingerSLMultiplier  float64  // Multiplier for bollinger-based SL calculation
+	TPVolatilityMultiplier float64 // Multiplier for volatility-based TP calculation
+	SLVolatilityMultiplier float64 // Multiplier for volatility-based SL calculation
+	BollingerTPMultiplier  float64 // Multiplier for bollinger-based TP calculation
+	BollingerSLMultiplier  float64 // Multiplier for bollinger-based SL calculation
 	// Signal confirmation thresholds
 	OrderbookStrengthThreshold float64
 	SignalStrengthThreshold    int
@@ -51,7 +54,7 @@ type Config struct {
 	LogLevel      int // 0=DEBUG, 1=INFO, 2=WARNING, 3=ERROR
 	// Daemon configuration
 	DaemonMode bool
-	
+
 	// WebUI configuration
 	EnableWebUI bool
 }
@@ -75,23 +78,26 @@ func LoadConfig() *Config {
 		ContractSize:     0.001,
 		ObDepth:          50,
 		TpThresholdQty:   500.0,
-		TpOffset:         0.008,  // Increased to 0.8% for better R/R ratio
+		TpOffset:         0.008, // Increased to 0.8% for better R/R ratio
 		SlThresholdQty:   500.0,
 		SmaLen:           20,
 		SlPerc:           0.004,  // Reduced to 0.4% to create 2:1 R/R ratio with TP of 0.8%
 		TrailPerc:        0.005,  // Keep trailing stop at 0.5% but adjust how it's applied
 		TrailThreshold:   0.5,    // Start trailing at 50% of the way to TP
+		TrailMinProfit:   0.0025, // Start trailing when profit is at least 0.25%
+		TrailStepPerc:    0.001,  // Update trailing stop only when price moves 0.1%
+		ATRMultiplier:    2.0,    // Default ATR multiplier for Chandelier trailing
 		Debug:            false,
 		DynamicTP:        false,
 		// ATR-based parameters for dynamic TP/SL
-		TPAtrMultiplier: 2.0,      // Default: Take Profit at 2.0 * ATR
-		SLAtrMultiplier: 1.0,      // Default: Stop Loss at 1.0 * ATR
-		AtrPeriod:       14,       // Default ATR period
+		TPAtrMultiplier: 2.0, // Default: Take Profit at 2.0 * ATR
+		SLAtrMultiplier: 1.0, // Default: Stop Loss at 1.0 * ATR
+		AtrPeriod:       14,  // Default ATR period
 		// Advanced volatility-based TP/SL parameters
-		TPVolatilityMultiplier: 2.5,  // Default: Take Profit at 2.5 * volatility measure
-		SLVolatilityMultiplier: 1.0,  // Default: Stop Loss at 1.0 * volatility measure
-		BollingerTPMultiplier:  2.0,  // Default: Bollinger TP multiplier
-		BollingerSLMultiplier:  1.0,  // Default: Bollinger SL multiplier
+		TPVolatilityMultiplier:     2.5, // Default: Take Profit at 2.5 * volatility measure
+		SLVolatilityMultiplier:     1.0, // Default: Stop Loss at 1.0 * volatility measure
+		BollingerTPMultiplier:      2.0, // Default: Bollinger TP multiplier
+		BollingerSLMultiplier:      1.0, // Default: Bollinger SL multiplier
 		OrderbookStrengthThreshold: 1.05,
 		SignalStrengthThreshold:    2,
 		// Logging defaults
