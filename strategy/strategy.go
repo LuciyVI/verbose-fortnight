@@ -190,32 +190,57 @@ func (t *Trader) DetectMarketRegime() {
 	// Calculate multiple metrics for better regime detection
 	rangePerc := calculateRangePercentage(recent)
 	t.Logger.Debug("Range percentage calculated: %.2f", rangePerc)
-	
+
 	volatilityRegime := detectVolatilityRegime(t.State.Closes)
 	t.Logger.Debug("Volatility regime detected: %s", volatilityRegime)
-	
+
 	trendStrength := calculateTrendStrength(recent)
 	t.Logger.Debug("Trend strength calculated: %.2f", trendStrength)
 
-	t.Logger.Info("Market regime metrics - RangePerc: %.2f, VolatilityRegime: %s, TrendStrength: %.2f", 
+	t.Logger.Info("Market regime metrics - RangePerc: %.2f, VolatilityRegime: %s, TrendStrength: %.2f",
 		rangePerc, volatilityRegime, trendStrength)
 
 	// Combine multiple signals for final determination
-	if rangePerc > 3.0 && trendStrength > 0.5 {
+	if rangePerc > 3.0 && trendStrength > t.Config.RegimeTrendThreshold {
 		t.State.MarketRegime = "trend"
 		t.Logger.Info("Market regime set to: trend")
-	} else if volatilityRegime == "low" && rangePerc < 1.5 {
+	} else if volatilityRegime == "low" && rangePerc < t.Config.RegimeRangeThreshold {
 		t.State.MarketRegime = "range"
 		t.Logger.Info("Market regime set to: range")
 	} else {
 		// If mixed signals, default to trend detection
-		if trendStrength > 0.5 {
+		if trendStrength > t.Config.RegimeTrendThreshold {
 			t.State.MarketRegime = "trend"
 			t.Logger.Info("Market regime set to: trend (based on trend strength)")
 		} else {
 			t.State.MarketRegime = "range"
 			t.Logger.Info("Market regime set to: range (based on trend strength)")
 		}
+	}
+
+	// Update state with higher-order trend if enabled
+	if t.Config.UseHigherTrendFilter && len(t.State.LongTermCloses) >= t.Config.HigherTrendPeriod {
+		t.State.HigherTrend = t.getHigherTrendDirection()
+	}
+}
+
+// getHigherTrendDirection determines the direction of the higher-order trend
+func (t *Trader) getHigherTrendDirection() string {
+	if len(t.State.LongTermCloses) < t.Config.HigherTrendPeriod {
+		return "unknown"
+	}
+
+	// Calculate the higher-order trend using the specified period
+	higherSMA := indicators.SMAWithPeriod(t.State.LongTermCloses, t.Config.HigherTrendPeriod)
+	currentPrice := t.State.LongTermCloses[len(t.State.LongTermCloses)-1]
+
+	// Determine trend based on position relative to higher SMA
+	if currentPrice > higherSMA {
+		return "up"
+	} else if currentPrice < higherSMA {
+		return "down"
+	} else {
+		return "neutral"
 	}
 }
 
@@ -752,6 +777,7 @@ func (t *Trader) generateConsolidatedSignals(closesCopy []float64, cls, smaVal, 
 	}
 
 	// Quaternary signals: Bollinger Bands (price touching bands for potential reversals)
+	// These will be filtered based on market regime
 	if cls <= bbLower { // Price touching or below lower band - potential LONG signal
 		t.Logger.Debug("Quaternary LONG signal: Close %.2f <= Bollinger Lower Band %.2f", cls, bbLower)
 		signalDetails = append(signalDetails, models.SignalDetails{
@@ -770,7 +796,17 @@ func (t *Trader) generateConsolidatedSignals(closesCopy []float64, cls, smaVal, 
 		totalWeight += t.Config.QuaternarySignalWeight
 	}
 
-	// Determine overall signal direction based on weights
+	// Apply regime-based strategy if enabled
+	if t.Config.UseRegimeBasedStrategy {
+		signalDetails = t.filterSignalsByRegime(signalDetails)
+	}
+
+	// Apply higher-order trend filter if enabled
+	if t.Config.UseHigherTrendFilter {
+		signalDetails = t.filterSignalsByHigherTrend(signalDetails)
+	}
+
+	// Determine overall signal direction based on weights after filtering
 	longWeight := 0
 	shortWeight := 0
 
@@ -781,6 +817,9 @@ func (t *Trader) generateConsolidatedSignals(closesCopy []float64, cls, smaVal, 
 			shortWeight += signal.Weight
 		}
 	}
+
+	// Recalculate total weight after filtering
+	totalWeight = longWeight + shortWeight
 
 	// Send consolidated signal based on weighted direction
 	if totalWeight >= t.Config.SignalThreshold {
@@ -808,6 +847,110 @@ func (t *Trader) generateConsolidatedSignals(closesCopy []float64, cls, smaVal, 
 
 		t.State.ConsolidatedSigChan <- consolidatedSignal
 	}
+}
+
+// filterSignalsByRegime applies different weights or filters signals based on market regime
+func (t *Trader) filterSignalsByRegime(signalDetails []models.SignalDetails) []models.SignalDetails {
+	if t.State.MarketRegime == "trend" {
+		// In trending regime, emphasize trend-following signals and de-emphasize counter-trend signals
+		// Increase weight for SMA and MACD signals
+		// Reduce weight for Bollinger Band signals (which may indicate counter-trend opportunities)
+		filteredDetails := make([]models.SignalDetails, 0, len(signalDetails))
+
+		for _, signal := range signalDetails {
+			switch signal.Kind {
+			case "BB_LONG", "BB_SHORT":
+				// Reduce weight of Bollinger Band signals in trending markets
+				adjustedSignal := signal
+				adjustedSignal.Weight = max(1, signal.Weight/2) // Reduce to at least 1
+				filteredDetails = append(filteredDetails, adjustedSignal)
+			case "SMA_LONG", "SMA_SHORT", "MACD_LONG", "MACD_SHORT":
+				// Keep trend-following signals as they are
+				filteredDetails = append(filteredDetails, signal)
+			case "GOLDEN_CROSS_LONG":
+				// Golden cross is a trend-following signal, keep as is
+				filteredDetails = append(filteredDetails, signal)
+			default:
+				filteredDetails = append(filteredDetails, signal)
+			}
+		}
+
+		return filteredDetails
+	} else if t.State.MarketRegime == "range" {
+		// In ranging regime, emphasize counter-trend signals and de-emphasize trend-following signals
+		// Increase weight for Bollinger Band signals (which indicate reversal opportunities)
+		// Reduce weight for SMA and MACD signals which may generate false signals in ranges
+		filteredDetails := make([]models.SignalDetails, 0, len(signalDetails))
+
+		for _, signal := range signalDetails {
+			switch signal.Kind {
+			case "BB_LONG", "BB_SHORT":
+				// Increase weight of Bollinger Band signals in ranging markets
+				adjustedSignal := signal
+				adjustedSignal.Weight = signal.Weight * 2
+				filteredDetails = append(filteredDetails, adjustedSignal)
+			case "SMA_LONG", "SMA_SHORT", "MACD_LONG", "MACD_SHORT":
+				// Reduce weight of trend-following signals in ranging markets
+				adjustedSignal := signal
+				adjustedSignal.Weight = max(1, signal.Weight/2) // Reduce to at least 1
+				filteredDetails = append(filteredDetails, adjustedSignal)
+			case "GOLDEN_CROSS_LONG":
+				// Reduce weight of golden cross in ranging markets
+				adjustedSignal := signal
+				adjustedSignal.Weight = max(1, signal.Weight/2) // Reduce to at least 1
+				filteredDetails = append(filteredDetails, adjustedSignal)
+			default:
+				filteredDetails = append(filteredDetails, signal)
+			}
+		}
+
+		return filteredDetails
+	}
+
+	// If regime is unknown, return original signals
+	return signalDetails
+}
+
+// filterSignalsByHigherTrend filters signals based on higher-order trend direction
+func (t *Trader) filterSignalsByHigherTrend(signalDetails []models.SignalDetails) []models.SignalDetails {
+	if t.State.HigherTrend == "up" {
+		// Only allow LONG signals when higher trend is up
+		filteredDetails := make([]models.SignalDetails, 0, len(signalDetails))
+
+		for _, signal := range signalDetails {
+			if signal.Kind == "SMA_LONG" || signal.Kind == "MACD_LONG" || signal.Kind == "GOLDEN_CROSS_LONG" || signal.Kind == "BB_LONG" {
+				filteredDetails = append(filteredDetails, signal)
+			} else {
+				t.Logger.Debug("Filtered out SHORT signal %s due to higher trend being UP", signal.Kind)
+			}
+		}
+
+		return filteredDetails
+	} else if t.State.HigherTrend == "down" {
+		// Only allow SHORT signals when higher trend is down
+		filteredDetails := make([]models.SignalDetails, 0, len(signalDetails))
+
+		for _, signal := range signalDetails {
+			if signal.Kind == "SMA_SHORT" || signal.Kind == "MACD_SHORT" || signal.Kind == "BB_SHORT" {
+				filteredDetails = append(filteredDetails, signal)
+			} else {
+				t.Logger.Debug("Filtered out LONG signal %s due to higher trend being DOWN", signal.Kind)
+			}
+		}
+
+		return filteredDetails
+	}
+
+	// If higher trend is neutral or unknown, return original signals
+	return signalDetails
+}
+
+// Helper function to return maximum of two integers
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // generateOriginalSignals maintains the original logic for backward compatibility
@@ -1126,6 +1269,11 @@ func (t *Trader) OnClosedCandle(closePrice float64) {
 	t.State.Highs = append(t.State.Highs, closePrice)
 	t.State.Lows = append(t.State.Lows, closePrice)
 
+	// Add to long-term data as well
+	t.State.LongTermCloses = append(t.State.LongTermCloses, closePrice)
+	t.State.LongTermHighs = append(t.State.LongTermHighs, closePrice)
+	t.State.LongTermLows = append(t.State.LongTermLows, closePrice)
+
 	if t.Config.Debug {
 		t.Logger.Debug("Added price: %.2f, length closes: %d", closePrice, len(t.State.Closes))
 	}
@@ -1140,8 +1288,8 @@ func (t *Trader) OnClosedCandle(closePrice float64) {
 		}
 		macdLine, _ := indicators.MACD(t.State.Closes)
 		bbUpper, bbMiddle, bbLower := indicators.CalculateBollingerBands(t.State.Closes, 20, 2.0)
-		
-		t.Logger.Debug("Indicators updated - SMA: %.2f, RSI: %.2f, MACD: %.4f, BB: %.2f/%.2f/%.2f", 
+
+		t.Logger.Debug("Indicators updated - SMA: %.2f, RSI: %.2f, MACD: %.4f, BB: %.2f/%.2f/%.2f",
 			smaVal, rsi, macdLine, bbLower, bbMiddle, bbUpper)
 	}
 
@@ -1151,6 +1299,14 @@ func (t *Trader) OnClosedCandle(closePrice float64) {
 		t.State.Closes = t.State.Closes[len(t.State.Closes)-maxLen:]
 		t.State.Highs = t.State.Highs[len(t.State.Highs)-maxLen:]
 		t.State.Lows = t.State.Lows[len(t.State.Lows)-maxLen:]
+	}
+
+	// Maintain long-term data with appropriate length
+	longTermMaxLen := t.Config.HigherTrendPeriod * 10  // Keep 10x the higher trend period
+	if len(t.State.LongTermCloses) > longTermMaxLen {
+		t.State.LongTermCloses = t.State.LongTermCloses[len(t.State.LongTermCloses)-longTermMaxLen:]
+		t.State.LongTermHighs = t.State.LongTermHighs[len(t.State.LongTermHighs)-longTermMaxLen:]
+		t.State.LongTermLows = t.State.LongTermLows[len(t.State.LongTermLows)-longTermMaxLen:]
 	}
 }
 

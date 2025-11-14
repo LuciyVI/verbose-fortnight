@@ -104,6 +104,11 @@ type State struct {
 	Highs  []float64
 	Lows   []float64
 
+	// Longer-term data for higher-order trend filter
+	LongTermCloses []float64
+	LongTermHighs  []float64
+	LongTermLows   []float64
+
 	// Instrument information
 	Instr InstrumentInfo
 
@@ -130,4 +135,5 @@ type State struct {
 	SigChan     chan Signal
 	ConsolidatedSigChan chan ConsolidatedSignal
 	MarketRegime string
+	HigherTrend  string  // Direction of higher-order trend (up, down, neutral)
 }

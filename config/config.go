@@ -40,6 +40,13 @@ type Config struct {
 	TertiarySignalWeight       int    // Weight for tertiary signals (like Golden Cross)
 	QuaternarySignalWeight     int    // Weight for quaternary signals (like Bollinger Bands)
 	SignalThreshold         	int    // Minimum total weight required to trigger a trade
+	// Higher-order trend filter configuration
+	UseHigherTrendFilter       bool   // Enable higher-order trend filtering
+	HigherTrendPeriod          int    // Period for higher-order trend (e.g., 50 or 200-period SMA)
+	// Regime-based strategy configuration
+	UseRegimeBasedStrategy     bool   // Enable regime-based strategy switching
+	RegimeTrendThreshold       float64 // Threshold for trend detection (0.0 to 1.0)
+	RegimeRangeThreshold       float64 // Threshold for range detection (0.0 to 1.0)
 	// Logging configuration
 	LogFile       string
 	LogMaxSize    int // megabytes
@@ -87,6 +94,13 @@ func LoadConfig() *Config {
 		TertiarySignalWeight:       1,    // Lower weight for tertiary signals like Golden Cross
 		QuaternarySignalWeight:     1,    // Lower weight for quaternary signals like Bollinger Bands
 		SignalThreshold:            4,    // Minimum total weight to trigger a signal
+		// Higher-order trend filter defaults
+		UseHigherTrendFilter:       true,  // Enable by default
+		HigherTrendPeriod:          50,    // 50-period SMA for higher trend filter
+		// Regime-based strategy defaults
+		UseRegimeBasedStrategy:     true,  // Enable by default
+		RegimeTrendThreshold:       0.6,   // Threshold for trend detection
+		RegimeRangeThreshold:       0.4,   // Threshold for range detection
 		// Logging defaults
 		LogFile:       getEnv("LOG_FILE", "trading_bot.log"),
 		LogMaxSize:    10, // 10 MB
