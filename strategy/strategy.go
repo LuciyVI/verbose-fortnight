@@ -639,7 +639,7 @@ func (t *Trader) adjustTPSLForShort(closePrice float64) {
 // SMAMovingAverageWorker generates signals based on SMA, MACD and other indicators
 func (t *Trader) SMAMovingAverageWorker() {
 	t.Logger.Info("Starting SMA Moving Average Worker...")
-	
+
 	for range time.Tick(1 * time.Second) {
 		if len(t.State.Closes) < t.Config.SmaLen {
 			continue
@@ -682,69 +682,198 @@ func (t *Trader) SMAMovingAverageWorker() {
 		}
 		t.Logger.Debug("Current market regime: %s, hysteresis: %.3f", t.State.MarketRegime, hysteresis)
 
-		// Generate signals based on multiple indicators with priority (RSI temporarily disabled)
-		// Primary: SMA, Secondary: MACD, Tertiary: Golden Cross, Quaternary: Bollinger Bands
-		longSignal := false
-		shortSignal := false
-		
-		// Primary signal: SMA crossing without RSI confirmation (RSI temporarily disabled)
-		if cls < smaVal*(1-hysteresis) {
-			t.Logger.Debug("Primary LONG signal: Close %.2f < SMA(%.2f) * (1-%.3f) = %.2f", 
-				cls, smaVal, hysteresis, smaVal*(1-hysteresis))
+		// Generate consolidated signals with weights
+		if t.Config.UseSignalConsolidation {
+			t.generateConsolidatedSignals(closesCopy, cls, smaVal, macdHist, macdLine, signalLine, bbUpper, bbLower, hysteresis)
+		} else {
+			// Original logic for backward compatibility
+			t.generateOriginalSignals(closesCopy, cls, smaVal, macdHist, macdLine, signalLine, bbUpper, bbLower, hysteresis)
+		}
+	}
+}
+
+// generateConsolidatedSignals generates signals using weighted consolidation approach
+func (t *Trader) generateConsolidatedSignals(closesCopy []float64, cls, smaVal, macdHist, macdLine, signalLine, bbUpper, bbLower, hysteresis float64) {
+	// Identify all possible signals with their weights
+	signalDetails := []models.SignalDetails{}
+	var totalWeight int
+
+	// Primary signal: SMA crossing
+	if cls < smaVal*(1-hysteresis) {
+		t.Logger.Debug("Primary LONG signal: Close %.2f < SMA(%.2f) * (1-%.3f) = %.2f",
+			cls, smaVal, hysteresis, smaVal*(1-hysteresis))
+		signalDetails = append(signalDetails, models.SignalDetails{
+			Kind: "SMA_LONG",
+			Weight: t.Config.PrimarySignalWeight,
+			Value: cls,
+		})
+		totalWeight += t.Config.PrimarySignalWeight
+	} else if cls > smaVal*(1+hysteresis) {
+		t.Logger.Debug("Primary SHORT signal: Close %.2f > SMA(%.2f) * (1+%.3f) = %.2f",
+			cls, smaVal, hysteresis, smaVal*(1+hysteresis))
+		signalDetails = append(signalDetails, models.SignalDetails{
+			Kind: "SMA_SHORT",
+			Weight: t.Config.PrimarySignalWeight,
+			Value: cls,
+		})
+		totalWeight += t.Config.PrimarySignalWeight
+	}
+
+	// Secondary signals: MACD confirmation
+	if macdHist > 0 && macdLine > signalLine { // Bullish MACD
+		t.Logger.Debug("Secondary LONG signal: Histogram(%.4f) > 0 and MACD(%.4f) > Signal(%.4f)",
+			macdHist, macdLine, signalLine)
+		signalDetails = append(signalDetails, models.SignalDetails{
+			Kind: "MACD_LONG",
+			Weight: t.Config.SecondarySignalWeight,
+			Value: macdHist,
+		})
+		totalWeight += t.Config.SecondarySignalWeight
+	} else if macdHist < 0 && macdLine < signalLine { // Bearish MACD
+		t.Logger.Debug("Secondary SHORT signal: Histogram(%.4f) < 0 and MACD(%.4f) < Signal(%.4f)",
+			macdHist, macdLine, signalLine)
+		signalDetails = append(signalDetails, models.SignalDetails{
+			Kind: "MACD_SHORT",
+			Weight: t.Config.SecondarySignalWeight,
+			Value: macdHist,
+		})
+		totalWeight += t.Config.SecondarySignalWeight
+	}
+
+	// Tertiary signals: Golden cross (only for LONG)
+	if indicators.GoldenCross(closesCopy) {
+		t.Logger.Debug("Tertiary LONG signal: Golden cross detected")
+		signalDetails = append(signalDetails, models.SignalDetails{
+			Kind: "GOLDEN_CROSS_LONG",
+			Weight: t.Config.TertiarySignalWeight,
+			Value: 1.0, // Binary indicator
+		})
+		totalWeight += t.Config.TertiarySignalWeight
+	}
+
+	// Quaternary signals: Bollinger Bands (price touching bands for potential reversals)
+	if cls <= bbLower { // Price touching or below lower band - potential LONG signal
+		t.Logger.Debug("Quaternary LONG signal: Close %.2f <= Bollinger Lower Band %.2f", cls, bbLower)
+		signalDetails = append(signalDetails, models.SignalDetails{
+			Kind: "BB_LONG",
+			Weight: t.Config.QuaternarySignalWeight,
+			Value: cls,
+		})
+		totalWeight += t.Config.QuaternarySignalWeight
+	} else if cls >= bbUpper { // Price touching or above upper band - potential SHORT signal
+		t.Logger.Debug("Quaternary SHORT signal: Close %.2f >= Bollinger Upper Band %.2f", cls, bbUpper)
+		signalDetails = append(signalDetails, models.SignalDetails{
+			Kind: "BB_SHORT",
+			Weight: t.Config.QuaternarySignalWeight,
+			Value: cls,
+		})
+		totalWeight += t.Config.QuaternarySignalWeight
+	}
+
+	// Determine overall signal direction based on weights
+	longWeight := 0
+	shortWeight := 0
+
+	for _, signal := range signalDetails {
+		if signal.Kind == "SMA_LONG" || signal.Kind == "MACD_LONG" || signal.Kind == "GOLDEN_CROSS_LONG" || signal.Kind == "BB_LONG" {
+			longWeight += signal.Weight
+		} else if signal.Kind == "SMA_SHORT" || signal.Kind == "MACD_SHORT" || signal.Kind == "BB_SHORT" {
+			shortWeight += signal.Weight
+		}
+	}
+
+	// Send consolidated signal based on weighted direction
+	if totalWeight >= t.Config.SignalThreshold {
+		var overallSignal string
+		if longWeight > shortWeight {
+			overallSignal = "LONG"
+		} else if shortWeight > longWeight {
+			overallSignal = "SHORT"
+		} else {
+			// If weights are equal, skip signal
+			return
+		}
+
+		t.Logger.Info("Consolidated %s signal generated - Total Weight: %d, Long Weight: %d, Short Weight: %d, Close: %.2f",
+			overallSignal, totalWeight, longWeight, shortWeight, cls)
+
+		consolidatedSignal := models.ConsolidatedSignal{
+			Kind:           overallSignal,
+			ClosePrice:     cls,
+			Time:           time.Now(),
+			SignalDetails:  signalDetails,
+			TotalWeight:    totalWeight,
+			SignalSource:   "consolidated",
+		}
+
+		t.State.ConsolidatedSigChan <- consolidatedSignal
+	}
+}
+
+// generateOriginalSignals maintains the original logic for backward compatibility
+func (t *Trader) generateOriginalSignals(closesCopy []float64, cls, smaVal, macdHist, macdLine, signalLine, bbUpper, bbLower, hysteresis float64) {
+	// Generate signals based on multiple indicators with priority (RSI temporarily disabled)
+	// Primary: SMA, Secondary: MACD, Tertiary: Golden Cross, Quaternary: Bollinger Bands
+	longSignal := false
+	shortSignal := false
+
+	// Primary signal: SMA crossing without RSI confirmation (RSI temporarily disabled)
+	if cls < smaVal*(1-hysteresis) {
+		t.Logger.Debug("Primary LONG signal: Close %.2f < SMA(%.2f) * (1-%.3f) = %.2f",
+			cls, smaVal, hysteresis, smaVal*(1-hysteresis))
+		longSignal = true
+	} else if cls > smaVal*(1+hysteresis) {
+		t.Logger.Debug("Primary SHORT signal: Close %.2f > SMA(%.2f) * (1+%.3f) = %.2f",
+			cls, smaVal, hysteresis, smaVal*(1+hysteresis))
+		shortSignal = true
+	}
+
+	// Secondary signals: MACD confirmation
+	if !longSignal && !shortSignal {
+		if macdHist > 0 && macdLine > signalLine { // Bullish MACD
+			t.Logger.Debug("Secondary LONG signal: Histogram(%.4f) > 0 and MACD(%.4f) > Signal(%.4f)",
+				macdHist, macdLine, signalLine)
 			longSignal = true
-		} else if cls > smaVal*(1+hysteresis) {
-			t.Logger.Debug("Primary SHORT signal: Close %.2f > SMA(%.2f) * (1+%.3f) = %.2f", 
-				cls, smaVal, hysteresis, smaVal*(1+hysteresis))
+		} else if macdHist < 0 && macdLine < signalLine { // Bearish MACD
+			t.Logger.Debug("Secondary SHORT signal: Histogram(%.4f) < 0 and MACD(%.4f) < Signal(%.4f)",
+				macdHist, macdLine, signalLine)
 			shortSignal = true
 		}
-		
-		// Secondary signals: MACD confirmation
-		if !longSignal && !shortSignal {
-			if macdHist > 0 && macdLine > signalLine { // Bullish MACD
-				t.Logger.Debug("Secondary LONG signal: Histogram(%.4f) > 0 and MACD(%.4f) > Signal(%.4f)", 
-					macdHist, macdLine, signalLine)
-				longSignal = true
-			} else if macdHist < 0 && macdLine < signalLine { // Bearish MACD
-				t.Logger.Debug("Secondary SHORT signal: Histogram(%.4f) < 0 and MACD(%.4f) < Signal(%.4f)", 
-					macdHist, macdLine, signalLine)
-				shortSignal = true
-			}
-		}
-		
-		// Tertiary signals: Golden cross (only for LONG) without RSI
-		if !longSignal && !shortSignal {
-			if indicators.GoldenCross(closesCopy) {
-				t.Logger.Debug("Tertiary LONG signal: Golden cross detected")
-				longSignal = true
-			}
-		}
+	}
 
-		// Quaternary signals: Bollinger Bands (price touching bands for potential reversals)
-		if !longSignal && !shortSignal {
-			if cls <= bbLower { // Price touching or below lower band - potential LONG signal
-				t.Logger.Debug("Quaternary LONG signal: Close %.2f <= Bollinger Lower Band %.2f", cls, bbLower)
-				longSignal = true
-			} else if cls >= bbUpper { // Price touching or above upper band - potential SHORT signal
-				t.Logger.Debug("Quaternary SHORT signal: Close %.2f >= Bollinger Upper Band %.2f", cls, bbUpper)
-				shortSignal = true
-			}
+	// Tertiary signals: Golden cross (only for LONG) without RSI
+	if !longSignal && !shortSignal {
+		if indicators.GoldenCross(closesCopy) {
+			t.Logger.Debug("Tertiary LONG signal: Golden cross detected")
+			longSignal = true
 		}
+	}
 
-		// Send only one signal per cycle to prevent conflicts
-		if longSignal {
-			t.Logger.Info("LONG signal generated - Close: %.2f", cls)
-			t.State.SigChan <- models.Signal{
-				Kind:       "SMA_LONG",
-				ClosePrice: cls,
-				Time:       time.Now(),
-			}
-		} else if shortSignal {
-			t.Logger.Info("SHORT signal generated - Close: %.2f", cls)
-			t.State.SigChan <- models.Signal{
-				Kind:       "SMA_SHORT",
-				ClosePrice: cls,
-				Time:       time.Now(),
-			}
+	// Quaternary signals: Bollinger Bands (price touching bands for potential reversals)
+	if !longSignal && !shortSignal {
+		if cls <= bbLower { // Price touching or below lower band - potential LONG signal
+			t.Logger.Debug("Quaternary LONG signal: Close %.2f <= Bollinger Lower Band %.2f", cls, bbLower)
+			longSignal = true
+		} else if cls >= bbUpper { // Price touching or above upper band - potential SHORT signal
+			t.Logger.Debug("Quaternary SHORT signal: Close %.2f >= Bollinger Upper Band %.2f", cls, bbUpper)
+			shortSignal = true
+		}
+	}
+
+	// Send only one signal per cycle to prevent conflicts
+	if longSignal {
+		t.Logger.Info("LONG signal generated - Close: %.2f", cls)
+		t.State.SigChan <- models.Signal{
+			Kind:       "SMA_LONG",
+			ClosePrice: cls,
+			Time:       time.Now(),
+		}
+	} else if shortSignal {
+		t.Logger.Info("SHORT signal generated - Close: %.2f", cls)
+		t.State.SigChan <- models.Signal{
+			Kind:       "SMA_SHORT",
+			ClosePrice: cls,
+			Time:       time.Now(),
 		}
 	}
 }
@@ -804,12 +933,75 @@ func (t *Trader) closeOppositePosition(newSide string) {
 
 // Trader processes signals and executes trades
 func (t *Trader) Trader() {
+	if t.Config.UseSignalConsolidation {
+		t.processConsolidatedSignals()
+	} else {
+		t.processOriginalSignals()
+	}
+}
+
+// processConsolidatedSignals handles the new weighted/consolidated signals
+func (t *Trader) processConsolidatedSignals() {
+	lastSignal := ""
+
+	for consolidatedSig := range t.State.ConsolidatedSigChan {
+		// Prevent consecutive same signals
+		if string(consolidatedSig.Kind) == lastSignal {
+			if t.Config.Debug {
+				t.Logger.Debug("Skipping duplicate consolidated signal: %s", consolidatedSig.Kind)
+			}
+			continue
+		}
+
+		// Check orderbook strength as additional confirmation
+		if !t.CheckOrderbookStrength(consolidatedSig.Kind) {
+			if t.Config.Debug {
+				t.Logger.Debug("Orderbook strength check failed for %s signal, skipping", consolidatedSig.Kind)
+			}
+			continue
+		}
+
+		t.Logger.Info("Processing consolidated %s signal with total weight: %d, component signals: %d",
+			consolidatedSig.Kind, consolidatedSig.TotalWeight, len(consolidatedSig.SignalDetails))
+
+		// Log details of each contributing signal
+		for _, signalDetail := range consolidatedSig.SignalDetails {
+			t.Logger.Debug("  - %s (weight: %d, value: %.4f)", signalDetail.Kind, signalDetail.Weight, signalDetail.Value)
+		}
+
+		// Process the consolidated signal
+		if consolidatedSig.Kind == "LONG" {
+			// Check if we have an opposite position that needs to be closed first
+			exists, side, _, _, _ := t.PositionManager.HasOpenPosition()
+			if exists && t.PositionManager.NormalizeSide(side) == "SHORT" {
+				t.Logger.Info("Closing existing SHORT position before opening LONG")
+				t.closeOppositePosition("LONG")
+			}
+
+			t.HandleLongSignal(consolidatedSig.ClosePrice)
+			lastSignal = "LONG"
+		} else if consolidatedSig.Kind == "SHORT" {
+			// Check if we have an opposite position that needs to be closed first
+			exists, side, _, _, _ := t.PositionManager.HasOpenPosition()
+			if exists && t.PositionManager.NormalizeSide(side) == "LONG" {
+				t.Logger.Info("Closing existing LONG position before opening SHORT")
+				t.closeOppositePosition("SHORT")
+			}
+
+			t.HandleShortSignal(consolidatedSig.ClosePrice)
+			lastSignal = "SHORT"
+		}
+	}
+}
+
+// processOriginalSignals handles the original signal processing for backward compatibility
+func (t *Trader) processOriginalSignals() {
 	signalStrength := make(map[string]int)
 	lastSignal := ""
-	
+
 	for sig := range t.State.SigChan {
 		signalStrength[sig.Kind]++
-		
+
 		// Prevent consecutive same signals
 		if sig.Kind == lastSignal {
 			if t.Config.Debug {
@@ -817,7 +1009,7 @@ func (t *Trader) Trader() {
 			}
 			continue
 		}
-		
+
 		if t.Config.Debug {
 			t.Logger.Debug("Signal strength: %v", signalStrength)
 		}
@@ -827,14 +1019,14 @@ func (t *Trader) Trader() {
 			if t.Config.Debug {
 				t.Logger.Debug("Confirmed LONG signal: %d indicators", signalStrength["SMA_LONG"])
 			}
-			
+
 			// Check if we have an opposite position that needs to be closed first
 			exists, side, _, _, _ := t.PositionManager.HasOpenPosition()
 			if exists && t.PositionManager.NormalizeSide(side) == "SHORT" {
 				t.Logger.Info("Closing existing SHORT position before opening LONG")
 				t.closeOppositePosition("LONG")
 			}
-			
+
 			t.HandleLongSignal(sig.ClosePrice)
 			lastSignal = "SMA_LONG"
 			t.resetSignalStrength(&signalStrength)
@@ -842,14 +1034,14 @@ func (t *Trader) Trader() {
 			if t.Config.Debug {
 				t.Logger.Debug("Confirmed SHORT signal: %d indicators", signalStrength["SMA_SHORT"])
 			}
-			
+
 			// Check if we have an opposite position that needs to be closed first
 			exists, side, _, _, _ := t.PositionManager.HasOpenPosition()
 			if exists && t.PositionManager.NormalizeSide(side) == "LONG" {
 				t.Logger.Info("Closing existing LONG position before opening SHORT")
 				t.closeOppositePosition("SHORT")
 			}
-			
+
 			t.HandleShortSignal(sig.ClosePrice)
 			lastSignal = "SMA_SHORT"
 			t.resetSignalStrength(&signalStrength)

@@ -327,20 +327,26 @@ func normalizeSide(side string) string {
 func main() {
 	// Load configuration first to initialize cfg
 	cfg = config.LoadConfig()
-	
+
+	// Initialize logging early in the process
+	if err := initLogging(); err != nil {
+		log.Fatalf("Failed to initialize logging: %v", err)
+		return
+	}
+
 	// Parse command line flags first to check for daemon-related commands
 	daemonStart := flag.Bool("start-daemon", false, "Start the application as a daemon")
 	daemonStop := flag.Bool("stop-daemon", false, "Stop the daemon process")
 	daemonRestart := flag.Bool("restart-daemon", false, "Restart the daemon process")
-	
+
 	// Keep the debug flag for compatibility
 	// Use a temporary variable for the debug flag since cfg is initialized after flags are parsed
 	debugFlag := flag.Bool("debug", false, "enable debug logs")
 	flag.Parse()
-	
+
 	// Update the config with the debug flag value after parsing
 	cfg.Debug = *debugFlag
-	
+
 	// Handle daemon commands
 	if *daemonStart || *daemonStop || *daemonRestart {
 		if *daemonStart {
@@ -376,12 +382,6 @@ func main() {
 		}
 	}
 	
-	// Initialize logging
-	if err := initLogging(); err != nil {
-		log.Fatalf("Failed to initialize logging: %v", err)
-		return
-	}
-	
 	logInfo("Application starting...")
 	logInfo("Daemon mode: %t", cfg.DaemonMode)
 
@@ -407,6 +407,7 @@ func main() {
 		AsksMap:   make(map[string]float64),
 		TPChan:    make(chan models.TPJob, 8),
 		SigChan:   make(chan models.Signal, 32),
+		ConsolidatedSigChan: make(chan models.ConsolidatedSignal, 32),
 		MarketRegime: "range", // default
 	}
 

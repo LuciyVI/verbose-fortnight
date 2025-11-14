@@ -32,6 +32,14 @@ type Config struct {
 	// Signal confirmation thresholds
 	OrderbookStrengthThreshold float64
 	SignalStrengthThreshold    int
+	// Signal consolidation configuration
+	UseSignalConsolidation     bool  // Enable signal consolidation (AND logic vs OR logic)
+	SignalConsolidationMethod  string // "weighted" or "threshold"
+	PrimarySignalWeight        int    // Weight for primary signals (like SMA crossing)
+	SecondarySignalWeight      int    // Weight for secondary signals (like MACD)
+	TertiarySignalWeight       int    // Weight for tertiary signals (like Golden Cross)
+	QuaternarySignalWeight     int    // Weight for quaternary signals (like Bollinger Bands)
+	SignalThreshold         	int    // Minimum total weight required to trigger a trade
 	// Logging configuration
 	LogFile       string
 	LogMaxSize    int // megabytes
@@ -71,6 +79,14 @@ func LoadConfig() *Config {
 		DynamicTP:        false,
 		OrderbookStrengthThreshold: 1.3,
 		SignalStrengthThreshold:    2,
+		// Signal consolidation defaults
+		UseSignalConsolidation:     true,  // Enable by default
+		SignalConsolidationMethod:  "weighted", // Use weighted method by default
+		PrimarySignalWeight:        3,    // Higher weight for primary signals like SMA
+		SecondarySignalWeight:      2,    // Medium weight for secondary signals like MACD
+		TertiarySignalWeight:       1,    // Lower weight for tertiary signals like Golden Cross
+		QuaternarySignalWeight:     1,    // Lower weight for quaternary signals like Bollinger Bands
+		SignalThreshold:            4,    // Minimum total weight to trigger a signal
 		// Logging defaults
 		LogFile:       getEnv("LOG_FILE", "trading_bot.log"),
 		LogMaxSize:    10, // 10 MB
