@@ -92,6 +92,14 @@ type Config struct {
 	UseRSIDivergenceFilter          bool    // Enable RSI divergence filtering
 	UseMACDDivergenceFilter         bool    // Enable MACD divergence filtering
 	DivergenceLookbackPeriod        int     // Lookback period for divergence detection (e.g., 10 periods)
+	// Enhanced TP/SL configuration
+	UseAdaptiveTargets             bool    // Enable adaptive TP/SL based on ATR or market volatility
+	ATRMultipleTP                  float64 // ATR multiplier for take profit targets (e.g., 3.0 * ATR)
+	ATRMultipleSL                  float64 // ATR multiplier for stop loss targets (e.g., 1.5 * ATR)
+	MinTPDistancePercent           float64 // Minimum distance for TP as percentage (e.g., 0.8%)
+	MinSLDistancePercent           float64 // Minimum distance for SL as percentage (e.g., 0.4%)
+	EnablePartialTrailing          bool    // Enable trailing of remaining position after partial close
+	TrailingATRMultiplier          float64 // ATR multiplier for trailing stops (e.g., 1.0 * ATR)
 	// Logging configuration
 	LogFile       string
 	LogMaxSize    int // megabytes
@@ -191,6 +199,14 @@ func LoadConfig() *Config {
 		UseRSIDivergenceFilter:             true,  // Enable by default
 		UseMACDDivergenceFilter:            true,  // Enable by default
 		DivergenceLookbackPeriod:           10,    // Lookback period for divergence detection
+		// Enhanced TP/SL defaults
+		UseAdaptiveTargets:                 true,  // Enable by default
+		ATRMultipleTP:                      3.0,   // Take profit at 3x ATR
+		ATRMultipleSL:                      1.5,   // Stop loss at 1.5x ATR
+		MinTPDistancePercent:               0.008, // Minimum 0.8% for TP
+		MinSLDistancePercent:               0.004, // Minimum 0.4% for SL
+		EnablePartialTrailing:              true,  // Enable by default
+		TrailingATRMultiplier:              1.0,   // Trailing at 1x ATR
 		// Logging defaults
 		LogFile:       getEnv("LOG_FILE", "trading_bot.log"),
 		LogMaxSize:    10, // 10 MB
