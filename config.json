@@ -1,0 +1,23 @@
+{
+  "debug": false,
+  "api_key": "YOUR_API_KEY",
+  "api_secret": "YOUR_API_SECRET",
+  "rest_host": "https://api-demo.bybit.com",
+  "ws_private_url": "wss://stream-demo.bybit.com/v5/private",
+  "ws_public_url": "wss://stream.bybit.com/v5/public/linear",
+  "pong_wait": 70,
+  "ping_period": 30,
+  "recv_window": "5000",
+  "account_type": "UNIFIED",
+  "symbol": "BTCUSDT",
+  "interval": "1",
+  "window_size": 20,
+  "bb_mult": 2.0,
+  "contract_size": 0.001,
+  "ob_depth": 50,
+  "tp_threshold_qty": 500.0,
+  "tp_offset": 0.002,
+  "sl_threshold_qty": 500.0,
+  "tp_percent": 0.005,
+  "sl_percent": 0.001
+}

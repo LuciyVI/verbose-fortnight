@@ -1,4 +1,4 @@
-module go-trade
+module go-trader
 
 go 1.23.3
 
