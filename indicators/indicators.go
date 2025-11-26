@@ -117,19 +117,35 @@ func EMA(src []float64, period int) float64 {
 }
 
 // MACD calculates Moving Average Convergence Divergence
-func MACD(src []float64) (macdLine, signalLine float64) {
+func MACD(src []float64) (macdLine, signalLine, histogram float64) {
 	if len(src) < 26 {
-		return 0, 0
+		return 0, 0, 0
 	}
 
-	ema12 := EMA(src, 12)
-	ema26 := EMA(src, 26)
-	macdLine = ema12 - ema26
+	macdSeries := make([]float64, len(src))
+	for i := range src {
+		if i+1 < 26 {
+			continue
+		}
+		short := EMA(src[:i+1], 12)
+		long := EMA(src[:i+1], 26)
+		macdSeries[i] = short - long
+	}
 
-	// For a complete MACD, we would calculate the signal line as EMA of the MACD line
-	// But this requires a history of MACD values, which would need to be maintained externally
+	macdLine = macdSeries[len(macdSeries)-1]
 
-	return macdLine, 0 // Placeholder for signal line
+	// Signal line: EMA of MACD series (9)
+	nonZero := make([]float64, 0, len(macdSeries))
+	for _, v := range macdSeries {
+		if v != 0 {
+			nonZero = append(nonZero, v)
+		}
+	}
+	if len(nonZero) >= 9 {
+		signalLine = EMA(nonZero, 9)
+	}
+	histogram = macdLine - signalLine
+	return macdLine, signalLine, histogram
 }
 
 // CalculateBollingerBands calculates upper and lower bands
@@ -158,8 +174,8 @@ func GoldenCross(closes []float64) bool {
 	prevData := closes[len(closes)-27 : len(closes)-1] // 26 elements
 	currData := closes[len(closes)-26:]                // 26 elements
 
-	prevMacd, _ := MACD(prevData)
-	currMacd, _ := MACD(currData)
+	prevMacd, _, _ := MACD(prevData)
+	currMacd, _, _ := MACD(currData)
 
 	// This is simplified - a real golden cross would compare MACD line to signal line
 	return prevMacd < 0 && currMacd > 0

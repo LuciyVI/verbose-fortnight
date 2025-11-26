@@ -26,8 +26,12 @@ type TPJob struct {
 
 // Signal represents a trading signal
 type Signal struct {
-	Kind       string    // "GC" или "SMA"
-	ClosePrice float64   // цена закрытия свечи
+	Kind       string   // "GC" или "SMA"
+	Direction  string   // LONG or SHORT
+	Strength   int      // aggregated indicator confirmations
+	Contribs   []string // names of indicators that fired
+	HighConf   bool     // high-confidence, bypass normal confirmation rules
+	ClosePrice float64  // цена закрытия свечи
 	Time       time.Time
 }
 
@@ -52,13 +56,29 @@ type KlineMsg struct {
 
 // KlineData represents kline data
 type KlineData struct {
+	Open    string `json:"open"`
+	High    string `json:"high"`
+	Low     string `json:"low"`
 	Close   string `json:"close"`
+	Volume  string `json:"volume"`
 	Confirm bool   `json:"confirm"`
 }
 
 // CloseFloat returns the close price as float64
 func (k KlineData) CloseFloat() float64 {
 	f, _ := strconv.ParseFloat(k.Close, 64)
+	return f
+}
+
+// HighFloat returns the high price as float64
+func (k KlineData) HighFloat() float64 {
+	f, _ := strconv.ParseFloat(k.High, 64)
+	return f
+}
+
+// LowFloat returns the low price as float64
+func (k KlineData) LowFloat() float64 {
+	f, _ := strconv.ParseFloat(k.Low, 64)
 	return f
 }
 
@@ -83,33 +103,41 @@ type State struct {
 	OrderQty       float64
 
 	// Strategy state
-	Closes []float64
-	Highs  []float64
-	Lows   []float64
+	Closes    []float64
+	Highs     []float64
+	Lows      []float64
+	Volumes   []float64
+	HTFCloses []float64
 
 	// Instrument information
 	Instr InstrumentInfo
 
 	// Orderbook maps with mutex protection
-	ObLock  sync.Mutex
-	BidsMap map[string]float64
-	AsksMap map[string]float64
+	ObLock             sync.Mutex
+	BidsMap            map[string]float64
+	AsksMap            map[string]float64
+	ObImbalanceHistory []float64
 
 	// Signal statistics
 	SignalStats struct {
 		Total, Correct, FalsePositive int
 		sync.Mutex
 	}
-	
+
 	// Profit tracking
-	RealizedPnL    float64
-	UnrealizedPnL  float64
-	TotalProfit    float64
-	TotalLoss      float64
+	RealizedPnL   float64
+	UnrealizedPnL float64
+	TotalProfit   float64
+	TotalLoss     float64
 	sync.RWMutex
+	PartialTPDone bool
+	LastExitAt    time.Time
+	LastExitDir   string
 
 	// Channels
-	TPChan      chan TPJob
-	SigChan     chan Signal
-	MarketRegime string
+	TPChan          chan TPJob
+	SigChan         chan Signal
+	MarketRegime    string
+	RegimeCandidate string
+	RegimeStreak    int
 }

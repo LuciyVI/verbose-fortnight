@@ -25,13 +25,33 @@ type Config struct {
 	TpOffset         float64
 	SlThresholdQty   float64
 	SmaLen           int
-	SlPerc           float64
-	TrailPerc        float64
-	Debug            bool
-	DynamicTP        bool
+	// Adaptive thresholds
+	AtrDeadbandMult    float64
+	RSILow             float64
+	RSIHigh            float64
+	HTFWindow          int
+	HTFMaLen           int
+	AtrSLMult          float64
+	AtrTPMult          float64
+	SlPerc             float64
+	TrailPerc          float64
+	TrailActivation    float64
+	TrailTightPerc     float64
+	BreakevenProgress  float64
+	ReentryCooldownSec int
+	VolumeSpikeMult    float64
+	MinVolume          float64
+	Debug              bool
+	DynamicTP          bool
 	// Signal confirmation thresholds
 	OrderbookStrengthThreshold float64
+	OrderbookLevels            int
+	OrderbookMinDepth          float64
+	OrderbookStabilityLookback int
 	SignalStrengthThreshold    int
+	RegimePersistence          int
+	PartialTakeProfitRatio     float64
+	PartialTakeProfitProgress  float64
 	// Logging configuration
 	LogFile       string
 	LogMaxSize    int // megabytes
@@ -46,31 +66,50 @@ type Config struct {
 // LoadConfig loads configuration from environment variables or uses defaults
 func LoadConfig() *Config {
 	return &Config{
-		APIKey:           getEnv("BYBIT_API_KEY", ""),
-		APISecret:        getEnv("BYBIT_API_SECRET", ""),
-		DemoRESTHost:     getEnv("BYBIT_DEMO_REST_HOST", "https://api-demo.bybit.com"),
-		DemoWSPrivateURL: getEnv("BYBIT_DEMO_WS_PRIVATE", "wss://stream-demo.bybit.com/v5/private"),
-		DemoWSPublicURL:  getEnv("BYBIT_DEMO_WS_PUBLIC", "wss://stream.bybit.com/v5/public/linear"),
-		PongWait:         70,
-		PingPeriod:       30,
-		RecvWindow:       "5000",
-		AccountType:      "UNIFIED",
-		Symbol:           "BTCUSDT",
-		Interval:         "1",
-		WindowSize:       20,
-		BbMult:           2.0,
-		ContractSize:     0.001,
-		ObDepth:          50,
-		TpThresholdQty:   500.0,
-		TpOffset:         0.002,
-		SlThresholdQty:   500.0,
-		SmaLen:           20,
-		SlPerc:           0.01,
-		TrailPerc:        0.005,
-		Debug:            false,
-		DynamicTP:        false,
+		APIKey:                     getEnv("BYBIT_API_KEY", ""),
+		APISecret:                  getEnv("BYBIT_API_SECRET", ""),
+		DemoRESTHost:               getEnv("BYBIT_DEMO_REST_HOST", "https://api-demo.bybit.com"),
+		DemoWSPrivateURL:           getEnv("BYBIT_DEMO_WS_PRIVATE", "wss://stream-demo.bybit.com/v5/private"),
+		DemoWSPublicURL:            getEnv("BYBIT_DEMO_WS_PUBLIC", "wss://stream.bybit.com/v5/public/linear"),
+		PongWait:                   70,
+		PingPeriod:                 30,
+		RecvWindow:                 "5000",
+		AccountType:                "UNIFIED",
+		Symbol:                     "BTCUSDT",
+		Interval:                   "1",
+		WindowSize:                 20,
+		BbMult:                     2.0,
+		ContractSize:               0.001,
+		ObDepth:                    50,
+		TpThresholdQty:             500.0,
+		TpOffset:                   0.002,
+		SlThresholdQty:             500.0,
+		SmaLen:                     20,
+		AtrDeadbandMult:            0.25,
+		RSILow:                     40,
+		RSIHigh:                    60,
+		HTFWindow:                  60,
+		HTFMaLen:                   20,
+		AtrSLMult:                  1.5,
+		AtrTPMult:                  3.0,
+		SlPerc:                     0.01,
+		TrailPerc:                  0.005,
+		TrailActivation:            0.8,
+		TrailTightPerc:             0.0025,
+		BreakevenProgress:          0.5,
+		ReentryCooldownSec:         30,
+		VolumeSpikeMult:            1.2,
+		MinVolume:                  0,
+		Debug:                      false,
+		DynamicTP:                  false,
 		OrderbookStrengthThreshold: 1.3,
+		OrderbookLevels:            5,
+		OrderbookMinDepth:          200,
+		OrderbookStabilityLookback: 5,
 		SignalStrengthThreshold:    2,
+		RegimePersistence:          3,
+		PartialTakeProfitRatio:     0.5,
+		PartialTakeProfitProgress:  0.5,
 		// Logging defaults
 		LogFile:       getEnv("LOG_FILE", "trading_bot.log"),
 		LogMaxSize:    10, // 10 MB

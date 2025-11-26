@@ -33,7 +33,7 @@ var (
 // Initialize logging with the provided configuration
 func initLogging() error {
 	logLevel := logging.LogLevel(cfg.LogLevel)
-	
+
 	var err error
 	logger, err = logging.NewLogger(
 		cfg.LogFile,
@@ -43,11 +43,11 @@ func initLogging() error {
 		cfg.LogCompress,
 		logLevel,
 	)
-	
+
 	if err != nil {
 		return fmt.Errorf("failed to initialize logger: %w", err)
 	}
-	
+
 	return nil
 }
 
@@ -106,22 +106,22 @@ func connectPrivateWS(apiClient *api.RESTClient, state *models.State) (*websocke
 		return nil, err
 	}
 	logInfo("Successfully connected to private WebSocket: %s", cfg.DemoWSPrivateURL)
-	
+
 	expires := time.Now().Add(5 * time.Second).UnixMilli()
-	
+
 	// Log authentication request
 	auth := map[string]interface{}{
 		"op":   "auth",
 		"args": []interface{}{cfg.APIKey, expires, signWS(cfg.APISecret, expires)},
 	}
 	dbg("Sending authentication request to exchange: %v", auth)
-	
+
 	if err := ws.WriteJSON(auth); err != nil {
 		logError("Failed to send authentication to exchange: %v", err)
 		ws.Close()
 		return nil, err
 	}
-	
+
 	// Read authentication response
 	_, authResp, err := ws.ReadMessage()
 	if err != nil {
@@ -130,14 +130,14 @@ func connectPrivateWS(apiClient *api.RESTClient, state *models.State) (*websocke
 		return nil, err
 	}
 	dbg("Received authentication response from exchange: %s", string(authResp))
-	
+
 	// Subscribe to wallet and position
 	subReq := map[string]interface{}{
 		"op":   "subscribe",
 		"args": []string{"wallet", "position"},
 	}
 	dbg("Sending subscription request to exchange: %v", subReq)
-	
+
 	if err := ws.WriteJSON(map[string]interface{}{
 		"op":   "subscribe",
 		"args": []string{"wallet", "position"},
@@ -146,7 +146,7 @@ func connectPrivateWS(apiClient *api.RESTClient, state *models.State) (*websocke
 		ws.Close()
 		return nil, err
 	}
-	
+
 	// Read subscription response
 	_, subResp, err := ws.ReadMessage()
 	if err != nil {
@@ -155,7 +155,7 @@ func connectPrivateWS(apiClient *api.RESTClient, state *models.State) (*websocke
 		return nil, err
 	}
 	dbg("Received subscription response from exchange: %s", string(subResp))
-	
+
 	state.PrivPtr.Store(ws)
 	logInfo("Private WebSocket authentication and subscription completed successfully")
 	return ws, nil
@@ -171,7 +171,7 @@ func signWS(secret string, expires int64) string {
 // reconnectPublic reconnects to the public WebSocket
 func reconnectPublic(klineTopic, obTopic string, state *models.State) (*websocket.Conn, error) {
 	logWarning("Attempting to reconnect to public WebSocket...")
-	
+
 	for backoff := 1; ; backoff++ {
 		time.Sleep(time.Duration(backoff*2) * time.Second)
 		logInfo("Attempting reconnect attempt #%d to public WebSocket: %s", backoff, cfg.DemoWSPublicURL)
@@ -180,13 +180,13 @@ func reconnectPublic(klineTopic, obTopic string, state *models.State) (*websocke
 			logError("Public reconnect dial: %v", err)
 			continue
 		}
-		
+
 		subReq := map[string]interface{}{
 			"op":   "subscribe",
 			"args": []string{klineTopic, obTopic},
 		}
 		dbg("Sending subscription request to exchange during reconnection: %v", subReq)
-		
+
 		if err = conn.WriteJSON(map[string]interface{}{
 			"op":   "subscribe",
 			"args": []string{klineTopic, obTopic},
@@ -195,7 +195,7 @@ func reconnectPublic(klineTopic, obTopic string, state *models.State) (*websocke
 			conn.Close()
 			continue
 		}
-		
+
 		_, msg, err := conn.ReadMessage()
 		if err == nil {
 			dbg("Received subscription response from exchange during reconnection: %s", string(msg))
@@ -203,7 +203,7 @@ func reconnectPublic(klineTopic, obTopic string, state *models.State) (*websocke
 			logInfo("Successfully reconnected to public WebSocket: %s", cfg.DemoWSPublicURL)
 			return conn, nil
 		}
-		
+
 		logError("Public resub read: %v", err)
 		conn.Close()
 	}
@@ -212,7 +212,7 @@ func reconnectPublic(klineTopic, obTopic string, state *models.State) (*websocke
 // ApplySnapshot applies orderbook snapshot
 func applySnapshot(state *models.State, bids, asks [][]string) {
 	dbg("Received orderbook snapshot from exchange - bids: %d, asks: %d", len(bids), len(asks))
-	
+
 	state.ObLock.Lock()
 	defer state.ObLock.Unlock()
 	state.BidsMap = map[string]float64{}
@@ -231,14 +231,14 @@ func applySnapshot(state *models.State, bids, asks [][]string) {
 		}
 	}
 	state.OrderbookReady.Store(true)
-	
+
 	dbg("Orderbook snapshot applied - bids: %d, asks: %d", len(state.BidsMap), len(state.AsksMap))
 }
 
 // ApplyDelta applies orderbook delta
 func applyDelta(state *models.State, bids, asks [][]string) {
 	dbg("Received orderbook delta from exchange - bid updates: %d, ask updates: %d", len(bids), len(asks))
-	
+
 	state.ObLock.Lock()
 	defer state.ObLock.Unlock()
 	for _, lv := range bids {
@@ -272,7 +272,7 @@ func applyDelta(state *models.State, bids, asks [][]string) {
 // WalletListener listens to wallet updates
 func walletListener(ws *websocket.Conn, out chan<- []byte, done chan<- struct{}, state *models.State) {
 	logInfo("Starting wallet listener to receive messages from exchange")
-	
+
 	for {
 		_, msg, err := ws.ReadMessage()
 		if err != nil {
@@ -281,9 +281,9 @@ func walletListener(ws *websocket.Conn, out chan<- []byte, done chan<- struct{},
 			done <- struct{}{}
 			return
 		}
-		
+
 		dbg("Received message from exchange: %s", string(msg))
-		
+
 		var peek struct {
 			Topic string `json:"topic"`
 		}
@@ -327,20 +327,20 @@ func normalizeSide(side string) string {
 func main() {
 	// Load configuration first to initialize cfg
 	cfg = config.LoadConfig()
-	
+
 	// Parse command line flags first to check for daemon-related commands
 	daemonStart := flag.Bool("start-daemon", false, "Start the application as a daemon")
 	daemonStop := flag.Bool("stop-daemon", false, "Stop the daemon process")
 	daemonRestart := flag.Bool("restart-daemon", false, "Restart the daemon process")
-	
+
 	// Keep the debug flag for compatibility
 	// Use a temporary variable for the debug flag since cfg is initialized after flags are parsed
 	debugFlag := flag.Bool("debug", false, "enable debug logs")
 	flag.Parse()
-	
+
 	// Update the config with the debug flag value after parsing
 	cfg.Debug = *debugFlag
-	
+
 	// Handle daemon commands
 	if *daemonStart || *daemonStop || *daemonRestart {
 		if *daemonStart {
@@ -375,39 +375,40 @@ func main() {
 			return
 		}
 	}
-	
+
 	// Initialize logging
 	if err := initLogging(); err != nil {
 		log.Fatalf("Failed to initialize logging: %v", err)
 		return
 	}
-	
+
 	logInfo("Application starting...")
 	logInfo("Daemon mode: %t", cfg.DaemonMode)
 
 	// Create API client
 	apiClient := api.NewRESTClient(cfg, logger)
-	
+
 	// Test API connection to ensure credentials are valid
 	if _, err := apiClient.GetBalance("USDT"); err != nil {
 		logError("API authentication failed: %v", err)
 		logFatal("Please check your API credentials")
 	}
-	
+
 	logInfo("API connection established successfully")
-	
+
 	// Initialize state
 	state := &models.State{
-		Debug:     cfg.Debug,
-		DynamicTP: cfg.DynamicTP,
-		SlPerc:    cfg.SlPerc,
-		TrailPerc: cfg.TrailPerc,
-		SmaLen:    cfg.SmaLen,
-		BidsMap:   make(map[string]float64),
-		AsksMap:   make(map[string]float64),
-		TPChan:    make(chan models.TPJob, 8),
-		SigChan:   make(chan models.Signal, 32),
-		MarketRegime: "range", // default
+		Debug:           cfg.Debug,
+		DynamicTP:       cfg.DynamicTP,
+		SlPerc:          cfg.SlPerc,
+		TrailPerc:       cfg.TrailPerc,
+		SmaLen:          cfg.SmaLen,
+		BidsMap:         make(map[string]float64),
+		AsksMap:         make(map[string]float64),
+		TPChan:          make(chan models.TPJob, 8),
+		SigChan:         make(chan models.Signal, 128),
+		MarketRegime:    "range", // default
+		RegimeCandidate: "range",
 	}
 
 	// Initialize instrument info
@@ -420,7 +421,7 @@ func main() {
 		state.Instr.TickSize = 0.1
 		logWarning("TickSize == 0 → fallback %.2f", state.Instr.TickSize)
 	}
-	
+
 	if bal, err := apiClient.GetBalance("USDT"); err == nil {
 		logInfo("Init balance: %.2f USDT", bal)
 	}
@@ -432,7 +433,7 @@ func main() {
 	if err != nil {
 		logFatal("Private WS dial: %v", err)
 	}
-	
+
 	walletChan := make(chan []byte, 16)
 	walletDone := make(chan struct{})
 	go walletListener(privConn, walletChan, walletDone, state)
@@ -446,16 +447,16 @@ func main() {
 	}
 	logInfo("Successfully connected to public WebSocket: %s", cfg.DemoWSPublicURL)
 	state.PubPtr.Store(pubConn)
-	
+
 	klineTopic := fmt.Sprintf("kline.%s.%s", cfg.Interval, cfg.Symbol)
 	obTopic := fmt.Sprintf("orderbook.%d.%s", cfg.ObDepth, cfg.Symbol)
-	
+
 	subReq := map[string]interface{}{
 		"op":   "subscribe",
 		"args": []string{klineTopic, obTopic},
 	}
 	dbg("Sending subscription request to exchange: %v", subReq)
-	
+
 	if err := pubConn.WriteJSON(map[string]interface{}{
 		"op":   "subscribe",
 		"args": []string{klineTopic, obTopic},
@@ -501,15 +502,15 @@ func main() {
 			trader.LogSignalStats()
 		}
 	}()
-	
+
 	// Start profit stats logging
 	go func() {
 		for range time.Tick(10 * time.Minute) {
-			logInfo("Profit stats - Realized P&L: %.2f, Total Profit: %.2f, Total Loss: %.2f", 
+			logInfo("Profit stats - Realized P&L: %.2f, Total Profit: %.2f, Total Loss: %.2f",
 				state.RealizedPnL, state.TotalProfit, state.TotalLoss)
 		}
 	}()
-	
+
 	// Start market regime detection
 	go func() {
 		for {
@@ -534,7 +535,7 @@ func main() {
 				break drainWallet
 			}
 		}
-		
+
 		// Read public messages
 		_, raw, err := pubConn.ReadMessage()
 		if err != nil {
@@ -545,9 +546,9 @@ func main() {
 			}
 			continue
 		}
-		
+
 		dbg("Received public message from exchange: %s", string(raw))
-		
+
 		// Route by topic
 		var peek struct {
 			Topic string `json:"topic"`
@@ -555,13 +556,13 @@ func main() {
 		if json.Unmarshal(raw, &peek) != nil {
 			continue
 		}
-		
+
 		switch {
 		case strings.HasPrefix(peek.Topic, "kline."):
 			var km models.KlineMsg
 			if json.Unmarshal(raw, &km) == nil && len(km.Data) > 0 && km.Data[0].Confirm {
 				logInfo("Received kline data update from exchange: %s", peek.Topic)
-				trader.OnClosedCandle(km.Data[0].CloseFloat())
+				trader.OnClosedCandle(km.Data[0])
 			}
 		case strings.HasPrefix(peek.Topic, "orderbook."):
 			var om models.OrderbookMsg
@@ -599,17 +600,17 @@ func main() {
 				logInfo("Cancelling all active orders before shutdown...")
 				go trader.PositionManager.CancelAllOrders(cfg.Symbol)
 			}
-			
+
 			// Close WebSocket connections
 			logInfo("Closing WebSocket connections...")
 			if pubConn := state.PubPtr.Load(); pubConn != nil {
 				pubConn.Close()
 			}
-			
+
 			if privConn := state.PrivPtr.Load(); privConn != nil {
 				privConn.Close()
 			}
-			
+
 			// Perform cleanup operations
 			if err := logger.Sync(); err != nil {
 				logError("Error syncing logger: %v", err)
