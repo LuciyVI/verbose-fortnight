@@ -53,34 +53,54 @@ func initLogging() error {
 
 // logDebug logs debug messages
 func logDebug(format string, v ...interface{}) {
-	logger.Debug(format, v...)
+	if logger != nil {
+		logger.Debug(format, v...)
+	} else {
+		log.Printf("[DEBUG] "+format, v...)
+	}
 }
 
 // logInfo logs info messages
 func logInfo(format string, v ...interface{}) {
-	logger.Info(format, v...)
+	if logger != nil {
+		logger.Info(format, v...)
+	} else {
+		log.Printf("[INFO] "+format, v...)
+	}
 }
 
 // dbg is an alias for logDebug
 func dbg(format string, v ...interface{}) {
 	if cfg.Debug {
-		logger.Debug(format, v...)
+		logDebug(format, v...)
 	}
 }
 
 // logWarning logs warning messages
 func logWarning(format string, v ...interface{}) {
-	logger.Warning(format, v...)
+	if logger != nil {
+		logger.Warning(format, v...)
+	} else {
+		log.Printf("[WARN] "+format, v...)
+	}
 }
 
 // logError logs error messages
 func logError(format string, v ...interface{}) {
-	logger.Error(format, v...)
+	if logger != nil {
+		logger.Error(format, v...)
+	} else {
+		log.Printf("[ERROR] "+format, v...)
+	}
 }
 
 // logFatal logs fatal messages and exits
 func logFatal(format string, v ...interface{}) {
-	logger.Fatal(format, v...)
+	if logger != nil {
+		logger.Fatal(format, v...)
+	} else {
+		log.Fatalf(format, v...)
+	}
 }
 
 // newWSConn creates a new WebSocket connection
