@@ -38,6 +38,10 @@ type Config struct {
 	TrailActivation    float64
 	TrailTightPerc     float64
 	BreakevenProgress  float64
+	RoundTripFeePerc   float64
+	FeeBufferMult      float64
+	MinProfitPerc      float64
+	MinTrailRR         float64
 	ReentryCooldownSec int
 	VolumeSpikeMult    float64
 	MinVolume          float64
@@ -52,6 +56,10 @@ type Config struct {
 	RegimePersistence          int
 	PartialTakeProfitRatio     float64
 	PartialTakeProfitProgress  float64
+	SLSetDelaySec              int
+	SLPocketPerc               float64
+	GracePeriodSec             int
+	MinReentryFeeBufferMult    float64
 	// Logging configuration
 	LogFile       string
 	LogMaxSize    int // megabytes
@@ -61,55 +69,68 @@ type Config struct {
 	LogLevel      int // 0=DEBUG, 1=INFO, 2=WARNING, 3=ERROR
 	// Daemon configuration
 	DaemonMode bool
+	// Trailing configuration
+	DisableTrailing bool
 }
 
 // LoadConfig loads configuration from environment variables or uses defaults
 func LoadConfig() *Config {
 	return &Config{
-		APIKey:                     getEnv("BYBIT_API_KEY", ""),
-		APISecret:                  getEnv("BYBIT_API_SECRET", ""),
-		DemoRESTHost:               getEnv("BYBIT_DEMO_REST_HOST", "https://api-demo.bybit.com"),
-		DemoWSPrivateURL:           getEnv("BYBIT_DEMO_WS_PRIVATE", "wss://stream-demo.bybit.com/v5/private"),
-		DemoWSPublicURL:            getEnv("BYBIT_DEMO_WS_PUBLIC", "wss://stream.bybit.com/v5/public/linear"),
-		PongWait:                   70,
-		PingPeriod:                 30,
-		RecvWindow:                 "5000",
-		AccountType:                "UNIFIED",
-		Symbol:                     "BTCUSDT",
-		Interval:                   "1",
-		WindowSize:                 20,
-		BbMult:                     2.0,
-		ContractSize:               0.001,
-		ObDepth:                    50,
-		TpThresholdQty:             500.0,
-		TpOffset:                   0.002,
-		SlThresholdQty:             500.0,
-		SmaLen:                     20,
-		AtrDeadbandMult:            0.25,
-		RSILow:                     40,
-		RSIHigh:                    60,
+		APIKey:           getEnv("BYBIT_API_KEY", ""),
+		APISecret:        getEnv("BYBIT_API_SECRET", ""),
+		DemoRESTHost:     getEnv("BYBIT_DEMO_REST_HOST", "https://api-demo.bybit.com"),
+		DemoWSPrivateURL: getEnv("BYBIT_DEMO_WS_PRIVATE", "wss://stream-demo.bybit.com/v5/private"),
+		// Use demo public stream by default to keep REST/WS environments consistent
+		DemoWSPublicURL: getEnv("BYBIT_DEMO_WS_PUBLIC", "wss://stream-demo.bybit.com/v5/public/linear"),
+		PongWait:        70,
+		PingPeriod:      30,
+		RecvWindow:      "5000",
+		AccountType:     "UNIFIED",
+		Symbol:          "BTCUSDT",
+		Interval:        "1",
+		WindowSize:      20,
+		BbMult:          2.0,
+		ContractSize:    0.001,
+		ObDepth:         50,
+		TpThresholdQty:  500.0,
+		TpOffset:        0.002,
+		SlThresholdQty:  500.0,
+		SmaLen:          20,
+		AtrDeadbandMult: 0.25,
+		// Enable RSI gating by default to avoid over-trading noise
+		RSILow:                     45,
+		RSIHigh:                    55,
 		HTFWindow:                  60,
 		HTFMaLen:                   20,
-		AtrSLMult:                  1.5,
-		AtrTPMult:                  3.0,
+		AtrSLMult:                  1.5, // wider SL to avoid noise
+		AtrTPMult:                  3.0, // restore wider TP
 		SlPerc:                     0.01,
 		TrailPerc:                  0.005,
-		TrailActivation:            0.8,
-		TrailTightPerc:             0.0025,
-		BreakevenProgress:          0.5,
+		TrailActivation:            0.6,
+		TrailTightPerc:             0.0015,
+		BreakevenProgress:          1.0,    // disable early BE; rely on static SL/TP
+		RoundTripFeePerc:           0.0012, // ~0.12% taker+taker on BTCUSDT
+		FeeBufferMult:              1.1,    // pad fee buffer a bit to cover slippage
+		MinProfitPerc:              0.0025, // require at least 0.25% projected move for TP
+		MinTrailRR:                 0.8,    // trail only after ~0.8R is reached
 		ReentryCooldownSec:         30,
-		VolumeSpikeMult:            1.2,
+		VolumeSpikeMult:            0,
 		MinVolume:                  0,
 		Debug:                      false,
 		DynamicTP:                  false,
-		OrderbookStrengthThreshold: 1.3,
+		OrderbookStrengthThreshold: 0,
 		OrderbookLevels:            5,
-		OrderbookMinDepth:          200,
-		OrderbookStabilityLookback: 5,
+		OrderbookMinDepth:          0,
+		// Trim orderbook imbalance history to avoid perpetual instability filtering
+		OrderbookStabilityLookback: 20,
 		SignalStrengthThreshold:    2,
 		RegimePersistence:          3,
 		PartialTakeProfitRatio:     0.5,
-		PartialTakeProfitProgress:  0.5,
+		PartialTakeProfitProgress:  0.33, // take first partial earlier
+		SLSetDelaySec:              1,    // delay before sending SL to avoid immediate noise
+		SLPocketPerc:               0.0005,
+		GracePeriodSec:             45,  // do not flip/close within this time after entry
+		MinReentryFeeBufferMult:    2.0, // require at least 2x fee buffer move before re-enter/flip
 		// Logging defaults
 		LogFile:       getEnv("LOG_FILE", "trading_bot.log"),
 		LogMaxSize:    10, // 10 MB
@@ -119,6 +140,8 @@ func LoadConfig() *Config {
 		LogLevel:      1, // INFO level
 		// Daemon defaults
 		DaemonMode: getEnvAsBool("DAEMON_MODE", false),
+		// Trailing defaults
+		DisableTrailing: true,
 	}
 }
 

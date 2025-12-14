@@ -130,9 +130,12 @@ type State struct {
 	TotalProfit   float64
 	TotalLoss     float64
 	sync.RWMutex
-	PartialTPDone bool
-	LastExitAt    time.Time
-	LastExitDir   string
+	PartialTPDone  bool
+	LastExitAt     time.Time
+	LastExitDir    string
+	LastEntryAt    time.Time
+	LastEntryPrice float64
+	LastEntryDir   string
 
 	// Channels
 	TPChan          chan TPJob

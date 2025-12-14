@@ -1,12 +1,8 @@
 package strategy
 
 import (
-	"bytes"
-	"encoding/json"
 	"fmt"
-	"io"
 	"math"
-	"net/http"
 	"sort"
 	"strconv"
 	"strings"
@@ -68,6 +64,27 @@ func (t *Trader) adaptiveDeadband(atr, price, base float64) float64 {
 		return math.Max(base, atr*t.Config.AtrDeadbandMult)
 	}
 	return base
+}
+
+// feeBuffer returns the minimum price move (in price units) needed to cover a round trip with fees and slippage padding
+func (t *Trader) feeBuffer(entry float64) float64 {
+	bufPerc := t.Config.RoundTripFeePerc
+	if bufPerc <= 0 {
+		bufPerc = 0.0012
+	}
+	mult := t.Config.FeeBufferMult
+	if mult <= 0 {
+		mult = 1.0
+	}
+	buf := entry * bufPerc * mult
+	tick := t.State.Instr.TickSize
+	if tick <= 0 {
+		tick = 0.1
+	}
+	if buf > 0 {
+		buf = math.Ceil(buf/tick) * tick
+	}
+	return buf
 }
 
 func (t *Trader) higherTimeframeBias(atr float64) string {
@@ -248,6 +265,14 @@ func (t *Trader) CheckOrderbookStrength(side string, lastPrice float64) (bool, s
 		ratio = topBidDepth / topAskDepth
 	} else if side == "SHORT" && topBidDepth > 0 {
 		ratio = topAskDepth / topBidDepth
+	}
+
+	// When no explicit strength threshold is set, skip advanced stability gating to let signals pass
+	if t.Config.OrderbookStrengthThreshold == 0 {
+		if ratio == 0 {
+			return false, "orderbook ratio zero"
+		}
+		return true, fmt.Sprintf("ratio %.2f depth %.2f", ratio, totalDepth)
 	}
 
 	// Track stability of imbalance
@@ -575,48 +600,40 @@ func (t *Trader) openPosition(newSide string, price float64) {
 		entry = price
 	}
 
+	t.State.Lock()
+	t.State.LastEntryAt = time.Now()
+	t.State.LastEntryPrice = entry
+	t.State.LastEntryDir = t.PositionManager.NormalizeSide(newSide)
+	t.State.Unlock()
+
 	// Calculate TP/SL with 2:1 ratio based on 15-minute projection
 	tp, sl := t.calculateTPSLWithRatio(entry, newSide)
 
-	t.Logger.Info("Setting TP/SL with 2:1 ratio: TP=%.2f, SL=%.2f", tp, sl)
-
-	// Update position TP/SL
-	body := map[string]interface{}{
-		"category":    "linear",
-		"symbol":      t.Config.Symbol,
-		"takeProfit":  fmt.Sprintf("%.2f", tp),
-		"stopLoss":    fmt.Sprintf("%.2f", sl),
-		"positionIdx": 0,
-		"tpslMode":    "Full",
+	minPocket := entry*t.Config.SLPocketPerc + t.feeBuffer(entry)
+	if t.PositionManager.NormalizeSide(newSide) == "LONG" {
+		if entry-sl < minPocket {
+			sl = entry - minPocket
+		}
+	} else {
+		if sl-entry < minPocket {
+			sl = entry + minPocket
+		}
 	}
 
-	raw, _ := json.Marshal(body)
-	ts := fmt.Sprintf("%d", time.Now().UnixMilli())
+	delay := time.Duration(t.Config.SLSetDelaySec) * time.Second
+	t.Logger.Info("Position opened: %s %.4f @ %.2f | TP %.2f  SL %.2f (send after %s, minPocket %.4f)",
+		newSide, qty, entry, tp, sl, delay.String(), minPocket)
 
-	// Log outgoing request
-	t.Logger.Info("Sending POST request to exchange: /v5/position/trading-stop, Body: %s", string(raw))
-
-	req, _ := http.NewRequest("POST", t.Config.DemoRESTHost+"/v5/position/trading-stop", bytes.NewReader(raw))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-BAPI-API-KEY", t.Config.APIKey)
-	req.Header.Set("X-BAPI-TIMESTAMP", ts)
-	req.Header.Set("X-BAPI-RECV-WINDOW", t.Config.RecvWindow)
-	req.Header.Set("X-BAPI-SIGN-TYPE", "2")
-	req.Header.Set("X-BAPI-SIGN", t.APIClient.SignREST(t.Config.APISecret, ts, t.Config.APIKey, t.Config.RecvWindow, string(raw)))
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Logger.Error("Failed to send POST request to exchange: %v", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	reply, _ := io.ReadAll(resp.Body)
-
-	// Log incoming response
-	t.Logger.Info("Received response from exchange for /v5/position/trading-stop: Status %d, Body: %s", resp.StatusCode, string(reply))
-
-	t.Logger.Info("Position opened: %s %.4f @ %.2f | TP %.2f  SL %.2f", newSide, qty, entry, tp, sl)
+	go func(tpVal, slVal float64) {
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+		if err := t.PositionManager.UpdatePositionTPSL(t.Config.Symbol, tpVal, slVal); err != nil {
+			t.Logger.Error("Error setting TP/SL after delay: %v", err)
+			return
+		}
+		t.Logger.Info("TP/SL placed ▶ TP %.2f  SL %.2f", tpVal, slVal)
+	}(tp, sl)
 }
 
 // calculateTPSLWithRatio calculates TP/SL with a 2:1 ratio based on 15-minute price projection
@@ -629,10 +646,17 @@ func (t *Trader) calculateTPSLWithRatio(entryPrice float64, positionSide string)
 	} else if t.State.MarketRegime == "range" {
 		regimeFactor = 0.9
 	}
+	feeBuf := t.feeBuffer(entryPrice)
+	minProfitDistance := math.Max(entryPrice*t.Config.MinProfitPerc, feeBuf*1.5)
 
 	if atr > 0 {
 		slDist := atr * t.Config.AtrSLMult * regimeFactor
 		tpDist := atr * t.Config.AtrTPMult * regimeFactor
+		// Enforce minimum SL distance to avoid noise whipsaw
+		minSL := entryPrice * t.Config.SlPerc
+		if slDist < minSL {
+			slDist = minSL
+		}
 		if positionSide == "LONG" {
 			stopLoss = entryPrice - slDist
 			takeProfit = entryPrice + tpDist
@@ -657,16 +681,24 @@ func (t *Trader) calculateTPSLWithRatio(entryPrice float64, positionSide string)
 		}
 	}
 
+	if positionSide == "LONG" && takeProfit-entryPrice < minProfitDistance {
+		takeProfit = entryPrice + minProfitDistance
+	}
+	if positionSide == "SHORT" && entryPrice-takeProfit < minProfitDistance {
+		takeProfit = entryPrice - minProfitDistance
+	}
+
 	tpDistanceActual := math.Abs(takeProfit - entryPrice)
 	slDistanceActual := math.Abs(entryPrice - stopLoss)
 	if slDistanceActual > 0 {
 		ratio := tpDistanceActual / slDistanceActual
-		if ratio < 2.0 && atr > 0 {
-			// enforce 2:1 by widening TP
+		targetRR := 2.0
+		if ratio < targetRR && slDistanceActual > 0 {
+			adj := slDistanceActual * targetRR
 			if positionSide == "LONG" {
-				takeProfit = entryPrice + 2*slDistanceActual
+				takeProfit = entryPrice + adj
 			} else {
-				takeProfit = entryPrice - 2*slDistanceActual
+				takeProfit = entryPrice - adj
 			}
 		}
 	}
@@ -852,6 +884,7 @@ func (t *Trader) SMAMovingAverageWorker() {
 
 	for range ticker.C {
 		if len(t.State.Closes) < t.Config.SmaLen {
+			t.Logger.Debug("SMA worker waiting: have %d candles, need %d", len(t.State.Closes), t.Config.SmaLen)
 			continue
 		}
 
@@ -1085,19 +1118,68 @@ func (t *Trader) closeOppositePosition(newSide string) {
 func (t *Trader) Trader() {
 	signalStrength := map[string]int{"LONG": 0, "SHORT": 0}
 	lastDirection := ""
+	grace := time.Duration(t.Config.GracePeriodSec) * time.Second
+	priceBufMult := t.Config.MinReentryFeeBufferMult
+	if priceBufMult <= 0 {
+		priceBufMult = 2.0
+	}
 
 	for sig := range t.State.SigChan {
 		dir := t.PositionManager.NormalizeSide(sig.Direction)
 		if dir == "" {
 			continue
 		}
+
+		now := time.Now()
+		exists, posSide, _, _, _ := t.PositionManager.HasOpenPosition()
+		posSide = t.PositionManager.NormalizeSide(posSide)
+
+		t.State.RLock()
+		lastEntryAt := t.State.LastEntryAt
+		lastEntryPrice := t.State.LastEntryPrice
+		lastExitAt := t.State.LastExitAt
+		lastExitDir := t.State.LastExitDir
+		t.State.RUnlock()
+
+		entryForDelta := lastEntryPrice
+		if entryForDelta == 0 {
+			entryForDelta = t.PositionManager.GetLastEntryPrice()
+		}
+		if entryForDelta == 0 {
+			entryForDelta = sig.ClosePrice
+		}
+		feeBuf := t.feeBuffer(entryForDelta)
+		minDelta := feeBuf * priceBufMult
+
+		if exists && grace > 0 && !lastEntryAt.IsZero() && now.Sub(lastEntryAt) < grace {
+			if t.Config.Debug {
+				t.Logger.Debug("Skipping %s: within grace period (%s since entry)", dir, now.Sub(lastEntryAt).String())
+			}
+			continue
+		}
+
+		if minDelta > 0 {
+			if !exists && !lastExitAt.IsZero() && dir == lastExitDir && math.Abs(sig.ClosePrice-entryForDelta) < minDelta {
+				if t.Config.Debug {
+					t.Logger.Debug("Skipping %s: price delta %.2f < min %.2f since last exit", dir, math.Abs(sig.ClosePrice-entryForDelta), minDelta)
+				}
+				continue
+			}
+			if exists && posSide != "" && dir != posSide && math.Abs(sig.ClosePrice-entryForDelta) < minDelta {
+				if t.Config.Debug {
+					t.Logger.Debug("Skipping flip %s→%s: price delta %.2f < min %.2f", posSide, dir, math.Abs(sig.ClosePrice-entryForDelta), minDelta)
+				}
+				continue
+			}
+		}
+
 		signalStrength[dir] += sig.Strength
 
 		// Re-entry cooldown to avoid noisy flips
 		cooldown := time.Duration(t.Config.ReentryCooldownSec) * time.Second
-		if cooldown > 0 && !sig.HighConf && !sig.Time.IsZero() && !t.State.LastExitAt.IsZero() && dir == t.State.LastExitDir {
-			if sig.Time.Sub(t.State.LastExitAt) < cooldown {
-				t.Logger.Debug("Skipping %s due to re-entry cooldown (last exit %s ago)", dir, time.Since(t.State.LastExitAt).String())
+		if cooldown > 0 && !sig.HighConf && !sig.Time.IsZero() && !lastExitAt.IsZero() && dir == lastExitDir {
+			if sig.Time.Sub(lastExitAt) < cooldown {
+				t.Logger.Debug("Skipping %s due to re-entry cooldown (last exit %s ago)", dir, time.Since(lastExitAt).String())
 				continue
 			}
 		}
@@ -1106,9 +1188,15 @@ func (t *Trader) Trader() {
 			t.Logger.Debug("Signal strength: %v", signalStrength)
 		}
 
+		// Allow repeated signals unless we already have an open position on that side
 		if dir == lastDirection && !sig.HighConf {
-			t.Logger.Debug("Skipping duplicate direction %s without high confidence", dir)
-			continue
+			exists, side, _, _, _ := t.PositionManager.HasOpenPosition()
+			if !exists || t.PositionManager.NormalizeSide(side) != dir {
+				// let it pass to open/flip
+			} else {
+				t.Logger.Debug("Skipping duplicate direction %s while position active", dir)
+				continue
+			}
 		}
 
 		threshold := t.Config.SignalStrengthThreshold
@@ -1189,6 +1277,11 @@ func (t *Trader) SyncPositionRealTime() {
 			continue
 		}
 
+		tick := t.State.Instr.TickSize
+		if tick <= 0 {
+			tick = 0.1
+		}
+
 		// Progress toward TP
 		var dist, prog float64
 		if side == "LONG" {
@@ -1202,22 +1295,41 @@ func (t *Trader) SyncPositionRealTime() {
 			continue
 		}
 
-		// Move SL to breakeven at risk 1:1
+		feeBuf := t.feeBuffer(entry)
+		risk := math.Abs(entry - sl)
+		if risk == 0 && dist != 0 {
+			risk = math.Abs(dist) / 2 // fall back to 1R = half the TP distance
+		}
+
+		// Move SL to breakeven only when price has covered fees
 		if prog >= t.Config.BreakevenProgress {
-			if side == "LONG" && (sl == 0 || sl < entry) {
-				if err := t.PositionManager.UpdatePositionTPSL(t.Config.Symbol, tp, entry); err != nil {
-					t.Logger.Error("Breakeven SL update error: %v", err)
-				} else {
-					t.Logger.Info("Moved SL to breakeven %.2f for LONG", entry)
-					sl = entry
+			lockStep := risk * 0.2 // lock 0.2R once in profit
+			if side == "LONG" && price-entry >= feeBuf {
+				target := math.Max(entry+feeBuf, entry+lockStep)
+				if target > price-tick {
+					target = price - tick
+				}
+				if target > sl {
+					if err := t.PositionManager.UpdatePositionTPSL(t.Config.Symbol, tp, target); err != nil {
+						t.Logger.Error("Breakeven SL update error: %v", err)
+					} else {
+						t.Logger.Info("Moved SL to lock %.2f for LONG", target)
+						sl = target
+					}
 				}
 			}
-			if side == "SHORT" && (sl == 0 || sl > entry) {
-				if err := t.PositionManager.UpdatePositionTPSL(t.Config.Symbol, tp, entry); err != nil {
-					t.Logger.Error("Breakeven SL update error: %v", err)
-				} else {
-					t.Logger.Info("Moved SL to breakeven %.2f for SHORT", entry)
-					sl = entry
+			if side == "SHORT" && entry-price >= feeBuf {
+				target := math.Min(entry-feeBuf, entry-lockStep)
+				if target < price+tick {
+					target = price + tick
+				}
+				if sl == 0 || target < sl {
+					if err := t.PositionManager.UpdatePositionTPSL(t.Config.Symbol, tp, target); err != nil {
+						t.Logger.Error("Breakeven SL update error: %v", err)
+					} else {
+						t.Logger.Info("Moved SL to lock %.2f for SHORT", target)
+						sl = target
+					}
 				}
 			}
 		}
@@ -1244,26 +1356,62 @@ func (t *Trader) SyncPositionRealTime() {
 			}
 		}
 
-		// Target SL: half of the way from entry to TP
-		targetSL := entry + prog*dist*0.5
+		if t.Config.DisableTrailing {
+			continue
+		}
 
-		// Tight trailing when close to TP
-		if prog >= t.Config.TrailActivation {
+		// Trail only after a defined amount of progress to avoid churn in chop
+		trailStart := math.Max(t.Config.TrailActivation, t.Config.BreakevenProgress)
+		var realizedR float64
+		if risk > 0 {
 			if side == "LONG" {
-				targetSL = math.Max(targetSL, price*(1-t.Config.TrailTightPerc))
+				realizedR = (price - entry) / risk
 			} else {
-				targetSL = math.Min(targetSL, price*(1+t.Config.TrailTightPerc))
+				realizedR = (entry - price) / risk
 			}
 		}
-
-		needMove := false
-		if side == "LONG" && targetSL > sl {
-			needMove = true
-		} else if side == "SHORT" && targetSL < sl {
-			needMove = true
-		}
-		if !needMove {
+		if prog < trailStart || realizedR < t.Config.MinTrailRR {
 			continue
+		}
+
+		atr := indicators.CalculateATR(t.State.Highs, t.State.Lows, t.State.Closes, 14)
+
+		baseBuffer := price * t.Config.TrailPerc
+		if atr > 0 {
+			baseBuffer = math.Max(baseBuffer, atr*0.5)
+		}
+		tightBuffer := price * t.Config.TrailTightPerc
+		if atr > 0 {
+			tightBuffer = math.Max(tightBuffer, atr*0.25)
+		}
+
+		var targetSL float64
+		if side == "LONG" {
+			targetSL = price - baseBuffer
+			if risk > 0 {
+				targetSL = math.Max(targetSL, entry+risk*0.25) // lock at least 0.25R when trailing kicks in
+			}
+			targetSL = math.Max(targetSL, entry+feeBuf)
+			if prog >= 0.9 {
+				targetSL = math.Max(targetSL, price-tightBuffer)
+			}
+			targetSL = math.Min(targetSL, price-tick)
+			if targetSL <= sl {
+				continue
+			}
+		} else {
+			targetSL = price + baseBuffer
+			if risk > 0 {
+				targetSL = math.Min(targetSL, entry-risk*0.25) // move stop below entry to secure profit
+			}
+			targetSL = math.Min(targetSL, entry-feeBuf)
+			if prog >= 0.9 {
+				targetSL = math.Min(targetSL, price+tightBuffer)
+			}
+			targetSL = math.Max(targetSL, price+tick)
+			if targetSL >= sl {
+				continue
+			}
 		}
 
 		t.Logger.Info("Trailing stop: updating SL from %.2f to %.2f (%.0f%% way to TP)", sl, targetSL, prog*100)
@@ -1281,6 +1429,7 @@ func (t *Trader) OnClosedCandle(kline models.KlineData) {
 	high := kline.HighFloat()
 	low := kline.LowFloat()
 	vol, _ := strconv.ParseFloat(kline.Volume, 64)
+	t.Logger.Debug("OnClosedCandle received: o/h/l/c=%s/%s/%s/%s vol=%s", kline.Open, kline.High, kline.Low, kline.Close, kline.Volume)
 	if high == 0 {
 		high = closePrice
 	}
@@ -1295,6 +1444,7 @@ func (t *Trader) OnClosedCandle(kline models.KlineData) {
 		t.State.Volumes = append(t.State.Volumes, vol)
 	}
 	t.State.HTFCloses = append(t.State.HTFCloses, closePrice)
+	t.Logger.Debug("Candle appended: closes=%d highs=%d lows=%d volumes=%d", len(t.State.Closes), len(t.State.Highs), len(t.State.Lows), len(t.State.Volumes))
 
 	if t.Config.Debug {
 		t.Logger.Debug("Added price: %.2f, length closes: %d", closePrice, len(t.State.Closes))

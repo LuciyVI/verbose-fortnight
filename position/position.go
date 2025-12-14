@@ -191,14 +191,14 @@ func (pm *PositionManager) GetLastBidPrice() float64 {
 	pm.State.ObLock.Lock()
 	defer pm.State.ObLock.Unlock()
 	
-	var min float64
+	var max float64
 	for ps := range pm.State.BidsMap {
 		p, _ := strconv.ParseFloat(ps, 64)
-		if p < min || min == 0 {
-			min = p
+		if p > max {
+			max = p
 		}
 	}
-	return min
+	return max
 }
 
 // GetLastAskPrice returns the last ask price from orderbook
@@ -206,14 +206,14 @@ func (pm *PositionManager) GetLastAskPrice() float64 {
 	pm.State.ObLock.Lock()
 	defer pm.State.ObLock.Unlock()
 	
-	var max float64
+	var min float64
 	for ps := range pm.State.AsksMap {
 		p, _ := strconv.ParseFloat(ps, 64)
-		if p > max {
-			max = p
+		if p < min || min == 0 {
+			min = p
 		}
 	}
-	return max
+	return min
 }
 
 // UpdateSignalStats updates signal statistics

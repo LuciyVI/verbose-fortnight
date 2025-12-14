@@ -53,34 +53,54 @@ func initLogging() error {
 
 // logDebug logs debug messages
 func logDebug(format string, v ...interface{}) {
-	logger.Debug(format, v...)
+	if logger != nil {
+		logger.Debug(format, v...)
+	} else {
+		log.Printf("[DEBUG] "+format, v...)
+	}
 }
 
 // logInfo logs info messages
 func logInfo(format string, v ...interface{}) {
-	logger.Info(format, v...)
+	if logger != nil {
+		logger.Info(format, v...)
+	} else {
+		log.Printf("[INFO] "+format, v...)
+	}
 }
 
 // dbg is an alias for logDebug
 func dbg(format string, v ...interface{}) {
 	if cfg.Debug {
-		logger.Debug(format, v...)
+		logDebug(format, v...)
 	}
 }
 
 // logWarning logs warning messages
 func logWarning(format string, v ...interface{}) {
-	logger.Warning(format, v...)
+	if logger != nil {
+		logger.Warning(format, v...)
+	} else {
+		log.Printf("[WARN] "+format, v...)
+	}
 }
 
 // logError logs error messages
 func logError(format string, v ...interface{}) {
-	logger.Error(format, v...)
+	if logger != nil {
+		logger.Error(format, v...)
+	} else {
+		log.Printf("[ERROR] "+format, v...)
+	}
 }
 
 // logFatal logs fatal messages and exits
 func logFatal(format string, v ...interface{}) {
-	logger.Fatal(format, v...)
+	if logger != nil {
+		logger.Fatal(format, v...)
+	} else {
+		log.Fatalf(format, v...)
+	}
 }
 
 // newWSConn creates a new WebSocket connection
@@ -333,13 +353,12 @@ func main() {
 	daemonStop := flag.Bool("stop-daemon", false, "Stop the daemon process")
 	daemonRestart := flag.Bool("restart-daemon", false, "Restart the daemon process")
 
-	// Keep the debug flag for compatibility
-	// Use a temporary variable for the debug flag since cfg is initialized after flags are parsed
-	debugFlag := flag.Bool("debug", false, "enable debug logs")
+	debugLevel := flag.Int("debug", cfg.LogLevel, "set log level (0=DEBUG, 1=INFO, 2=WARNING, 3=ERROR)")
 	flag.Parse()
 
-	// Update the config with the debug flag value after parsing
-	cfg.Debug = *debugFlag
+	// Update logging settings based on flag
+	cfg.LogLevel = *debugLevel
+	cfg.Debug = cfg.LogLevel == 0
 
 	// Handle daemon commands
 	if *daemonStart || *daemonStop || *daemonRestart {
@@ -439,12 +458,23 @@ func main() {
 	go walletListener(privConn, walletChan, walletDone, state)
 
 	// Connect to public WebSocket
-	logInfo("Connecting to public WebSocket: %s", cfg.DemoWSPublicURL)
-	pubConn, err := newWSConn(cfg.DemoWSPublicURL)
+	pubWSURL := cfg.DemoWSPublicURL
+	logInfo("Connecting to public WebSocket: %s", pubWSURL)
+	pubConn, err := newWSConn(pubWSURL)
+	if err != nil && strings.Contains(pubWSURL, "stream-demo.bybit.com") {
+		// Fallback to mainnet public stream if demo WS rejects handshake
+		mainnetWS := "wss://stream.bybit.com/v5/public/linear"
+		logWarning("Demo public WS failed (%v); falling back to %s", err, mainnetWS)
+		pubConn, err = newWSConn(mainnetWS)
+		if err == nil {
+			pubWSURL = mainnetWS
+		}
+	}
 	if err != nil {
 		logError("Failed to connect to public WebSocket: %v", err)
 		logFatal("Public WS dial: %v", err)
 	}
+	cfg.DemoWSPublicURL = pubWSURL
 	logInfo("Successfully connected to public WebSocket: %s", cfg.DemoWSPublicURL)
 	state.PubPtr.Store(pubConn)
 
@@ -560,8 +590,12 @@ func main() {
 		switch {
 		case strings.HasPrefix(peek.Topic, "kline."):
 			var km models.KlineMsg
-			if json.Unmarshal(raw, &km) == nil && len(km.Data) > 0 && km.Data[0].Confirm {
-				logInfo("Received kline data update from exchange: %s", peek.Topic)
+			if json.Unmarshal(raw, &km) == nil && len(km.Data) > 0 {
+				if !km.Data[0].Confirm {
+					dbg("Ignoring kline update (not closed): %s close=%s", peek.Topic, km.Data[0].Close)
+					break
+				}
+				logInfo("Processing closed kline from exchange: %s o/h/l/c=%s/%s/%s/%s vol=%s", peek.Topic, km.Data[0].Open, km.Data[0].High, km.Data[0].Low, km.Data[0].Close, km.Data[0].Volume)
 				trader.OnClosedCandle(km.Data[0])
 			}
 		case strings.HasPrefix(peek.Topic, "orderbook."):
