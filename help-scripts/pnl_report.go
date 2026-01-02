@@ -25,7 +25,17 @@ type closedPnlItem struct {
 	Qty           string `json:"qty"`
 	CreatedTime   string `json:"createdTime"`
 	UpdatedTime   string `json:"updatedTime"`
-	Fee           string `json:"execFee"`
+	ExecFee       string `json:"execFee"`
+	CumEntryFee   string `json:"cumEntryFee"`
+	CumExitFee    string `json:"cumExitFee"`
+}
+
+type openPosition struct {
+	Side       string
+	Size       float64
+	AvgPrice   float64
+	TakeProfit float64
+	StopLoss   float64
 }
 
 type closedPnlResp struct {
@@ -41,6 +51,10 @@ func parseFloat(s string) float64 {
 	return v
 }
 
+func formatFloat(value float64, decimals int) string {
+	return fmt.Sprintf("%.*f", decimals, value)
+}
+
 func parseTimeMs(msStr string) time.Time {
 	ms, _ := strconv.ParseInt(msStr, 10, 64)
 	if ms > 1e12 {
@@ -48,6 +62,22 @@ func parseTimeMs(msStr string) time.Time {
 	}
 	// Some fields come in seconds; multiply if it looks too small
 	return time.Unix(ms, 0)
+}
+
+func calcFee(item closedPnlItem) float64 {
+	fee := parseFloat(item.ExecFee)
+	if fee == 0 {
+		fee = parseFloat(item.CumEntryFee) + parseFloat(item.CumExitFee)
+	}
+	return fee
+}
+
+func calcPnl(side string, entry, exit, qty, fee float64) float64 {
+	pnl := (exit - entry) * qty
+	if strings.EqualFold(side, "Sell") {
+		pnl = (entry - exit) * qty
+	}
+	return pnl - fee
 }
 
 func fetchClosedPnlPage(client *api.RESTClient, symbol string, start, end int64, cursor string) ([]closedPnlItem, string, error) {
@@ -115,6 +145,28 @@ func fetchClosedPnl(client *api.RESTClient, symbol string, start, end int64) ([]
 	return all, nil
 }
 
+func fetchOpenPositions(client *api.RESTClient, symbol string) ([]openPosition, error) {
+	list, err := client.GetPositionList(symbol)
+	if err != nil {
+		return nil, err
+	}
+	positions := make([]openPosition, 0, len(list))
+	for _, item := range list {
+		size := parseFloat(item.Size)
+		if size <= 0 {
+			continue
+		}
+		positions = append(positions, openPosition{
+			Side:       item.Side,
+			Size:       size,
+			AvgPrice:   parseFloat(item.AvgPrice),
+			TakeProfit: parseFloat(item.TakeProfit),
+			StopLoss:   parseFloat(item.StopLoss),
+		})
+	}
+	return positions, nil
+}
+
 func main() {
 	hours := flag.Int("hours", 24, "lookback window in hours")
 	symbolFlag := flag.String("symbol", "", "instrument symbol (defaults to config Symbol)")
@@ -143,7 +195,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	if len(items) == 0 {
+	openPositions, openErr := fetchOpenPositions(client, cfg.Symbol)
+	if openErr != nil {
+		fmt.Fprintf(os.Stderr, "error fetching open positions: %v\n", openErr)
+	}
+	if len(items) == 0 && len(openPositions) == 0 {
 		fmt.Println("No closed positions in the selected window.")
 		return
 	}
@@ -158,38 +214,83 @@ func main() {
 	}
 
 	fmt.Printf("Closed PnL %s for %s\n", windowLabel, cfg.Symbol)
-	fmt.Printf("%-19s %-5s %-10s %-10s %-10s %-10s %-10s\n", "Time", "Side", "Qty", "Entry", "Exit", "PnL", "Fee")
+	fmt.Printf("%-19s %-5s %-10s %-10s %-10s %-10s %-12s %-10s\n",
+		"Time", "Side", "Qty", "Entry", "Exit", "PnL", "Closed P&L", "Fee")
 
 	var csvBuilder strings.Builder
 	if *outCSV != "" {
-		csvBuilder.WriteString("time,side,qty,entry,exit,pnl,fee\n")
+		csvBuilder.WriteString("time,side,qty,entry,exit,pnl,closed_pnl,fee\n")
 	}
 
-	var total, wins, losses float64
+	var total, wins, losses, totalClosed float64
 	for _, it := range items {
 		t := parseTimeMs(it.UpdatedTime).In(time.Local).Format("2006-01-02 15:04")
 		qty := parseFloat(it.Qty)
 		entry := parseFloat(it.AvgEntryPrice)
 		exit := parseFloat(it.AvgExitPrice)
-		pnl := parseFloat(it.CurPnl)
-		fee := parseFloat(it.Fee)
+		fee := calcFee(it)
+		pnl := calcPnl(it.Side, entry, exit, qty, fee)
+		closedPnl := parseFloat(it.CurPnl)
 
 		total += pnl
+		totalClosed += closedPnl
 		if pnl >= 0 {
 			wins += pnl
 		} else {
 			losses += pnl
 		}
 
-		fmt.Printf("%-19s %-5s %-10.4f %-10.2f %-10.2f %-10.4f %-10.4f\n",
-			t, it.Side, qty, entry, exit, pnl, fee)
+		fmt.Printf("%-19s %-5s %-10s %-10s %-10s %-10s %-12s %-10s\n",
+			t,
+			it.Side,
+			formatFloat(qty, 4),
+			formatFloat(entry, 2),
+			formatFloat(exit, 2),
+			formatFloat(pnl, 4),
+			formatFloat(closedPnl, 4),
+			formatFloat(fee, 4),
+		)
 
 		if *outCSV != "" {
-			fmt.Fprintf(&csvBuilder, "%s,%s,%.4f,%.2f,%.2f,%.4f,%.4f\n",
-				t, it.Side, qty, entry, exit, pnl, fee)
+			fmt.Fprintf(&csvBuilder, "%s,%s,%s,%s,%s,%s,%s,%s\n",
+				t,
+				it.Side,
+				formatFloat(qty, 4),
+				formatFloat(entry, 2),
+				formatFloat(exit, 2),
+				formatFloat(pnl, 4),
+				formatFloat(closedPnl, 4),
+				formatFloat(fee, 4),
+			)
 		}
 	}
+	for _, op := range openPositions {
+		fmt.Printf("%-19s %-5s %-10s %-10s %-10s %-10s %-12s %-10s\n",
+			"OPEN",
+			op.Side,
+			formatFloat(op.Size, 4),
+			formatFloat(op.AvgPrice, 2),
+			"",
+			"",
+			"",
+			"",
+		)
+		if *outCSV != "" {
+			fmt.Fprintf(&csvBuilder, "%s,%s,%s,%s,%s,%s,%s,%s\n",
+				"OPEN",
+				op.Side,
+				formatFloat(op.Size, 4),
+				formatFloat(op.AvgPrice, 2),
+				"",
+				"",
+				"",
+				"",
+			)
+		}
+	}
+
 	fmt.Printf("\nTotal PnL: %.4f (wins %.4f, losses %.4f)\n", total, wins, losses)
+	fmt.Printf("Total Closed P&L: %.4f\n", totalClosed)
 
 	if *outCSV != "" {
 		if err := os.WriteFile(*outCSV, []byte(csvBuilder.String()), 0o644); err != nil {
