@@ -24,6 +24,13 @@ type TPJob struct {
 	EntryPrice float64
 }
 
+// SignalDetails represents details of a single signal
+type SignalDetails struct {
+	Kind  string  // "SMA_LONG", "MACD_LONG", etc.
+	Weight int    // Weight of this signal
+	Value float64 // Additional value if needed e.g., indicator value
+}
+
 // Signal represents a trading signal
 type Signal struct {
 	Kind       string   // "GC" или "SMA"
@@ -33,6 +40,16 @@ type Signal struct {
 	HighConf   bool     // high-confidence, bypass normal confirmation rules
 	ClosePrice float64  // цена закрытия свечи
 	Time       time.Time
+}
+
+// ConsolidatedSignal represents a consolidated trading signal with multiple confirmations
+type ConsolidatedSignal struct {
+	Kind           string          // Overall signal type: "LONG" or "SHORT"
+	ClosePrice     float64         // Current close price
+	Time           time.Time
+	SignalDetails  []SignalDetails // All contributing signals
+	TotalWeight    int             // Total weight of all contributing signals
+	SignalSource   string          // Source of the signal: "consolidated" or "original"
 }
 
 // OrderbookMsg represents orderbook message
@@ -109,6 +126,11 @@ type State struct {
 	Volumes   []float64
 	HTFCloses []float64
 
+	// Longer-term data for higher-order trend filter
+	LongTermCloses []float64
+	LongTermHighs  []float64
+	LongTermLows   []float64
+
 	// Instrument information
 	Instr InstrumentInfo
 
@@ -136,6 +158,37 @@ type State struct {
 	LastEntryAt    time.Time
 	LastEntryPrice float64
 	LastEntryDir   string
+
+	// Volume tracking
+	RecentVolumes  []float64 // Store recent volumes for calculating average/surge detection
+
+	// Position tracking for partial profits
+	PartialTPTriggered bool  // Flag to indicate if partial profit has been taken
+	PartialTPPrice     float64  // Price at which partial profit was triggered
+
+	// Re-entry tracking
+	LastExitPrice      float64  // Price at which the last position was closed
+	LastExitTime       time.Time // Time at which the last position was closed
+	LastExitSide       string    // Side of the last closed position ("LONG" or "SHORT")
+
+	// Multi-timeframe analysis
+	HigherTimeframeCloses []float64 // Closes for higher timeframe (e.g., 5-min candles aggregated from 1-min)
+	HigherTimeframeHighs  []float64 // Highs for higher timeframe
+	HigherTimeframeLows   []float64 // Lows for higher timeframe
+	HigherTimeframeTrend  string    // Trend direction on higher timeframe ("up", "down", "neutral")
+	LastHTFUpdateTime     time.Time // Time of last higher timeframe candle update
+
+	// Divergence tracking
+	PreviousPrices         []float64  // Previous prices for divergence detection
+	PreviousRSIValues      []float64  // Previous RSI values for divergence detection
+	PreviousMACDValues     []float64  // Previous MACD values for divergence detection
+	PreviousMACDSignalValues []float64  // Previous MACD signal values for divergence detection
+
+	// Partial profit and trailing tracking
+	ActiveTrailingPositions map[string]bool  // Track which positions are in trailing mode
+	PartialProfitTriggers   map[string]bool  // Track if partial profit has been triggered
+	TrailingStopLevels      map[string]float64 // Current trailing stop levels for positions
+	TrailingTakeProfitLevels map[string]float64 // Current trailing TP levels for positions
 
 	// Channels
 	TPChan          chan TPJob

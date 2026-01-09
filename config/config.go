@@ -1,3 +1,4 @@
+cat config/config.go 
 package config
 
 import (
@@ -33,6 +34,11 @@ type Config struct {
 	HTFMaLen           int
 	AtrSLMult          float64
 	AtrTPMult          float64
+	TargetRRRange      float64
+	TargetRRTrend      float64
+	AtrTPCapMultRange  float64
+	AtrTPCapMultTrend  float64
+	EnableTPSLStage1   bool
 	SlPerc             float64
 	TrailPerc          float64
 	TrailActivation    float64
@@ -52,12 +58,17 @@ type Config struct {
 	OrderbookLevels            int
 	OrderbookMinDepth          float64
 	OrderbookStabilityLookback int
+	OrderbookStabilityRange    float64
+	OrderbookMedianRatioMult   float64
 	SignalStrengthThreshold    int
 	RegimePersistence          int
 	PartialTakeProfitRatio     float64
 	PartialTakeProfitProgress  float64
 	SLSetDelaySec              int
 	SLPocketPerc               float64
+	PocketFeeMult              float64
+	SLFeeFloorMult             float64
+	TPFeeFloorMult             float64
 	GracePeriodSec             int
 	MinReentryFeeBufferMult    float64
 	// Logging configuration
@@ -67,6 +78,8 @@ type Config struct {
 	LogMaxAge     int // days
 	LogCompress   bool
 	LogLevel      int // 0=DEBUG, 1=INFO, 2=WARNING, 3=ERROR
+	// Status server configuration
+	StatusAddr string
 	// Daemon configuration
 	DaemonMode bool
 	// Trailing configuration
@@ -104,6 +117,11 @@ func LoadConfig() *Config {
 		HTFMaLen:                   20,
 		AtrSLMult:                  1.5, // wider SL to avoid noise
 		AtrTPMult:                  3.0, // restore wider TP
+		TargetRRRange:              1.0,
+		TargetRRTrend:              1.8,
+		AtrTPCapMultRange:          2.0,
+		AtrTPCapMultTrend:          3.5,
+		EnableTPSLStage1:           true,
 		SlPerc:                     0.01,
 		TrailPerc:                  0.005,
 		TrailActivation:            0.6,
@@ -118,19 +136,24 @@ func LoadConfig() *Config {
 		MinVolume:                  0,
 		Debug:                      false,
 		DynamicTP:                  false,
-		OrderbookStrengthThreshold: 0,
+		OrderbookStrengthThreshold: 0.5,
 		OrderbookLevels:            5,
 		OrderbookMinDepth:          0,
 		// Trim orderbook imbalance history to avoid perpetual instability filtering
-		OrderbookStabilityLookback: 20,
-		SignalStrengthThreshold:    2,
+		OrderbookStabilityLookback: 8,
+		OrderbookStabilityRange:    3.0,
+		OrderbookMedianRatioMult:   0.08,
+		SignalStrengthThreshold:    3,
 		RegimePersistence:          3,
 		PartialTakeProfitRatio:     0.5,
 		PartialTakeProfitProgress:  0.33, // take first partial earlier
 		SLSetDelaySec:              1,    // delay before sending SL to avoid immediate noise
 		SLPocketPerc:               0.0005,
+		PocketFeeMult:              2.0,
+		SLFeeFloorMult:             4.0,
+		TPFeeFloorMult:             5.0,
 		GracePeriodSec:             45,  // do not flip/close within this time after entry
-		MinReentryFeeBufferMult:    2.0, // require at least 2x fee buffer move before re-enter/flip
+		MinReentryFeeBufferMult:    3.0, // require at least 3x fee buffer move before re-enter/flip
 		// Logging defaults
 		LogFile:       getEnv("LOG_FILE", "trading_bot.log"),
 		LogMaxSize:    10, // 10 MB
@@ -138,6 +161,8 @@ func LoadConfig() *Config {
 		LogMaxAge:     30, // 30 days
 		LogCompress:   true,
 		LogLevel:      1, // INFO level
+		// Status server defaults
+		StatusAddr: getEnv("STATUS_ADDR", "127.0.0.1:6061"),
 		// Daemon defaults
 		DaemonMode: getEnvAsBool("DAEMON_MODE", false),
 		// Trailing defaults

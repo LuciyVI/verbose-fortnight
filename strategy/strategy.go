@@ -27,18 +27,29 @@ type Trader struct {
 	Logger          logging.LoggerInterface
 }
 
-type indicatorSnapshot struct {
-	Close      float64
-	SMA        float64
-	RSI        float64
-	MACDLine   float64
-	MACDSignal float64
-	MACDHist   float64
-	ATR        float64
-	BBUpper    float64
-	BBMiddle   float64
-	BBLower    float64
-	HTFBias    string
+type tpslCalcDetails struct {
+	entry             float64
+	side              string
+	regime            string
+	atr               float64
+	slDist            float64
+	tpDist            float64
+	slDistBase        float64
+	slDistFeeFloor    float64
+	tpDistBase        float64
+	tpDistMinProfit   float64
+	tpDistDynamicRR   float64
+	tpDistCapped      float64
+	tpDistFeeFloor    float64
+	feeBuffer         float64
+	targetRR          float64
+	cap               float64
+	minProfitDistance float64
+	dynamicRRApplied  bool
+	capApplied        bool
+	slFeeFloorApplied bool
+	tpFeeFloorApplied bool
+	regimeFactor      float64
 }
 
 // NewTrader creates a new trader instance
@@ -285,6 +296,10 @@ func (t *Trader) CheckOrderbookStrength(side string, lastPrice float64) (bool, s
 	t.State.Unlock()
 
 	stable := true
+	stabilityRange := t.Config.OrderbookStabilityRange
+	if stabilityRange <= 0 {
+		stabilityRange = 0.6
+	}
 	if len(historyCopy) >= 3 {
 		minR, maxR := historyCopy[0], historyCopy[0]
 		for _, v := range historyCopy[1:] {
@@ -295,7 +310,7 @@ func (t *Trader) CheckOrderbookStrength(side string, lastPrice float64) (bool, s
 				maxR = v
 			}
 		}
-		if maxR-minR > 0.6 {
+		if maxR-minR > stabilityRange {
 			stable = false
 		}
 	}
@@ -309,7 +324,11 @@ func (t *Trader) CheckOrderbookStrength(side string, lastPrice float64) (bool, s
 		return tmp[len(tmp)/2]
 	}
 	medianRatio := median(historyCopy)
-	if medianRatio > 0 && ratio < medianRatio*0.8 {
+	medianMult := t.Config.OrderbookMedianRatioMult
+	if medianMult <= 0 {
+		medianMult = 0.5
+	}
+	if medianRatio > 0 && ratio < medianRatio*medianMult {
 		return false, fmt.Sprintf("ratio %.2f below median %.2f", ratio, medianRatio)
 	}
 
@@ -320,15 +339,30 @@ func (t *Trader) CheckOrderbookStrength(side string, lastPrice float64) (bool, s
 	}
 
 	// Volume confirmation: require last volume spike relative to median if configured
+	volOk := true
+	volReason := ""
+	lastVol := 0.0
+	medVol := 0.0
 	if len(t.State.Volumes) > 5 && t.Config.VolumeSpikeMult > 0 {
-		medVol := median(t.State.Volumes[len(t.State.Volumes)-5:])
-		lastVol := t.State.Volumes[len(t.State.Volumes)-1]
+		medVol = median(t.State.Volumes[len(t.State.Volumes)-5:])
+		lastVol = t.State.Volumes[len(t.State.Volumes)-1]
 		if medVol > 0 && lastVol < medVol*t.Config.VolumeSpikeMult {
-			return false, fmt.Sprintf("volume %.2f below spike %.2f", lastVol, medVol*t.Config.VolumeSpikeMult)
+			volOk = false
+			volReason = fmt.Sprintf("volume %.2f below spike %.2f", lastVol, medVol*t.Config.VolumeSpikeMult)
+		} else if t.Config.MinVolume > 0 && lastVol < t.Config.MinVolume {
+			volOk = false
+			volReason = fmt.Sprintf("volume %.2f below minimum %.2f", lastVol, t.Config.MinVolume)
 		}
-		if t.Config.MinVolume > 0 && lastVol < t.Config.MinVolume {
-			return false, fmt.Sprintf("volume %.2f below minimum %.2f", lastVol, t.Config.MinVolume)
+	}
+	if !volOk {
+		if t.Config.Debug {
+			t.Logger.Debug("Orderbook volume check: ok=false reason=%s lastVol=%.2f medVol=%.2f min=%.2f", volReason, lastVol, medVol, t.Config.MinVolume)
 		}
+		return false, volReason
+	}
+	if t.Config.Debug && t.Config.VolumeSpikeMult > 0 && len(t.State.Volumes) > 5 {
+		t.Logger.Debug("Orderbook volume check: ok=true lastVol=%.2f medVol=%.2f spike=%.2f min=%.2f",
+			lastVol, medVol, medVol*t.Config.VolumeSpikeMult, t.Config.MinVolume)
 	}
 
 	threshold := t.Config.OrderbookStrengthThreshold
@@ -483,6 +517,9 @@ func (t *Trader) HandleLongSignal(closePrice float64) {
 	newSide := t.PositionManager.NormalizeSide("LONG")
 
 	if !exists {
+		if t.Config.Debug {
+			t.Logger.Debug("openPosition called: side=%s reason=no_existing_position", newSide)
+		}
 		t.openPosition(newSide, closePrice)
 	} else if side == newSide {
 		t.adjustTPSL(closePrice)
@@ -490,6 +527,9 @@ func (t *Trader) HandleLongSignal(closePrice float64) {
 		// Close opposite position first
 		t.closeOppositePosition(newSide)
 		// Then open new position
+		if t.Config.Debug {
+			t.Logger.Debug("openPosition called: side=%s reason=flip_position", newSide)
+		}
 		t.openPosition(newSide, closePrice)
 	}
 }
@@ -501,6 +541,9 @@ func (t *Trader) HandleShortSignal(closePrice float64) {
 	newSide := t.PositionManager.NormalizeSide("SHORT")
 
 	if !exists {
+		if t.Config.Debug {
+			t.Logger.Debug("openPosition called: side=%s reason=no_existing_position", newSide)
+		}
 		t.openPosition(newSide, closePrice)
 	} else if side == newSide {
 		t.adjustTPSLForShort(closePrice)
@@ -508,6 +551,9 @@ func (t *Trader) HandleShortSignal(closePrice float64) {
 		// Close opposite position first
 		t.closeOppositePosition(newSide)
 		// Then open new position
+		if t.Config.Debug {
+			t.Logger.Debug("openPosition called: side=%s reason=flip_position", newSide)
+		}
 		t.openPosition(newSide, closePrice)
 	}
 }
@@ -607,18 +653,9 @@ func (t *Trader) openPosition(newSide string, price float64) {
 	t.State.Unlock()
 
 	// Calculate TP/SL with 2:1 ratio based on 15-minute projection
-	tp, sl := t.calculateTPSLWithRatio(entry, newSide)
+	tp, sl := t.calculateInitialTPSL(entry, newSide)
 
-	minPocket := entry*t.Config.SLPocketPerc + t.feeBuffer(entry)
-	if t.PositionManager.NormalizeSide(newSide) == "LONG" {
-		if entry-sl < minPocket {
-			sl = entry - minPocket
-		}
-	} else {
-		if sl-entry < minPocket {
-			sl = entry + minPocket
-		}
-	}
+	minPocket := t.minPocketDistance(entry)
 
 	delay := time.Duration(t.Config.SLSetDelaySec) * time.Second
 	t.Logger.Info("Position opened: %s %.4f @ %.2f | TP %.2f  SL %.2f (send after %s, minPocket %.4f)",
@@ -636,28 +673,147 @@ func (t *Trader) openPosition(newSide string, price float64) {
 	}(tp, sl)
 }
 
-// calculateTPSLWithRatio calculates TP/SL with a 2:1 ratio based on 15-minute price projection
-// TP is calculated based on expected price movement in the next 15 minutes
-func (t *Trader) calculateTPSLWithRatio(entryPrice float64, positionSide string) (takeProfit float64, stopLoss float64) {
-	atr := indicators.CalculateATR(t.State.Highs, t.State.Lows, t.State.Closes, 14)
-	regimeFactor := 1.0
-	if t.State.MarketRegime == "trend" {
-		regimeFactor = 1.1
-	} else if t.State.MarketRegime == "range" {
-		regimeFactor = 0.9
+func (t *Trader) calculateInitialTPSL(entry float64, positionSide string) (float64, float64) {
+	if !t.Config.EnableTPSLStage1 {
+		return t.calculateTPSLLegacy(entry, positionSide)
 	}
+
+	details := t.calcTPSLDetails(entry, positionSide)
+	if details.side == "" {
+		return 0, 0
+	}
+
+	minPocket := t.minPocketDistance(entry)
+	minSLDist := math.Max(minPocket, details.slDistFeeFloor)
+	minTPDist := math.Max(details.minProfitDistance, details.tpDistFeeFloor)
+
+	tp := entry + details.tpDist
+	sl := entry - details.slDist
+	if details.side == "SHORT" {
+		tp = entry - details.tpDist
+		sl = entry + details.slDist
+	}
+
+	pocketAdjusted := false
+	if details.side == "LONG" {
+		if entry-sl < minPocket {
+			sl = entry - minPocket
+			pocketAdjusted = true
+		}
+	} else {
+		if sl-entry < minPocket {
+			sl = entry + minPocket
+			pocketAdjusted = true
+		}
+	}
+	slDistAfterPocket := math.Abs(entry - sl)
+
+	tick := t.State.Instr.TickSize
+	if tick <= 0 {
+		tick = 0.1
+	}
+
+	tpPreRound := tp
+	slPreRound := sl
+	tp = t.roundTP(entry, tp, tick, details.side)
+	sl = t.roundSL(entry, sl, tick, details.side)
+	roundingApplied := tp != tpPreRound || sl != slPreRound
+	roundingMode := "long_tp_floor_sl_floor"
+	if details.side == "SHORT" {
+		roundingMode = "short_tp_ceil_sl_ceil"
+	}
+
+	invariantAdjusted := false
+	if details.side == "LONG" {
+		if tp-entry < minTPDist {
+			need := math.Ceil((minTPDist-(tp-entry))/tick) * tick
+			tp += math.Max(need, tick)
+			invariantAdjusted = true
+		}
+		if entry-sl < minSLDist {
+			need := math.Ceil((minSLDist-(entry-sl))/tick) * tick
+			sl -= math.Max(need, tick)
+			invariantAdjusted = true
+		}
+	} else {
+		if entry-tp < minTPDist {
+			need := math.Ceil((minTPDist-(entry-tp))/tick) * tick
+			tp -= math.Max(need, tick)
+			invariantAdjusted = true
+		}
+		if sl-entry < minSLDist {
+			need := math.Ceil((minSLDist-(sl-entry))/tick) * tick
+			sl += math.Max(need, tick)
+			invariantAdjusted = true
+		}
+	}
+
+	tpDistFinal := math.Abs(tp - entry)
+	slDistFinal := math.Abs(entry - sl)
+	tpTicks := tpDistFinal / tick
+	slTicks := slDistFinal / tick
+	actualRR := 0.0
+	if slDistFinal > 0 {
+		actualRR = tpDistFinal / slDistFinal
+	}
+
+	t.Logger.Debug(
+		"TP/SL calc entry %.2f side %s tick %.4f atr %.4f regime %s feeBuf %.4f slDist %.4f->%.4f tpDist base %.4f minProfit %.4f dynRR %.4f cap %.4f feeFloor %.4f targetRR %.2f rr %.2f pocket %.4f tp %.2f sl %.2f tpTicks %.1f slTicks %.1f flags dynRR=%t cap=%t pocket=%t slFeeFloor=%t tpFeeFloor=%t rounding=%t mode=%s invariant=%t",
+		entry,
+		details.side,
+		tick,
+		details.atr,
+		details.regime,
+		details.feeBuffer,
+		details.slDist,
+		slDistAfterPocket,
+		details.tpDistBase,
+		details.tpDistMinProfit,
+		details.tpDistDynamicRR,
+		details.tpDistCapped,
+		details.tpDistFeeFloor,
+		details.targetRR,
+		actualRR,
+		minPocket,
+		tp,
+		sl,
+		tpTicks,
+		slTicks,
+		details.dynamicRRApplied,
+		details.capApplied,
+		pocketAdjusted,
+		details.slFeeFloorApplied,
+		details.tpFeeFloorApplied,
+		roundingApplied,
+		roundingMode,
+		invariantAdjusted,
+	)
+
+	return tp, sl
+}
+
+func (t *Trader) calculateTPSLLegacy(entryPrice float64, positionSide string) (float64, float64) {
+	side := t.PositionManager.NormalizeSide(positionSide)
+	if side == "" {
+		side = strings.ToUpper(positionSide)
+	}
+
+	atr := indicators.CalculateATR(t.State.Highs, t.State.Lows, t.State.Closes, 14)
+	regimeFactor := t.regimeFactor(t.State.MarketRegime)
 	feeBuf := t.feeBuffer(entryPrice)
 	minProfitDistance := math.Max(entryPrice*t.Config.MinProfitPerc, feeBuf*1.5)
+
+	var takeProfit float64
+	var stopLoss float64
 
 	if atr > 0 {
 		slDist := atr * t.Config.AtrSLMult * regimeFactor
 		tpDist := atr * t.Config.AtrTPMult * regimeFactor
-		// Enforce minimum SL distance to avoid noise whipsaw
 		minSL := entryPrice * t.Config.SlPerc
 		if slDist < minSL {
 			slDist = minSL
 		}
-		if positionSide == "LONG" {
+		if side == "LONG" {
 			stopLoss = entryPrice - slDist
 			takeProfit = entryPrice + tpDist
 		} else {
@@ -665,26 +821,25 @@ func (t *Trader) calculateTPSLWithRatio(entryPrice float64, positionSide string)
 			takeProfit = entryPrice - tpDist
 		}
 	} else {
-		// Fallback to percentage distances
-		takeProfit = t.calculateTPBasedOn15MinProjection(entryPrice, positionSide)
+		takeProfit = t.calculateTPBasedOn15MinProjection(entryPrice, side)
 		var tpPercentDistance float64
-		if positionSide == "LONG" {
+		if side == "LONG" {
 			tpPercentDistance = math.Abs((takeProfit - entryPrice) / entryPrice * 100)
 		} else {
 			tpPercentDistance = math.Abs((entryPrice - takeProfit) / entryPrice * 100)
 		}
 		slPercentDistance := tpPercentDistance / 2
-		if positionSide == "LONG" {
+		if side == "LONG" {
 			stopLoss = entryPrice * (1 - slPercentDistance/100)
 		} else {
 			stopLoss = entryPrice * (1 + slPercentDistance/100)
 		}
 	}
 
-	if positionSide == "LONG" && takeProfit-entryPrice < minProfitDistance {
+	if side == "LONG" && takeProfit-entryPrice < minProfitDistance {
 		takeProfit = entryPrice + minProfitDistance
 	}
-	if positionSide == "SHORT" && entryPrice-takeProfit < minProfitDistance {
+	if side == "SHORT" && entryPrice-takeProfit < minProfitDistance {
 		takeProfit = entryPrice - minProfitDistance
 	}
 
@@ -693,9 +848,9 @@ func (t *Trader) calculateTPSLWithRatio(entryPrice float64, positionSide string)
 	if slDistanceActual > 0 {
 		ratio := tpDistanceActual / slDistanceActual
 		targetRR := 2.0
-		if ratio < targetRR && slDistanceActual > 0 {
+		if ratio < targetRR {
 			adj := slDistanceActual * targetRR
-			if positionSide == "LONG" {
+			if side == "LONG" {
 				takeProfit = entryPrice + adj
 			} else {
 				takeProfit = entryPrice - adj
@@ -703,17 +858,237 @@ func (t *Trader) calculateTPSLWithRatio(entryPrice float64, positionSide string)
 		}
 	}
 
-	// Round to tick size
 	if t.State.Instr.TickSize > 0 {
 		takeProfit = math.Round(takeProfit/t.State.Instr.TickSize) * t.State.Instr.TickSize
 		stopLoss = math.Round(stopLoss/t.State.Instr.TickSize) * t.State.Instr.TickSize
 	}
 
-	t.Logger.Debug("TP/SL calc (ATR basis) Entry %.2f TP %.2f SL %.2f ATR %.4f RegimeFactor %.2f", entryPrice, takeProfit, stopLoss, atr, regimeFactor)
+	minPocket := t.minPocketDistance(entryPrice)
+	if side == "LONG" {
+		if entryPrice-stopLoss < minPocket {
+			stopLoss = entryPrice - minPocket
+		}
+	} else {
+		if stopLoss-entryPrice < minPocket {
+			stopLoss = entryPrice + minPocket
+		}
+	}
+
 	return takeProfit, stopLoss
 }
 
-func (t *Trader) buildIndicatorSnapshot(closesCopy []float64) indicatorSnapshot {
+func (t *Trader) targetRR(regime string) float64 {
+	if strings.ToLower(regime) == "trend" {
+		val := 1.8
+		if t.Config.TargetRRTrend > 0 {
+			val = t.Config.TargetRRTrend
+		}
+		return clamp(val, 1.5, 2.2)
+	}
+	val := 1.0
+	if t.Config.TargetRRRange > 0 {
+		val = t.Config.TargetRRRange
+	}
+	return clamp(val, 0.8, 1.3)
+}
+
+func clamp(val, min, max float64) float64 {
+	if val < min {
+		return min
+	}
+	if val > max {
+		return max
+	}
+	return val
+}
+
+func (t *Trader) atrTPCapMult(regime string) float64 {
+	if strings.ToLower(regime) == "trend" {
+		if t.Config.AtrTPCapMultTrend > 0 {
+			return t.Config.AtrTPCapMultTrend
+		}
+		return 3.5
+	}
+	if t.Config.AtrTPCapMultRange > 0 {
+		return t.Config.AtrTPCapMultRange
+	}
+	return 2.0
+}
+
+func (t *Trader) regimeFactor(regime string) float64 {
+	switch strings.ToLower(regime) {
+	case "trend":
+		return 1.1
+	case "range":
+		return 0.9
+	default:
+		return 1.0
+	}
+}
+
+func (t *Trader) clampTPDistWithAtr(tpDist, atr float64, regime string) (float64, float64, bool) {
+	if atr <= 0 {
+		return tpDist, 0, false
+	}
+	cap := atr * t.atrTPCapMult(regime) * t.regimeFactor(regime)
+	if cap > 0 && tpDist > cap {
+		return cap, cap, true
+	}
+	return tpDist, cap, false
+}
+
+func (t *Trader) minPocketDistance(entry float64) float64 {
+	feeBuf := t.feeBuffer(entry)
+	pocketMult := t.Config.PocketFeeMult
+	if pocketMult <= 0 {
+		pocketMult = 2.0
+	}
+	return math.Max(entry*t.Config.SLPocketPerc, feeBuf*pocketMult)
+}
+
+func (t *Trader) roundTP(entry, tp, tick float64, side string) float64 {
+	if tick <= 0 {
+		return tp
+	}
+	if side == "LONG" {
+		return math.Floor(tp/tick) * tick
+	}
+	if side == "SHORT" {
+		return math.Ceil(tp/tick) * tick
+	}
+	return math.Round(tp/tick) * tick
+}
+
+func (t *Trader) roundSL(entry, sl, tick float64, side string) float64 {
+	if tick <= 0 {
+		return sl
+	}
+	if side == "LONG" {
+		return math.Floor(sl/tick) * tick
+	}
+	if side == "SHORT" {
+		return math.Ceil(sl/tick) * tick
+	}
+	return math.Round(sl/tick) * tick
+}
+
+// calculateTPSLWithRatio calculates TP/SL using ATR/projection with dynamic RR and caps.
+// TP is calculated based on expected price movement in the next 15 minutes when ATR is unavailable.
+func (t *Trader) calculateTPSLWithRatio(entryPrice float64, positionSide string) (takeProfit float64, stopLoss float64) {
+	return t.calculateInitialTPSL(entryPrice, positionSide)
+}
+
+func (t *Trader) calcTPSLDetails(entryPrice float64, positionSide string) tpslCalcDetails {
+	side := t.PositionManager.NormalizeSide(positionSide)
+	if side == "" {
+		side = strings.ToUpper(positionSide)
+	}
+	regime := strings.ToLower(t.State.MarketRegime)
+	if regime != "trend" {
+		regime = "range"
+	}
+
+	atr := indicators.CalculateATR(t.State.Highs, t.State.Lows, t.State.Closes, 14)
+	regimeFactor := t.regimeFactor(regime)
+	feeBuf := t.feeBuffer(entryPrice)
+	minProfitDistance := math.Max(entryPrice*t.Config.MinProfitPerc, feeBuf*1.5)
+	slFeeFloorMult := t.Config.SLFeeFloorMult
+	if slFeeFloorMult <= 0 {
+		slFeeFloorMult = 4.0
+	}
+	tpFeeFloorMult := t.Config.TPFeeFloorMult
+	if tpFeeFloorMult <= 0 {
+		tpFeeFloorMult = 5.0
+	}
+
+	var slDist float64
+	var tpDist float64
+	var slDistBase float64
+	var tpDistBase float64
+	if atr > 0 {
+		slDist = atr * t.Config.AtrSLMult * regimeFactor
+		tpDist = atr * t.Config.AtrTPMult * regimeFactor
+		// Enforce minimum SL distance to avoid noise whipsaw
+		minSL := entryPrice * t.Config.SlPerc
+		if slDist < minSL {
+			slDist = minSL
+		}
+	} else {
+		tpPrice := t.calculateTPBasedOn15MinProjection(entryPrice, side)
+		tpDist = math.Abs(tpPrice - entryPrice)
+		slDist = tpDist / 2
+	}
+
+	slDistBase = slDist
+	tpDistBase = tpDist
+
+	slFeeFloorApplied := false
+	if feeBuf > 0 && slDist < feeBuf*slFeeFloorMult {
+		slDist = feeBuf * slFeeFloorMult
+		slFeeFloorApplied = true
+	}
+	slDistFeeFloor := slDist
+
+	tpDistMinProfit := tpDist
+	if tpDist < minProfitDistance {
+		tpDist = minProfitDistance
+	}
+	tpDistMinProfit = tpDist
+
+	targetRR := t.targetRR(regime)
+	dynamicRRApplied := false
+	if slDist > 0 {
+		rr := tpDist / slDist
+		if rr < targetRR {
+			tpDist = slDist * targetRR
+			dynamicRRApplied = true
+		}
+	}
+	tpDistDynamicRR := tpDist
+
+	cap := 0.0
+	capApplied := false
+	if atr > 0 {
+		var capped bool
+		tpDist, cap, capped = t.clampTPDistWithAtr(tpDist, atr, regime)
+		capApplied = capped
+	}
+	tpDistCapped := tpDist
+
+	tpFeeFloorApplied := false
+	if feeBuf > 0 && tpDist < feeBuf*tpFeeFloorMult {
+		tpDist = feeBuf * tpFeeFloorMult
+		tpFeeFloorApplied = true
+	}
+	tpDistFeeFloor := tpDist
+
+	return tpslCalcDetails{
+		entry:             entryPrice,
+		side:              side,
+		regime:            regime,
+		atr:               atr,
+		slDist:            slDist,
+		tpDist:            tpDist,
+		slDistBase:        slDistBase,
+		slDistFeeFloor:    slDistFeeFloor,
+		tpDistBase:        tpDistBase,
+		tpDistMinProfit:   tpDistMinProfit,
+		tpDistDynamicRR:   tpDistDynamicRR,
+		tpDistCapped:      tpDistCapped,
+		tpDistFeeFloor:    tpDistFeeFloor,
+		feeBuffer:         feeBuf,
+		targetRR:          targetRR,
+		cap:               cap,
+		minProfitDistance: minProfitDistance,
+		dynamicRRApplied:  dynamicRRApplied,
+		capApplied:        capApplied,
+		slFeeFloorApplied: slFeeFloorApplied,
+		tpFeeFloorApplied: tpFeeFloorApplied,
+		regimeFactor:      regimeFactor,
+	}
+}
+
+func (t *Trader) buildIndicatorSnapshot(closesCopy []float64) models.IndicatorSnapshot {
 	cls := closesCopy[len(closesCopy)-1]
 	recent := closesCopy
 	if len(recent) > t.Config.SmaLen && t.Config.SmaLen > 0 {
@@ -732,7 +1107,8 @@ func (t *Trader) buildIndicatorSnapshot(closesCopy []float64) indicatorSnapshot 
 	bbUpper, bbMiddle, bbLower := indicators.CalculateBollingerBands(closesCopy, 20, 2.0)
 	htfBias := t.higherTimeframeBias(atr)
 
-	return indicatorSnapshot{
+	return models.IndicatorSnapshot{
+		Time:       time.Now(),
 		Close:      cls,
 		SMA:        smaVal,
 		RSI:        rsi,
@@ -882,7 +1258,15 @@ func (t *Trader) SMAMovingAverageWorker() {
 		return false
 	}
 
+	lastCandleSeq := uint64(0)
+
 	for range ticker.C {
+		candleSeq := t.State.CandleSeq.Load()
+		if candleSeq == 0 || candleSeq == lastCandleSeq {
+			continue
+		}
+		lastCandleSeq = candleSeq
+
 		if len(t.State.Closes) < t.Config.SmaLen {
 			t.Logger.Debug("SMA worker waiting: have %d candles, need %d", len(t.State.Closes), t.Config.SmaLen)
 			continue
@@ -890,6 +1274,9 @@ func (t *Trader) SMAMovingAverageWorker() {
 
 		closesCopy := append([]float64(nil), t.State.Closes...)
 		snap := t.buildIndicatorSnapshot(closesCopy)
+		t.State.StatusLock.Lock()
+		t.State.LastIndicators = snap
+		t.State.StatusLock.Unlock()
 		baseDeadband := 0.005
 		if t.State.MarketRegime == "trend" {
 			baseDeadband = 0.01
@@ -1045,8 +1432,22 @@ func (t *Trader) SMAMovingAverageWorker() {
 			Contribs:   contrib[dir],
 			HighConf:   highConf,
 			ClosePrice: snap.Close,
+			CandleSeq:  candleSeq,
 			Time:       time.Now(),
 		}
+		contribCopy := append([]string(nil), sig.Contribs...)
+		t.State.StatusLock.Lock()
+		t.State.LastSignal = models.SignalSnapshot{
+			Kind:       sig.Kind,
+			Direction:  sig.Direction,
+			Strength:   sig.Strength,
+			Contribs:   contribCopy,
+			HighConf:   sig.HighConf,
+			ClosePrice: sig.ClosePrice,
+			CandleSeq:  sig.CandleSeq,
+			Time:       sig.Time,
+		}
+		t.State.StatusLock.Unlock()
 
 		select {
 		case t.State.SigChan <- sig:
@@ -1118,6 +1519,7 @@ func (t *Trader) closeOppositePosition(newSide string) {
 func (t *Trader) Trader() {
 	signalStrength := map[string]int{"LONG": 0, "SHORT": 0}
 	lastDirection := ""
+	lastCandleSeq := uint64(0)
 	grace := time.Duration(t.Config.GracePeriodSec) * time.Second
 	priceBufMult := t.Config.MinReentryFeeBufferMult
 	if priceBufMult <= 0 {
@@ -1125,9 +1527,21 @@ func (t *Trader) Trader() {
 	}
 
 	for sig := range t.State.SigChan {
+		if sig.CandleSeq != 0 && sig.CandleSeq != lastCandleSeq {
+			t.resetSignalStrength(&signalStrength)
+			if t.Config.Debug {
+				t.Logger.Debug("New candle seq=%d: reset signal strength", sig.CandleSeq)
+			}
+			lastCandleSeq = sig.CandleSeq
+		}
+
 		dir := t.PositionManager.NormalizeSide(sig.Direction)
 		if dir == "" {
 			continue
+		}
+
+		if t.Config.Debug {
+			t.Logger.Debug("Signal received: dir=%s strength=%d highConf=%t close=%.2f candleSeq=%d", dir, sig.Strength, sig.HighConf, sig.ClosePrice, sig.CandleSeq)
 		}
 
 		now := time.Now()
@@ -1139,7 +1553,13 @@ func (t *Trader) Trader() {
 		lastEntryPrice := t.State.LastEntryPrice
 		lastExitAt := t.State.LastExitAt
 		lastExitDir := t.State.LastExitDir
+		lastEntryDir := t.State.LastEntryDir
 		t.State.RUnlock()
+
+		if t.Config.Debug {
+			t.Logger.Debug("Position before signal: exists=%t side=%s lastEntryDir=%s lastEntryAt=%s lastExitDir=%s lastExitAt=%s",
+				exists, posSide, lastEntryDir, lastEntryAt, lastExitDir, lastExitAt)
+		}
 
 		entryForDelta := lastEntryPrice
 		if entryForDelta == 0 {
@@ -1151,52 +1571,78 @@ func (t *Trader) Trader() {
 		feeBuf := t.feeBuffer(entryForDelta)
 		minDelta := feeBuf * priceBufMult
 
+		graceOk := true
 		if exists && grace > 0 && !lastEntryAt.IsZero() && now.Sub(lastEntryAt) < grace {
+			graceOk = false
 			if t.Config.Debug {
-				t.Logger.Debug("Skipping %s: within grace period (%s since entry)", dir, now.Sub(lastEntryAt).String())
+				t.Logger.Debug("Filter graceOk=false dir=%s sinceEntry=%s grace=%s", dir, now.Sub(lastEntryAt).String(), grace)
 			}
 			continue
 		}
 
+		minDeltaOk := true
 		if minDelta > 0 {
 			if !exists && !lastExitAt.IsZero() && dir == lastExitDir && math.Abs(sig.ClosePrice-entryForDelta) < minDelta {
+				minDeltaOk = false
 				if t.Config.Debug {
-					t.Logger.Debug("Skipping %s: price delta %.2f < min %.2f since last exit", dir, math.Abs(sig.ClosePrice-entryForDelta), minDelta)
+					t.Logger.Debug("Filter minDeltaOk=false dir=%s delta=%.2f min=%.2f since last exit", dir, math.Abs(sig.ClosePrice-entryForDelta), minDelta)
 				}
 				continue
 			}
 			if exists && posSide != "" && dir != posSide && math.Abs(sig.ClosePrice-entryForDelta) < minDelta {
+				minDeltaOk = false
 				if t.Config.Debug {
-					t.Logger.Debug("Skipping flip %s→%s: price delta %.2f < min %.2f", posSide, dir, math.Abs(sig.ClosePrice-entryForDelta), minDelta)
+					t.Logger.Debug("Filter minDeltaOk=false dir=%s flip=%s->%s delta=%.2f min=%.2f", dir, posSide, dir, math.Abs(sig.ClosePrice-entryForDelta), minDelta)
 				}
 				continue
 			}
 		}
 
-		signalStrength[dir] += sig.Strength
-
 		// Re-entry cooldown to avoid noisy flips
+		cooldownOk := true
 		cooldown := time.Duration(t.Config.ReentryCooldownSec) * time.Second
 		if cooldown > 0 && !sig.HighConf && !sig.Time.IsZero() && !lastExitAt.IsZero() && dir == lastExitDir {
 			if sig.Time.Sub(lastExitAt) < cooldown {
-				t.Logger.Debug("Skipping %s due to re-entry cooldown (last exit %s ago)", dir, time.Since(lastExitAt).String())
+				cooldownOk = false
+				if t.Config.Debug {
+					t.Logger.Debug("Filter cooldownOk=false dir=%s sinceExit=%s cooldown=%s", dir, sig.Time.Sub(lastExitAt).String(), cooldown)
+				}
+				continue
+			}
+		}
+
+		duplicateOk := true
+		// Allow repeated signals unless we already have an open position on that side
+		if dir == lastDirection && !sig.HighConf {
+			if exists && posSide == dir {
+				duplicateOk = false
+				if t.Config.Debug {
+					t.Logger.Debug("Filter duplicateOk=false dir=%s posSide=%s lastDirection=%s", dir, posSide, lastDirection)
+				}
 				continue
 			}
 		}
 
 		if t.Config.Debug {
-			t.Logger.Debug("Signal strength: %v", signalStrength)
+			t.Logger.Debug("Filters ok: graceOk=%t minDeltaOk=%t cooldownOk=%t duplicateOk=%t", graceOk, minDeltaOk, cooldownOk, duplicateOk)
 		}
 
-		// Allow repeated signals unless we already have an open position on that side
-		if dir == lastDirection && !sig.HighConf {
-			exists, side, _, _, _ := t.PositionManager.HasOpenPosition()
-			if !exists || t.PositionManager.NormalizeSide(side) != dir {
-				// let it pass to open/flip
-			} else {
-				t.Logger.Debug("Skipping duplicate direction %s while position active", dir)
-				continue
-			}
+		obOK, obReason := t.CheckOrderbookStrength(dir, sig.ClosePrice)
+		if t.Config.Debug {
+			t.Logger.Debug("Orderbook check: ok=%t reason=%s", obOK, obReason)
+		}
+		if !obOK {
+			continue
+		}
+
+		strengthBeforeLong := signalStrength["LONG"]
+		strengthBeforeShort := signalStrength["SHORT"]
+		signalStrength[dir] += sig.Strength
+		strengthAfterLong := signalStrength["LONG"]
+		strengthAfterShort := signalStrength["SHORT"]
+		if t.Config.Debug {
+			t.Logger.Debug("Signal strength update: dir=%s before(L/S)=%d/%d +%d => after(L/S)=%d/%d",
+				dir, strengthBeforeLong, strengthBeforeShort, sig.Strength, strengthAfterLong, strengthAfterShort)
 		}
 
 		threshold := t.Config.SignalStrengthThreshold
@@ -1204,13 +1650,12 @@ func (t *Trader) Trader() {
 			threshold = 1
 		}
 
-		obOK, obReason := t.CheckOrderbookStrength(dir, sig.ClosePrice)
-		if !obOK {
-			t.Logger.Debug("Orderbook rejected %s at trader stage: %s", dir, obReason)
-			continue
+		if t.Config.Debug {
+			t.Logger.Debug("Signal threshold: dir=%s strength=%d threshold=%d highConf=%t", dir, signalStrength[dir], threshold, sig.HighConf)
 		}
 
 		// Process LONG signal with proper conflict resolution
+		action := ""
 		if dir == "LONG" && signalStrength["LONG"] >= threshold {
 			if t.Config.Debug {
 				t.Logger.Debug("Confirmed LONG signal: strength=%d (threshold=%d) highConf=%t", signalStrength["LONG"], threshold, sig.HighConf)
@@ -1225,6 +1670,7 @@ func (t *Trader) Trader() {
 			t.HandleLongSignal(sig.ClosePrice)
 			lastDirection = "LONG"
 			t.resetSignalStrength(&signalStrength)
+			action = "LONG"
 		} else if dir == "SHORT" && signalStrength["SHORT"] >= threshold {
 			if t.Config.Debug {
 				t.Logger.Debug("Confirmed SHORT signal: strength=%d (threshold=%d) highConf=%t", signalStrength["SHORT"], threshold, sig.HighConf)
@@ -1239,6 +1685,12 @@ func (t *Trader) Trader() {
 			t.HandleShortSignal(sig.ClosePrice)
 			lastDirection = "SHORT"
 			t.resetSignalStrength(&signalStrength)
+			action = "SHORT"
+		}
+
+		if action != "" && t.Config.Debug {
+			existsAfter, sideAfter, _, _, _ := t.PositionManager.HasOpenPosition()
+			t.Logger.Debug("Position after %s signal: exists=%t side=%s", action, existsAfter, t.PositionManager.NormalizeSide(sideAfter))
 		}
 	}
 }
@@ -1254,15 +1706,30 @@ func (t *Trader) SyncPositionRealTime() {
 	t.Logger.Info("Starting trailing stop logic...")
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
+	var lastTPSLAttempt time.Time
 
 	for range ticker.C {
 		// Current position
 		exists, side, qty, tp, sl := t.PositionManager.HasOpenPosition()
-		if !exists || tp == 0 {
+		if !exists {
 			continue
 		}
 		entry := t.PositionManager.GetLastEntryPrice()
 		if entry == 0 {
+			continue
+		}
+		if tp <= 0 || sl <= 0 {
+			if !lastTPSLAttempt.IsZero() && time.Since(lastTPSLAttempt) < 10*time.Second {
+				continue
+			}
+			lastTPSLAttempt = time.Now()
+			tpNew, slNew := t.calculateInitialTPSL(entry, side)
+			t.Logger.Info("Missing TP/SL detected for %s position, setting TP %.2f SL %.2f", side, tpNew, slNew)
+			if err := t.PositionManager.UpdatePositionTPSL(t.Config.Symbol, tpNew, slNew); err != nil {
+				t.Logger.Error("Error setting missing TP/SL: %v", err)
+			} else {
+				t.Logger.Info("TP/SL placed ▶ TP %.2f  SL %.2f", tpNew, slNew)
+			}
 			continue
 		}
 
@@ -1301,8 +1768,11 @@ func (t *Trader) SyncPositionRealTime() {
 			risk = math.Abs(dist) / 2 // fall back to 1R = half the TP distance
 		}
 
+		minTightenProg := t.Config.PartialTakeProfitProgress
+		allowTighten := minTightenProg <= 0 || prog >= minTightenProg
+
 		// Move SL to breakeven only when price has covered fees
-		if prog >= t.Config.BreakevenProgress {
+		if allowTighten && prog >= t.Config.BreakevenProgress {
 			lockStep := risk * 0.2 // lock 0.2R once in profit
 			if side == "LONG" && price-entry >= feeBuf {
 				target := math.Max(entry+feeBuf, entry+lockStep)
@@ -1357,6 +1827,9 @@ func (t *Trader) SyncPositionRealTime() {
 		}
 
 		if t.Config.DisableTrailing {
+			continue
+		}
+		if !allowTighten {
 			continue
 		}
 
@@ -1444,6 +1917,7 @@ func (t *Trader) OnClosedCandle(kline models.KlineData) {
 		t.State.Volumes = append(t.State.Volumes, vol)
 	}
 	t.State.HTFCloses = append(t.State.HTFCloses, closePrice)
+	t.State.CandleSeq.Add(1)
 	t.Logger.Debug("Candle appended: closes=%d highs=%d lows=%d volumes=%d", len(t.State.Closes), len(t.State.Highs), len(t.State.Lows), len(t.State.Volumes))
 
 	if t.Config.Debug {
