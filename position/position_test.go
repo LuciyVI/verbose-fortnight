@@ -111,7 +111,7 @@ func TestHasOpenPositionNone(t *testing.T) {
 	}
 }
 
-func TestUpdatePositionTPSLUsesPositionIdxForShort(t *testing.T) {
+func TestUpdatePositionTPSLUsesPositionIdxZero(t *testing.T) {
 	list := []map[string]string{
 		{
 			"side":       "Sell",
@@ -133,8 +133,8 @@ func TestUpdatePositionTPSLUsesPositionIdxForShort(t *testing.T) {
 	if err := json.Unmarshal(buf.Bytes(), &body); err != nil {
 		t.Fatalf("unmarshal body: %v", err)
 	}
-	if idx, ok := body["positionIdx"].(float64); !ok || idx != 1 {
-		t.Fatalf("positionIdx=%v want 1", body["positionIdx"])
+	if idx, ok := body["positionIdx"].(float64); !ok || idx != 0 {
+		t.Fatalf("positionIdx=%v want 0", body["positionIdx"])
 	}
 	if body["takeProfit"] != "90.00" || body["stopLoss"] != "110.00" {
 		t.Fatalf("takeProfit/stopLoss unexpected: %v", body)

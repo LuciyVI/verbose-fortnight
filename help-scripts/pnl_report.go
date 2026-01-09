@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -64,17 +65,30 @@ func parseTimeMs(msStr string) time.Time {
 	return time.Unix(ms, 0)
 }
 
-func calcFee(item closedPnlItem) float64 {
+func calcFee(item closedPnlItem, fallbackFeePerc, entry, exit, qty float64) float64 {
 	fee := parseFloat(item.ExecFee)
 	if fee == 0 {
 		fee = parseFloat(item.CumEntryFee) + parseFloat(item.CumExitFee)
+	}
+	if fee == 0 && fallbackFeePerc > 0 && qty > 0 {
+		price := entry
+		if price == 0 {
+			price = exit
+		} else if exit > 0 {
+			price = (entry + exit) / 2
+		}
+		notional := math.Abs(price * qty)
+		fee = notional * fallbackFeePerc
+	}
+	if fee < 0 {
+		fee = -fee
 	}
 	return fee
 }
 
 func calcPnl(side string, entry, exit, qty, fee float64) float64 {
 	pnl := (exit - entry) * qty
-	if strings.EqualFold(side, "Sell") {
+	if strings.EqualFold(side, "sell") || strings.EqualFold(side, "short") {
 		pnl = (entry - exit) * qty
 	}
 	return pnl - fee
@@ -228,7 +242,7 @@ func main() {
 		qty := parseFloat(it.Qty)
 		entry := parseFloat(it.AvgEntryPrice)
 		exit := parseFloat(it.AvgExitPrice)
-		fee := calcFee(it)
+		fee := calcFee(it, cfg.RoundTripFeePerc, entry, exit, qty)
 		pnl := calcPnl(it.Side, entry, exit, qty, fee)
 		closedPnl := parseFloat(it.CurPnl)
 

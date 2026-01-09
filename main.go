@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -22,6 +23,7 @@ import (
 	"verbose-fortnight/daemon"
 	"verbose-fortnight/logging"
 	"verbose-fortnight/models"
+	"verbose-fortnight/status"
 	"verbose-fortnight/strategy"
 )
 
@@ -290,7 +292,7 @@ func applyDelta(state *models.State, bids, asks [][]string) {
 }
 
 // WalletListener listens to wallet updates
-func walletListener(ws *websocket.Conn, out chan<- []byte, done chan<- struct{}, state *models.State) {
+func walletListener(ws *websocket.Conn, out chan<- []byte, done chan<- struct{}, state *models.State, symbol string) {
 	logInfo("Starting wallet listener to receive messages from exchange")
 
 	for {
@@ -309,24 +311,7 @@ func walletListener(ws *websocket.Conn, out chan<- []byte, done chan<- struct{},
 		}
 		if json.Unmarshal(msg, &peek) == nil && peek.Topic == "position" {
 			logInfo("Received position update from exchange: %s", string(msg))
-			var posUpdate struct {
-				Data struct {
-					Side string `json:"side"`
-					Size string `json:"size"`
-				} `json:"data"`
-			}
-			if json.Unmarshal(msg, &posUpdate) == nil {
-				size, _ := strconv.ParseFloat(posUpdate.Data.Size, 64)
-				if size > 0 {
-					state.PosSide = normalizeSide(posUpdate.Data.Side)
-					state.OrderQty = size
-					logInfo("Position updated: Side=%s, Size=%.4f", state.PosSide, state.OrderQty)
-				} else {
-					state.PosSide = ""
-					state.OrderQty = 0
-					logInfo("Position closed")
-				}
-			}
+			updatePositionFromMessage(state, symbol, msg)
 		}
 		out <- msg
 	}
@@ -342,6 +327,93 @@ func normalizeSide(side string) string {
 	default:
 		return ""
 	}
+}
+
+type positionItem struct {
+	Symbol     string `json:"symbol"`
+	Side       string `json:"side"`
+	Size       string `json:"size"`
+	TakeProfit string `json:"takeProfit"`
+	StopLoss   string `json:"stopLoss"`
+	AvgPrice   string `json:"avgPrice"`
+}
+
+func updatePositionFromMessage(state *models.State, symbol string, raw []byte) {
+	var envelope struct {
+		Data json.RawMessage `json:"data"`
+	}
+	if json.Unmarshal(raw, &envelope) != nil || len(envelope.Data) == 0 {
+		return
+	}
+
+	var items []positionItem
+	if json.Unmarshal(envelope.Data, &items) == nil {
+		for _, item := range items {
+			if symbol != "" && item.Symbol != "" && item.Symbol != symbol {
+				continue
+			}
+			applyPositionItem(state, item)
+		}
+		return
+	}
+
+	var item positionItem
+	if json.Unmarshal(envelope.Data, &item) != nil {
+		return
+	}
+	if symbol != "" && item.Symbol != "" && item.Symbol != symbol {
+		return
+	}
+	applyPositionItem(state, item)
+}
+
+func applyPositionItem(state *models.State, item positionItem) {
+	size := parseFloat(item.Size)
+	side := normalizeSide(item.Side)
+	tp := parseFloat(item.TakeProfit)
+	sl := parseFloat(item.StopLoss)
+	entry := parseFloat(item.AvgPrice)
+	now := time.Now()
+
+	if size <= 0 {
+		side = ""
+		size = 0
+		entry = 0
+		tp = 0
+		sl = 0
+	}
+
+	state.StatusLock.Lock()
+	state.LastPosition = models.PositionSnapshot{
+		Side:       side,
+		Size:       size,
+		EntryPrice: entry,
+		TakeProfit: tp,
+		StopLoss:   sl,
+		UpdatedAt:  now,
+	}
+	state.StatusLock.Unlock()
+
+	if size > 0 {
+		state.PosSide = side
+		state.OrderQty = size
+		logInfo("Position updated: Side=%s, Size=%.4f TP=%.2f SL=%.2f", side, size, tp, sl)
+	} else {
+		state.PosSide = ""
+		state.OrderQty = 0
+		logInfo("Position closed")
+	}
+}
+
+func parseFloat(raw string) float64 {
+	if raw == "" {
+		return 0
+	}
+	val, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return 0
+	}
+	return val
 }
 
 func main() {
@@ -455,7 +527,7 @@ func main() {
 
 	walletChan := make(chan []byte, 16)
 	walletDone := make(chan struct{})
-	go walletListener(privConn, walletChan, walletDone, state)
+	go walletListener(privConn, walletChan, walletDone, state, cfg.Symbol)
 
 	// Connect to public WebSocket
 	pubWSURL := cfg.DemoWSPublicURL
@@ -519,6 +591,7 @@ func main() {
 
 	// Create trader
 	trader := strategy.NewTrader(apiClient, cfg, state, logger)
+	statusServer := status.StartServer(cfg, state, logger)
 
 	// Start indicator and trading goroutines
 	go trader.SMAMovingAverageWorker()
@@ -622,7 +695,7 @@ func main() {
 				if privConn, err = connectPrivateWS(apiClient, state); err == nil {
 					logInfo("Successfully reconnected to private WebSocket")
 					walletDone = make(chan struct{})
-					go walletListener(privConn, walletChan, walletDone, state)
+					go walletListener(privConn, walletChan, walletDone, state, cfg.Symbol)
 					break
 				}
 				logError("Private reconnect #%d: %v", retry, err)
@@ -646,6 +719,11 @@ func main() {
 			}
 
 			// Perform cleanup operations
+			if statusServer != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				_ = statusServer.Shutdown(ctx)
+				cancel()
+			}
 			if err := logger.Sync(); err != nil {
 				logError("Error syncing logger: %v", err)
 			}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -45,5 +46,28 @@ func TestFetchClosedPnlPagination(t *testing.T) {
 	}
 	if items[0].Side != "Buy" || items[1].Side != "Sell" {
 		t.Fatalf("unexpected items: %#v", items)
+	}
+}
+
+func TestCalcPnlDirection(t *testing.T) {
+	cases := []struct {
+		side  string
+		entry float64
+		exit  float64
+		qty   float64
+		fee   float64
+		want  float64
+	}{
+		{side: "Buy", entry: 100, exit: 110, qty: 1, fee: 0, want: 10},
+		{side: "Sell", entry: 100, exit: 90, qty: 1, fee: 0, want: 10},
+		{side: "Sell", entry: 100, exit: 90, qty: 1, fee: 1, want: 9},
+		{side: "SHORT", entry: 100, exit: 105, qty: 1, fee: 0, want: -5},
+	}
+
+	for _, tc := range cases {
+		got := calcPnl(tc.side, tc.entry, tc.exit, tc.qty, tc.fee)
+		if math.Abs(got-tc.want) > 1e-9 {
+			t.Fatalf("calcPnl(%s) got %.6f want %.6f", tc.side, got, tc.want)
+		}
 	}
 }

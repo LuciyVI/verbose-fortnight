@@ -26,9 +26,9 @@ type TPJob struct {
 
 // SignalDetails represents details of a single signal
 type SignalDetails struct {
-	Kind  string  // "SMA_LONG", "MACD_LONG", etc.
-	Weight int    // Weight of this signal
-	Value float64 // Additional value if needed e.g., indicator value
+	Kind   string  // "SMA_LONG", "MACD_LONG", etc.
+	Weight int     // Weight of this signal
+	Value  float64 // Additional value if needed e.g., indicator value
 }
 
 // Signal represents a trading signal
@@ -39,17 +39,56 @@ type Signal struct {
 	Contribs   []string // names of indicators that fired
 	HighConf   bool     // high-confidence, bypass normal confirmation rules
 	ClosePrice float64  // цена закрытия свечи
+	CandleSeq  uint64   // monotonic sequence of closed candles
 	Time       time.Time
 }
 
 // ConsolidatedSignal represents a consolidated trading signal with multiple confirmations
 type ConsolidatedSignal struct {
-	Kind           string          // Overall signal type: "LONG" or "SHORT"
-	ClosePrice     float64         // Current close price
-	Time           time.Time
-	SignalDetails  []SignalDetails // All contributing signals
-	TotalWeight    int             // Total weight of all contributing signals
-	SignalSource   string          // Source of the signal: "consolidated" or "original"
+	Kind          string  // Overall signal type: "LONG" or "SHORT"
+	ClosePrice    float64 // Current close price
+	Time          time.Time
+	SignalDetails []SignalDetails // All contributing signals
+	TotalWeight   int             // Total weight of all contributing signals
+	SignalSource  string          // Source of the signal: "consolidated" or "original"
+}
+
+// SignalSnapshot holds the latest emitted signal details for status reporting.
+type SignalSnapshot struct {
+	Kind       string    `json:"kind"`
+	Direction  string    `json:"direction"`
+	Strength   int       `json:"strength"`
+	Contribs   []string  `json:"contribs,omitempty"`
+	HighConf   bool      `json:"highConf"`
+	ClosePrice float64   `json:"closePrice"`
+	CandleSeq  uint64    `json:"candleSeq"`
+	Time       time.Time `json:"time"`
+}
+
+// IndicatorSnapshot holds the latest indicator values for status reporting.
+type IndicatorSnapshot struct {
+	Time       time.Time `json:"time"`
+	Close      float64   `json:"close"`
+	SMA        float64   `json:"sma"`
+	RSI        float64   `json:"rsi"`
+	MACDLine   float64   `json:"macdLine"`
+	MACDSignal float64   `json:"macdSignal"`
+	MACDHist   float64   `json:"macdHist"`
+	ATR        float64   `json:"atr"`
+	BBUpper    float64   `json:"bbUpper"`
+	BBMiddle   float64   `json:"bbMiddle"`
+	BBLower    float64   `json:"bbLower"`
+	HTFBias    string    `json:"htfBias,omitempty"`
+}
+
+// PositionSnapshot holds the last known position details for status reporting.
+type PositionSnapshot struct {
+	Side       string    `json:"side"`
+	Size       float64   `json:"size"`
+	EntryPrice float64   `json:"entryPrice"`
+	TakeProfit float64   `json:"takeProfit"`
+	StopLoss   float64   `json:"stopLoss"`
+	UpdatedAt  time.Time `json:"updatedAt"`
 }
 
 // OrderbookMsg represents orderbook message
@@ -125,6 +164,7 @@ type State struct {
 	Lows      []float64
 	Volumes   []float64
 	HTFCloses []float64
+	CandleSeq atomic.Uint64
 
 	// Longer-term data for higher-order trend filter
 	LongTermCloses []float64
@@ -160,16 +200,16 @@ type State struct {
 	LastEntryDir   string
 
 	// Volume tracking
-	RecentVolumes  []float64 // Store recent volumes for calculating average/surge detection
+	RecentVolumes []float64 // Store recent volumes for calculating average/surge detection
 
 	// Position tracking for partial profits
-	PartialTPTriggered bool  // Flag to indicate if partial profit has been taken
-	PartialTPPrice     float64  // Price at which partial profit was triggered
+	PartialTPTriggered bool    // Flag to indicate if partial profit has been taken
+	PartialTPPrice     float64 // Price at which partial profit was triggered
 
 	// Re-entry tracking
-	LastExitPrice      float64  // Price at which the last position was closed
-	LastExitTime       time.Time // Time at which the last position was closed
-	LastExitSide       string    // Side of the last closed position ("LONG" or "SHORT")
+	LastExitPrice float64   // Price at which the last position was closed
+	LastExitTime  time.Time // Time at which the last position was closed
+	LastExitSide  string    // Side of the last closed position ("LONG" or "SHORT")
 
 	// Multi-timeframe analysis
 	HigherTimeframeCloses []float64 // Closes for higher timeframe (e.g., 5-min candles aggregated from 1-min)
@@ -179,16 +219,22 @@ type State struct {
 	LastHTFUpdateTime     time.Time // Time of last higher timeframe candle update
 
 	// Divergence tracking
-	PreviousPrices         []float64  // Previous prices for divergence detection
-	PreviousRSIValues      []float64  // Previous RSI values for divergence detection
-	PreviousMACDValues     []float64  // Previous MACD values for divergence detection
-	PreviousMACDSignalValues []float64  // Previous MACD signal values for divergence detection
+	PreviousPrices           []float64 // Previous prices for divergence detection
+	PreviousRSIValues        []float64 // Previous RSI values for divergence detection
+	PreviousMACDValues       []float64 // Previous MACD values for divergence detection
+	PreviousMACDSignalValues []float64 // Previous MACD signal values for divergence detection
 
 	// Partial profit and trailing tracking
-	ActiveTrailingPositions map[string]bool  // Track which positions are in trailing mode
-	PartialProfitTriggers   map[string]bool  // Track if partial profit has been triggered
-	TrailingStopLevels      map[string]float64 // Current trailing stop levels for positions
+	ActiveTrailingPositions  map[string]bool    // Track which positions are in trailing mode
+	PartialProfitTriggers    map[string]bool    // Track if partial profit has been triggered
+	TrailingStopLevels       map[string]float64 // Current trailing stop levels for positions
 	TrailingTakeProfitLevels map[string]float64 // Current trailing TP levels for positions
+
+	// Status snapshots for external reporting
+	StatusLock     sync.RWMutex
+	LastSignal     SignalSnapshot
+	LastIndicators IndicatorSnapshot
+	LastPosition   PositionSnapshot
 
 	// Channels
 	TPChan          chan TPJob

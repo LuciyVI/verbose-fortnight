@@ -73,12 +73,28 @@ func (pm *PositionManager) HasOpenPosition() (bool, string, float64, float64, fl
 			tp, _ := strconv.ParseFloat(takeProfit, 64)
 			sl, _ := strconv.ParseFloat(stopLoss, 64)
 			side := pm.NormalizeSide(res.Side)
+			entry, _ := strconv.ParseFloat(res.AvgPrice, 64)
 
 			pm.Logger.Info("Found open position: Side=%s, Size=%.4f, TP=%.2f, SL=%.2f", side, size, tp, sl)
+			pm.State.StatusLock.Lock()
+			pm.State.LastPosition = models.PositionSnapshot{
+				Side:       side,
+				Size:       size,
+				EntryPrice: entry,
+				TakeProfit: tp,
+				StopLoss:   sl,
+				UpdatedAt:  time.Now(),
+			}
+			pm.State.StatusLock.Unlock()
 			return true, side, size, tp, sl
 		}
 	}
 	pm.Logger.Info("No open positions found")
+	pm.State.StatusLock.Lock()
+	pm.State.LastPosition = models.PositionSnapshot{
+		UpdatedAt: time.Now(),
+	}
+	pm.State.StatusLock.Unlock()
 	return false, "", 0, 0, 0
 }
 
@@ -101,14 +117,9 @@ func (pm *PositionManager) GetLastEntryPrice() float64 {
 
 // UpdatePositionTPSL updates the TP/SL for a position
 func (pm *PositionManager) UpdatePositionTPSL(symbol string, tp, sl float64) error {
-	exists, side, _, _, _ := pm.HasOpenPosition()
+	exists, _, _, _, _ := pm.HasOpenPosition()
 	if !exists {
 		return fmt.Errorf("no open position to update TP/SL")
-	}
-
-	positionIdx := 0
-	if pm.NormalizeSide(side) == "SHORT" {
-		positionIdx = 1
 	}
 
 	const path = "/v5/position/trading-stop"
@@ -117,16 +128,16 @@ func (pm *PositionManager) UpdatePositionTPSL(symbol string, tp, sl float64) err
 		"symbol":      symbol,
 		"takeProfit":  fmt.Sprintf("%.2f", tp),
 		"stopLoss":    fmt.Sprintf("%.2f", sl),
-		"positionIdx": positionIdx,
+		"positionIdx": 0,
 		"tpslMode":    "Full",
 	}
 
 	raw, _ := json.Marshal(body)
 	ts := fmt.Sprintf("%d", time.Now().UnixMilli())
-	
+
 	// Log outgoing request
 	pm.Logger.Info("Sending POST request to exchange: %s, Body: %s", path, string(raw))
-	
+
 	req, _ := http.NewRequest("POST", pm.Config.DemoRESTHost+path, bytes.NewReader(raw))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-BAPI-API-KEY", pm.Config.APIKey)
@@ -143,10 +154,10 @@ func (pm *PositionManager) UpdatePositionTPSL(symbol string, tp, sl float64) err
 	defer resp.Body.Close()
 
 	reply, _ := io.ReadAll(resp.Body)
-	
+
 	// Log incoming response
 	pm.Logger.Info("Received response from exchange for %s: Status %d, Body: %s", path, resp.StatusCode, string(reply))
-	
+
 	var r struct {
 		RetCode int    `json:"retCode"`
 		RetMsg  string `json:"retMsg"`
@@ -190,7 +201,7 @@ func (pm *PositionManager) CancelAllOrders(symbol string) {
 func (pm *PositionManager) GetLastBidPrice() float64 {
 	pm.State.ObLock.Lock()
 	defer pm.State.ObLock.Unlock()
-	
+
 	var max float64
 	for ps := range pm.State.BidsMap {
 		p, _ := strconv.ParseFloat(ps, 64)
@@ -205,7 +216,7 @@ func (pm *PositionManager) GetLastBidPrice() float64 {
 func (pm *PositionManager) GetLastAskPrice() float64 {
 	pm.State.ObLock.Lock()
 	defer pm.State.ObLock.Unlock()
-	
+
 	var min float64
 	for ps := range pm.State.AsksMap {
 		p, _ := strconv.ParseFloat(ps, 64)
@@ -234,14 +245,14 @@ func (pm *PositionManager) CalculatePositionProfit(side string, entryPrice, exit
 	if entryPrice <= 0 || exitPrice <= 0 || qty <= 0 {
 		return 0 // Can't calculate profit without valid prices and quantity
 	}
-	
+
 	var profit float64
 	if side == "LONG" {
 		profit = (exitPrice - entryPrice) * qty
 	} else if side == "SHORT" {
 		profit = (entryPrice - exitPrice) * qty
 	}
-	
+
 	// Update state with profit information
 	pm.State.Lock()
 	pm.State.RealizedPnL += profit
@@ -251,7 +262,7 @@ func (pm *PositionManager) CalculatePositionProfit(side string, entryPrice, exit
 		pm.State.TotalLoss += math.Abs(profit)
 	}
 	pm.State.Unlock()
-	
+
 	return profit
 }
 
