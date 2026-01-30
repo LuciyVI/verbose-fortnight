@@ -1,0 +1,8 @@
+logs/
+trading_bot*.log
+trading_bot*.log.gz
+report.csv
+go-trade
+go-trade.pid
+anal/
+docs/
