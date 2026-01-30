@@ -70,6 +70,13 @@ export BYBIT_API_SECRET="your_api_secret"
 export BYBIT_DEMO_REST_HOST="https://api-demo.bybit.com"
 export BYBIT_DEMO_WS_PRIVATE="wss://stream-demo.bybit.com/v5/private"
 export BYBIT_DEMO_WS_PUBLIC="wss://stream.bybit.com/v5/public/linear"
+export ORDER_BALANCE_PCT="0.01" # 1% of USDT balance per order (0 = min size)
+
+# Dynamic TP parameters (percent units, e.g. 0.4 = 0.4%)
+export DYNAMIC_TP_K="1.0"
+export DYNAMIC_TP_VOLATILITY_FACTOR="6.0"
+export DYNAMIC_TP_MIN_PERC="0.4"
+export DYNAMIC_TP_MAX_PERC="1.8"
 ```
 
 ## Usage

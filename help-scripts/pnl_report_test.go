@@ -49,25 +49,77 @@ func TestFetchClosedPnlPagination(t *testing.T) {
 	}
 }
 
-func TestCalcPnlDirection(t *testing.T) {
-	cases := []struct {
-		side  string
-		entry float64
-		exit  float64
-		qty   float64
-		fee   float64
-		want  float64
-	}{
-		{side: "Buy", entry: 100, exit: 110, qty: 1, fee: 0, want: 10},
-		{side: "Sell", entry: 100, exit: 90, qty: 1, fee: 0, want: 10},
-		{side: "Sell", entry: 100, exit: 90, qty: 1, fee: 1, want: 9},
-		{side: "SHORT", entry: 100, exit: 105, qty: 1, fee: 0, want: -5},
-	}
+func TestCalcPnLShortProfit(t *testing.T) {
+	entry := 94000.0
+	exit := 92308.2
+	qty := 0.001
+	fee := 0.1100
 
-	for _, tc := range cases {
-		got := calcPnl(tc.side, tc.entry, tc.exit, tc.qty, tc.fee)
-		if math.Abs(got-tc.want) > 1e-9 {
-			t.Fatalf("calcPnl(%s) got %.6f want %.6f", tc.side, got, tc.want)
-		}
+	gross, net := CalcPnL("Sell", entry, exit, qty, fee)
+	if math.Abs(net-1.5818) > 1e-4 {
+		t.Fatalf("short profit net got %.4f want 1.5818", net)
+	}
+	if gross <= 0 {
+		t.Fatalf("short profit gross should be positive, got %.4f", gross)
+	}
+}
+
+func TestCalcPnLShortLoss(t *testing.T) {
+	entry := 90000.0
+	exit := 93330.0
+	qty := 0.001
+	fee := 0.1200
+
+	gross, net := CalcPnL("Sell", entry, exit, qty, fee)
+	if math.Abs(net-(-3.4500)) > 1e-4 {
+		t.Fatalf("short loss net got %.4f want -3.4500", net)
+	}
+	if gross >= 0 {
+		t.Fatalf("short loss gross should be negative, got %.4f", gross)
+	}
+}
+
+func TestCalcPnLLongProfit(t *testing.T) {
+	gross, net := CalcPnL("Buy", 100, 110, 1, 0.5)
+	if math.Abs(gross-10) > 1e-9 {
+		t.Fatalf("long profit gross got %.4f want 10.0000", gross)
+	}
+	if math.Abs(net-9.5) > 1e-9 {
+		t.Fatalf("long profit net got %.4f want 9.5000", net)
+	}
+}
+
+func TestCalcPnLLongLoss(t *testing.T) {
+	gross, net := CalcPnL("Buy", 110, 100, 1, 0.5)
+	if math.Abs(gross-(-10)) > 1e-9 {
+		t.Fatalf("long loss gross got %.4f want -10.0000", gross)
+	}
+	if math.Abs(net-(-10.5)) > 1e-9 {
+		t.Fatalf("long loss net got %.4f want -10.5000", net)
+	}
+}
+
+func TestCalcPnLZeroMove(t *testing.T) {
+	gross, net := CalcPnL("Buy", 100, 100, 1, 0.25)
+	if math.Abs(gross) > 1e-9 {
+		t.Fatalf("zero move gross got %.6f want 0", gross)
+	}
+	if math.Abs(net-(-0.25)) > 1e-9 {
+		t.Fatalf("zero move net got %.6f want -0.25", net)
+	}
+}
+
+func TestCalcGrossSymmetryBySide(t *testing.T) {
+	entry := 100.0
+	exit := 110.0
+	qty := 1.0
+
+	longGross, longNet := CalcPnL("Buy", entry, exit, qty, 0.1)
+	shortGross, shortNet := CalcPnL("Sell", entry, exit, qty, 0.1)
+	if math.Abs(longGross+shortGross) > 1e-9 {
+		t.Fatalf("expected gross symmetry, got long %.4f short %.4f", longGross, shortGross)
+	}
+	if math.Abs(longNet+shortNet+0.2) > 1e-9 {
+		t.Fatalf("expected net symmetry with fees, got long %.4f short %.4f", longNet, shortNet)
 	}
 }

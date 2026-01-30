@@ -1,8 +1,8 @@
-cat config/config.go 
 package config
 
 import (
 	"os"
+	"strconv"
 )
 
 // Config holds application configuration
@@ -21,6 +21,7 @@ type Config struct {
 	WindowSize       int
 	BbMult           float64
 	ContractSize     float64
+	OrderBalancePct  float64 // 0 uses minimum order size
 	ObDepth          int
 	TpThresholdQty   float64
 	TpOffset         float64
@@ -53,6 +54,11 @@ type Config struct {
 	MinVolume          float64
 	Debug              bool
 	DynamicTP          bool
+	// Dynamic TP configuration (percent units, e.g. 0.4 = 0.4%)
+	DynamicTPK                float64
+	DynamicTPVolatilityFactor float64
+	DynamicTPMinPerc          float64
+	DynamicTPMaxPerc          float64
 	// Signal confirmation thresholds
 	OrderbookStrengthThreshold float64
 	OrderbookLevels            int
@@ -104,6 +110,8 @@ func LoadConfig() *Config {
 		WindowSize:      20,
 		BbMult:          2.0,
 		ContractSize:    0.001,
+		// OrderBalancePct is a balance fraction: 1.0 = 100% of balance.
+		OrderBalancePct: getEnvAsFloat("ORDER_BALANCE_PCT", 1.0),
 		ObDepth:         50,
 		TpThresholdQty:  500.0,
 		TpOffset:        0.002,
@@ -136,6 +144,10 @@ func LoadConfig() *Config {
 		MinVolume:                  0,
 		Debug:                      false,
 		DynamicTP:                  false,
+		DynamicTPK:                 getEnvAsFloat("DYNAMIC_TP_K", 1.0),
+		DynamicTPVolatilityFactor:  getEnvAsFloat("DYNAMIC_TP_VOLATILITY_FACTOR", 6.0),
+		DynamicTPMinPerc:           getEnvAsFloat("DYNAMIC_TP_MIN_PERC", 0.4),
+		DynamicTPMaxPerc:           getEnvAsFloat("DYNAMIC_TP_MAX_PERC", 1.8),
 		OrderbookStrengthThreshold: 0.5,
 		OrderbookLevels:            5,
 		OrderbookMinDepth:          0,
@@ -145,9 +157,9 @@ func LoadConfig() *Config {
 		OrderbookMedianRatioMult:   0.08,
 		SignalStrengthThreshold:    3,
 		RegimePersistence:          3,
-		PartialTakeProfitRatio:     0.5,
-		PartialTakeProfitProgress:  0.33, // take first partial earlier
-		SLSetDelaySec:              1,    // delay before sending SL to avoid immediate noise
+		PartialTakeProfitRatio:     0.4, // close 40% at first target
+		PartialTakeProfitProgress:  0.6, // first target at 60% progress to TP
+		SLSetDelaySec:              1,   // delay before sending SL to avoid immediate noise
 		SLPocketPerc:               0.0005,
 		PocketFeeMult:              2.0,
 		SLFeeFloorMult:             4.0,
@@ -155,7 +167,7 @@ func LoadConfig() *Config {
 		GracePeriodSec:             45,  // do not flip/close within this time after entry
 		MinReentryFeeBufferMult:    3.0, // require at least 3x fee buffer move before re-enter/flip
 		// Logging defaults
-		LogFile:       getEnv("LOG_FILE", "trading_bot.log"),
+		LogFile:       getEnv("LOG_FILE", "logs/trading_bot.log"),
 		LogMaxSize:    10, // 10 MB
 		LogMaxBackups: 5,  // 5 backup files
 		LogMaxAge:     30, // 30 days
@@ -183,6 +195,18 @@ func getEnvAsBool(key string, defaultValue bool) bool {
 	default:
 		return false
 	}
+}
+
+func getEnvAsFloat(key string, defaultValue float64) float64 {
+	value := getEnv(key, "")
+	if value == "" {
+		return defaultValue
+	}
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return defaultValue
+	}
+	return parsed
 }
 
 func getEnv(key, defaultValue string) string {

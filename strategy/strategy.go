@@ -28,28 +28,77 @@ type Trader struct {
 }
 
 type tpslCalcDetails struct {
-	entry             float64
-	side              string
-	regime            string
-	atr               float64
-	slDist            float64
-	tpDist            float64
-	slDistBase        float64
-	slDistFeeFloor    float64
-	tpDistBase        float64
-	tpDistMinProfit   float64
-	tpDistDynamicRR   float64
-	tpDistCapped      float64
-	tpDistFeeFloor    float64
-	feeBuffer         float64
-	targetRR          float64
-	cap               float64
-	minProfitDistance float64
-	dynamicRRApplied  bool
-	capApplied        bool
-	slFeeFloorApplied bool
-	tpFeeFloorApplied bool
-	regimeFactor      float64
+	entry            float64
+	side             string
+	regime           string
+	atr              float64
+	atrPercent       float64
+	tpPercRaw        float64
+	tpPercClamped    float64
+	tpPercMin        float64
+	tpPercMax        float64
+	k                float64
+	volatilityFactor float64
+	regimeFactor     float64
+
+	tpDistBase float64
+	tpDist     float64
+}
+
+type dynamicTPDetails struct {
+	ATRPercent       float64
+	K                float64
+	VolatilityFactor float64
+	RegimeFactor     float64
+	RawPercent       float64
+	ClampedPercent   float64
+	MinPercent       float64
+	MaxPercent       float64
+}
+
+func (t *Trader) dynamicTP(entry, atr float64, regime string) dynamicTPDetails {
+	k := t.Config.DynamicTPK
+	if k <= 0 {
+		k = 1.0
+	}
+	volFactor := t.Config.DynamicTPVolatilityFactor
+	if volFactor <= 0 {
+		volFactor = 6.0
+	}
+	minPerc := t.Config.DynamicTPMinPerc
+	if minPerc <= 0 {
+		minPerc = 0.4
+	}
+	maxPerc := t.Config.DynamicTPMaxPerc
+	if maxPerc <= 0 {
+		maxPerc = 1.8
+	}
+	if maxPerc < minPerc {
+		maxPerc = minPerc
+	}
+
+	regimeFactor := t.regimeFactor(regime)
+
+	atrPerc := 0.0
+	if entry > 0 && atr > 0 {
+		atrPerc = atr / entry * 100
+	}
+	raw := k * atrPerc * volFactor * regimeFactor
+	clamped := clamp(raw, minPerc, maxPerc)
+	if math.IsNaN(clamped) || math.IsInf(clamped, 0) {
+		clamped = minPerc
+	}
+
+	return dynamicTPDetails{
+		ATRPercent:       atrPerc,
+		K:                k,
+		VolatilityFactor: volFactor,
+		RegimeFactor:     regimeFactor,
+		RawPercent:       raw,
+		ClampedPercent:   clamped,
+		MinPercent:       minPerc,
+		MaxPercent:       maxPerc,
+	}
 }
 
 // NewTrader creates a new trader instance
@@ -558,6 +607,22 @@ func (t *Trader) HandleShortSignal(closePrice float64) {
 	}
 }
 
+// roundDownToStep avoids exceeding the target notional while keeping step alignment.
+func roundDownToStep(qty, step float64) float64 {
+	if step <= 0 {
+		return qty
+	}
+	return math.Floor(qty/step+1e-9) * step
+}
+
+// roundUpToStep enforces exchange minimums while keeping step alignment.
+func roundUpToStep(qty, step float64) float64 {
+	if step <= 0 {
+		return qty
+	}
+	return math.Ceil(qty/step-1e-9) * step
+}
+
 // openPosition opens a new position
 func (t *Trader) openPosition(newSide string, price float64) {
 	t.Logger.Info("Attempting to open new position: %s @ price %.2f", newSide, price)
@@ -622,7 +687,32 @@ func (t *Trader) openPosition(newSide string, price float64) {
 	t.Logger.Info("Current balance: %.2f USDT", bal)
 
 	step := t.State.Instr.QtyStep
-	qty := math.Max(t.State.Instr.MinQty, step)
+	if step <= 0 {
+		step = t.State.Instr.MinQty
+	}
+	if step <= 0 {
+		t.Logger.Error("Invalid instrument step size: %.8f", step)
+		return
+	}
+
+	minQty := math.Max(t.State.Instr.MinQty, step)
+	minRequired := minQty
+	if price > 0 && t.State.Instr.MinNotional > 0 {
+		minNotionalQty := t.State.Instr.MinNotional / price
+		if minNotionalQty > minRequired {
+			minRequired = minNotionalQty
+		}
+	}
+	minRequired = roundUpToStep(minRequired, step)
+
+	qty := minRequired
+	if t.Config.OrderBalancePct > 0 && price > 0 {
+		targetQty := (bal * t.Config.OrderBalancePct) / price
+		qty = roundDownToStep(targetQty, step)
+		if qty < minRequired {
+			qty = minRequired
+		}
+	}
 	if bal < price*qty {
 		t.Logger.Error("Insufficient balance: %.2f USDT", bal)
 		return
@@ -674,39 +764,29 @@ func (t *Trader) openPosition(newSide string, price float64) {
 }
 
 func (t *Trader) calculateInitialTPSL(entry float64, positionSide string) (float64, float64) {
-	if !t.Config.EnableTPSLStage1 {
-		return t.calculateTPSLLegacy(entry, positionSide)
-	}
-
 	details := t.calcTPSLDetails(entry, positionSide)
 	if details.side == "" {
 		return 0, 0
 	}
 
 	minPocket := t.minPocketDistance(entry)
-	minSLDist := math.Max(minPocket, details.slDistFeeFloor)
-	minTPDist := math.Max(details.minProfitDistance, details.tpDistFeeFloor)
+	// SL is derived from TP (SLdist = TPdist/2), so the SL-side constraint we enforce here
+	// is the "pocket" distance. Fee floors and minimum profit are enforced on the TP side.
+	minSLDist := minPocket
+	requiredTPDist := math.Max(details.tpDist, 2*minSLDist)
 
-	tp := entry + details.tpDist
-	sl := entry - details.slDist
+	// 1) Calculate TP first.
+	tpDist := details.tpDist
+	ratioAdjusted := false
+	if tpDist < requiredTPDist {
+		tpDist = requiredTPDist
+		ratioAdjusted = true
+	}
+
+	tp := entry + tpDist
 	if details.side == "SHORT" {
-		tp = entry - details.tpDist
-		sl = entry + details.slDist
+		tp = entry - tpDist
 	}
-
-	pocketAdjusted := false
-	if details.side == "LONG" {
-		if entry-sl < minPocket {
-			sl = entry - minPocket
-			pocketAdjusted = true
-		}
-	} else {
-		if sl-entry < minPocket {
-			sl = entry + minPocket
-			pocketAdjusted = true
-		}
-	}
-	slDistAfterPocket := math.Abs(entry - sl)
 
 	tick := t.State.Instr.TickSize
 	if tick <= 0 {
@@ -714,41 +794,56 @@ func (t *Trader) calculateInitialTPSL(entry float64, positionSide string) (float
 	}
 
 	tpPreRound := tp
-	slPreRound := sl
 	tp = t.roundTP(entry, tp, tick, details.side)
-	sl = t.roundSL(entry, sl, tick, details.side)
-	roundingApplied := tp != tpPreRound || sl != slPreRound
-	roundingMode := "long_tp_floor_sl_floor"
-	if details.side == "SHORT" {
-		roundingMode = "short_tp_ceil_sl_ceil"
-	}
 
-	invariantAdjusted := false
-	if details.side == "LONG" {
-		if tp-entry < minTPDist {
-			need := math.Ceil((minTPDist-(tp-entry))/tick) * tick
-			tp += math.Max(need, tick)
-			invariantAdjusted = true
-		}
-		if entry-sl < minSLDist {
-			need := math.Ceil((minSLDist-(entry-sl))/tick) * tick
-			sl -= math.Max(need, tick)
-			invariantAdjusted = true
-		}
-	} else {
-		if entry-tp < minTPDist {
-			need := math.Ceil((minTPDist-(entry-tp))/tick) * tick
-			tp -= math.Max(need, tick)
-			invariantAdjusted = true
-		}
-		if sl-entry < minSLDist {
-			need := math.Ceil((minSLDist-(sl-entry))/tick) * tick
-			sl += math.Max(need, tick)
-			invariantAdjusted = true
-		}
-	}
-
+	// Ensure TP still respects minimum distance after rounding.
 	tpDistFinal := math.Abs(tp - entry)
+	if tpDistFinal < requiredTPDist {
+		need := math.Ceil((requiredTPDist-tpDistFinal)/tick) * tick
+		if details.side == "LONG" {
+			tp += math.Max(need, tick)
+		} else {
+			tp -= math.Max(need, tick)
+		}
+		tpDistFinal = math.Abs(tp - entry)
+	}
+
+	// 2) After TP is set, derive SL from TP distance: SLdist = TPdist/2.
+	sl := entry - tpDistFinal/2
+	if details.side == "SHORT" {
+		sl = entry + tpDistFinal/2
+	}
+	slPreRound := sl
+	sl = t.roundSL(entry, sl, tick, details.side)
+
+	// If rounding pulled SL too close, widen TP (and recompute SL) until pocket/floors hold.
+	invariantAdjusted := false
+	for i := 0; i < 8; i++ {
+		slDistFinal := math.Abs(entry - sl)
+		// Keep SL strictly outside the pocket after rounding.
+		if slDistFinal > minSLDist+1e-9 {
+			break
+		}
+		if details.side == "LONG" {
+			tp += 2 * tick
+		} else {
+			tp -= 2 * tick
+		}
+		invariantAdjusted = true
+		tpDistFinal = math.Abs(tp - entry)
+		sl = entry - tpDistFinal/2
+		if details.side == "SHORT" {
+			sl = entry + tpDistFinal/2
+		}
+		sl = t.roundSL(entry, sl, tick, details.side)
+	}
+
+	roundingApplied := tp != tpPreRound || sl != slPreRound
+	roundingMode := "long_tp_floor_sl_ceil"
+	if details.side == "SHORT" {
+		roundingMode = "short_tp_ceil_sl_floor"
+	}
+
 	slDistFinal := math.Abs(entry - sl)
 	tpTicks := tpDistFinal / tick
 	slTicks := slDistFinal / tick
@@ -758,32 +853,29 @@ func (t *Trader) calculateInitialTPSL(entry float64, positionSide string) (float
 	}
 
 	t.Logger.Debug(
-		"TP/SL calc entry %.2f side %s tick %.4f atr %.4f regime %s feeBuf %.4f slDist %.4f->%.4f tpDist base %.4f minProfit %.4f dynRR %.4f cap %.4f feeFloor %.4f targetRR %.2f rr %.2f pocket %.4f tp %.2f sl %.2f tpTicks %.1f slTicks %.1f flags dynRR=%t cap=%t pocket=%t slFeeFloor=%t tpFeeFloor=%t rounding=%t mode=%s invariant=%t",
+		"TP/SL calc entry %.2f side %s tick %.4f atr %.4f atrPerc %.4f%% k %.2f volF %.2f regime %s regF %.2f tpPerc raw %.4f%% clamp %.4f%% [%.4f..%.4f] tpDistBase %.4f required %.4f rr %.2f pocket %.4f tp %.2f sl %.2f tpTicks %.1f slTicks %.1f flags ratioAdj=%t rounding=%t mode=%s invariant=%t",
 		entry,
 		details.side,
 		tick,
 		details.atr,
+		details.atrPercent,
+		details.k,
+		details.volatilityFactor,
 		details.regime,
-		details.feeBuffer,
-		details.slDist,
-		slDistAfterPocket,
+		details.regimeFactor,
+		details.tpPercRaw,
+		details.tpPercClamped,
+		details.tpPercMin,
+		details.tpPercMax,
 		details.tpDistBase,
-		details.tpDistMinProfit,
-		details.tpDistDynamicRR,
-		details.tpDistCapped,
-		details.tpDistFeeFloor,
-		details.targetRR,
+		requiredTPDist,
 		actualRR,
 		minPocket,
 		tp,
 		sl,
 		tpTicks,
 		slTicks,
-		details.dynamicRRApplied,
-		details.capApplied,
-		pocketAdjusted,
-		details.slFeeFloorApplied,
-		details.tpFeeFloorApplied,
+		ratioAdjusted,
 		roundingApplied,
 		roundingMode,
 		invariantAdjusted,
@@ -793,88 +885,8 @@ func (t *Trader) calculateInitialTPSL(entry float64, positionSide string) (float
 }
 
 func (t *Trader) calculateTPSLLegacy(entryPrice float64, positionSide string) (float64, float64) {
-	side := t.PositionManager.NormalizeSide(positionSide)
-	if side == "" {
-		side = strings.ToUpper(positionSide)
-	}
-
-	atr := indicators.CalculateATR(t.State.Highs, t.State.Lows, t.State.Closes, 14)
-	regimeFactor := t.regimeFactor(t.State.MarketRegime)
-	feeBuf := t.feeBuffer(entryPrice)
-	minProfitDistance := math.Max(entryPrice*t.Config.MinProfitPerc, feeBuf*1.5)
-
-	var takeProfit float64
-	var stopLoss float64
-
-	if atr > 0 {
-		slDist := atr * t.Config.AtrSLMult * regimeFactor
-		tpDist := atr * t.Config.AtrTPMult * regimeFactor
-		minSL := entryPrice * t.Config.SlPerc
-		if slDist < minSL {
-			slDist = minSL
-		}
-		if side == "LONG" {
-			stopLoss = entryPrice - slDist
-			takeProfit = entryPrice + tpDist
-		} else {
-			stopLoss = entryPrice + slDist
-			takeProfit = entryPrice - tpDist
-		}
-	} else {
-		takeProfit = t.calculateTPBasedOn15MinProjection(entryPrice, side)
-		var tpPercentDistance float64
-		if side == "LONG" {
-			tpPercentDistance = math.Abs((takeProfit - entryPrice) / entryPrice * 100)
-		} else {
-			tpPercentDistance = math.Abs((entryPrice - takeProfit) / entryPrice * 100)
-		}
-		slPercentDistance := tpPercentDistance / 2
-		if side == "LONG" {
-			stopLoss = entryPrice * (1 - slPercentDistance/100)
-		} else {
-			stopLoss = entryPrice * (1 + slPercentDistance/100)
-		}
-	}
-
-	if side == "LONG" && takeProfit-entryPrice < minProfitDistance {
-		takeProfit = entryPrice + minProfitDistance
-	}
-	if side == "SHORT" && entryPrice-takeProfit < minProfitDistance {
-		takeProfit = entryPrice - minProfitDistance
-	}
-
-	tpDistanceActual := math.Abs(takeProfit - entryPrice)
-	slDistanceActual := math.Abs(entryPrice - stopLoss)
-	if slDistanceActual > 0 {
-		ratio := tpDistanceActual / slDistanceActual
-		targetRR := 2.0
-		if ratio < targetRR {
-			adj := slDistanceActual * targetRR
-			if side == "LONG" {
-				takeProfit = entryPrice + adj
-			} else {
-				takeProfit = entryPrice - adj
-			}
-		}
-	}
-
-	if t.State.Instr.TickSize > 0 {
-		takeProfit = math.Round(takeProfit/t.State.Instr.TickSize) * t.State.Instr.TickSize
-		stopLoss = math.Round(stopLoss/t.State.Instr.TickSize) * t.State.Instr.TickSize
-	}
-
-	minPocket := t.minPocketDistance(entryPrice)
-	if side == "LONG" {
-		if entryPrice-stopLoss < minPocket {
-			stopLoss = entryPrice - minPocket
-		}
-	} else {
-		if stopLoss-entryPrice < minPocket {
-			stopLoss = entryPrice + minPocket
-		}
-	}
-
-	return takeProfit, stopLoss
+	// Deprecated: keep for compatibility but route to the unified TP/SL logic.
+	return t.calculateInitialTPSL(entryPrice, positionSide)
 }
 
 func (t *Trader) targetRR(regime string) float64 {
@@ -964,10 +976,10 @@ func (t *Trader) roundSL(entry, sl, tick float64, side string) float64 {
 		return sl
 	}
 	if side == "LONG" {
-		return math.Floor(sl/tick) * tick
+		return math.Ceil(sl/tick) * tick
 	}
 	if side == "SHORT" {
-		return math.Ceil(sl/tick) * tick
+		return math.Floor(sl/tick) * tick
 	}
 	return math.Round(sl/tick) * tick
 }
@@ -989,102 +1001,28 @@ func (t *Trader) calcTPSLDetails(entryPrice float64, positionSide string) tpslCa
 	}
 
 	atr := indicators.CalculateATR(t.State.Highs, t.State.Lows, t.State.Closes, 14)
-	regimeFactor := t.regimeFactor(regime)
-	feeBuf := t.feeBuffer(entryPrice)
-	minProfitDistance := math.Max(entryPrice*t.Config.MinProfitPerc, feeBuf*1.5)
-	slFeeFloorMult := t.Config.SLFeeFloorMult
-	if slFeeFloorMult <= 0 {
-		slFeeFloorMult = 4.0
-	}
-	tpFeeFloorMult := t.Config.TPFeeFloorMult
-	if tpFeeFloorMult <= 0 {
-		tpFeeFloorMult = 5.0
-	}
+	dyn := t.dynamicTP(entryPrice, atr, regime)
 
-	var slDist float64
-	var tpDist float64
-	var slDistBase float64
-	var tpDistBase float64
-	if atr > 0 {
-		slDist = atr * t.Config.AtrSLMult * regimeFactor
-		tpDist = atr * t.Config.AtrTPMult * regimeFactor
-		// Enforce minimum SL distance to avoid noise whipsaw
-		minSL := entryPrice * t.Config.SlPerc
-		if slDist < minSL {
-			slDist = minSL
-		}
-	} else {
-		tpPrice := t.calculateTPBasedOn15MinProjection(entryPrice, side)
-		tpDist = math.Abs(tpPrice - entryPrice)
-		slDist = tpDist / 2
+	tpDist := 0.0
+	if entryPrice > 0 {
+		tpDist = entryPrice * dyn.ClampedPercent / 100
 	}
-
-	slDistBase = slDist
-	tpDistBase = tpDist
-
-	slFeeFloorApplied := false
-	if feeBuf > 0 && slDist < feeBuf*slFeeFloorMult {
-		slDist = feeBuf * slFeeFloorMult
-		slFeeFloorApplied = true
-	}
-	slDistFeeFloor := slDist
-
-	tpDistMinProfit := tpDist
-	if tpDist < minProfitDistance {
-		tpDist = minProfitDistance
-	}
-	tpDistMinProfit = tpDist
-
-	targetRR := t.targetRR(regime)
-	dynamicRRApplied := false
-	if slDist > 0 {
-		rr := tpDist / slDist
-		if rr < targetRR {
-			tpDist = slDist * targetRR
-			dynamicRRApplied = true
-		}
-	}
-	tpDistDynamicRR := tpDist
-
-	cap := 0.0
-	capApplied := false
-	if atr > 0 {
-		var capped bool
-		tpDist, cap, capped = t.clampTPDistWithAtr(tpDist, atr, regime)
-		capApplied = capped
-	}
-	tpDistCapped := tpDist
-
-	tpFeeFloorApplied := false
-	if feeBuf > 0 && tpDist < feeBuf*tpFeeFloorMult {
-		tpDist = feeBuf * tpFeeFloorMult
-		tpFeeFloorApplied = true
-	}
-	tpDistFeeFloor := tpDist
 
 	return tpslCalcDetails{
-		entry:             entryPrice,
-		side:              side,
-		regime:            regime,
-		atr:               atr,
-		slDist:            slDist,
-		tpDist:            tpDist,
-		slDistBase:        slDistBase,
-		slDistFeeFloor:    slDistFeeFloor,
-		tpDistBase:        tpDistBase,
-		tpDistMinProfit:   tpDistMinProfit,
-		tpDistDynamicRR:   tpDistDynamicRR,
-		tpDistCapped:      tpDistCapped,
-		tpDistFeeFloor:    tpDistFeeFloor,
-		feeBuffer:         feeBuf,
-		targetRR:          targetRR,
-		cap:               cap,
-		minProfitDistance: minProfitDistance,
-		dynamicRRApplied:  dynamicRRApplied,
-		capApplied:        capApplied,
-		slFeeFloorApplied: slFeeFloorApplied,
-		tpFeeFloorApplied: tpFeeFloorApplied,
-		regimeFactor:      regimeFactor,
+		entry:            entryPrice,
+		side:             side,
+		regime:           regime,
+		atr:              atr,
+		atrPercent:       dyn.ATRPercent,
+		tpPercRaw:        dyn.RawPercent,
+		tpPercClamped:    dyn.ClampedPercent,
+		tpPercMin:        dyn.MinPercent,
+		tpPercMax:        dyn.MaxPercent,
+		k:                dyn.K,
+		volatilityFactor: dyn.VolatilityFactor,
+		regimeFactor:     dyn.RegimeFactor,
+		tpDistBase:       tpDist,
+		tpDist:           tpDist,
 	}
 }
 
@@ -1125,15 +1063,19 @@ func (t *Trader) buildIndicatorSnapshot(closesCopy []float64) models.IndicatorSn
 
 // calculateTPBasedOn15MinProjection calculates TP based on expected price movement in next 15 minutes
 func (t *Trader) calculateTPBasedOn15MinProjection(entryPrice float64, positionSide string) float64 {
+	minTPPerc := t.Config.DynamicTPMinPerc
+	if minTPPerc <= 0 {
+		minTPPerc = 0.4
+	}
+	minTPFrac := minTPPerc / 100
+
 	// Get recent price data for 15-minute projection
 	if len(t.State.Closes) < 15 {
 		t.Logger.Warning("Not enough data for 15-minute projection, using fallback")
-		// Fallback to simple percentage-based TP
-		const defaultTPPerc = 0.005 // 0.5%
 		if positionSide == "LONG" {
-			return entryPrice * (1 + defaultTPPerc)
+			return entryPrice * (1 + minTPFrac)
 		}
-		return entryPrice * (1 - defaultTPPerc)
+		return entryPrice * (1 - minTPFrac)
 	}
 
 	// Use the last 15 minutes of data (15 one-minute candles)
@@ -1170,15 +1112,15 @@ func (t *Trader) calculateTPBasedOn15MinProjection(entryPrice float64, positionS
 	}
 	tpPrice := entryPrice + move
 
-	// Ensure TP is reasonable (at least 0.1% away from entry)
-	minTPDistance := entryPrice * 0.001
+	// Ensure TP is reasonable (at least DynamicTPMinPerc away from entry)
+	minTPDistance := entryPrice * minTPFrac
 	actualTPDistance := math.Abs(tpPrice - entryPrice)
 
 	if actualTPDistance < minTPDistance {
 		if positionSide == "LONG" {
-			tpPrice = entryPrice * (1 + 0.001) // 0.1% above entry
+			tpPrice = entryPrice * (1 + minTPFrac)
 		} else {
-			tpPrice = entryPrice * (1 - 0.001) // 0.1% below entry
+			tpPrice = entryPrice * (1 - minTPFrac)
 		}
 	}
 
@@ -1822,6 +1764,22 @@ func (t *Trader) SyncPositionRealTime() {
 					t.State.PartialTPDone = true
 					t.State.Unlock()
 					t.Logger.Info("Partial TP executed: %.2f (%s), progress=%.0f%%", partialQty, reduceSide, prog*100)
+
+					// After partial TP, move SL to breakeven (entry) for the remainder.
+					be := entry
+					if side == "LONG" && be > price-tick {
+						be = price - tick
+					}
+					if side == "SHORT" && be < price+tick {
+						be = price + tick
+					}
+					be = t.roundSL(entry, be, tick, side)
+					if err := t.PositionManager.UpdatePositionTPSL(t.Config.Symbol, tp, be); err != nil {
+						t.Logger.Error("Breakeven SL update after partial error: %v", err)
+					} else {
+						t.Logger.Info("Moved SL to breakeven %.2f after partial TP", be)
+						sl = be
+					}
 				}
 			}
 		}
