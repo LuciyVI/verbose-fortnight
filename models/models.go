@@ -198,6 +198,8 @@ type State struct {
 	LastEntryAt    time.Time
 	LastEntryPrice float64
 	LastEntryDir   string
+	LastOrderID    string
+	LastExecID     string
 
 	// Volume tracking
 	RecentVolumes []float64 // Store recent volumes for calculating average/surge detection

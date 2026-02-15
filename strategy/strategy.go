@@ -1,6 +1,7 @@
 package strategy
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
@@ -25,6 +26,61 @@ type Trader struct {
 	OrderManager    *order.OrderManager
 	PositionManager *position.PositionManager
 	Logger          logging.LoggerInterface
+}
+
+type tradeEventLog struct {
+	Event             string  `json:"event"`
+	TradeID           string  `json:"trade_id"`
+	Side              string  `json:"side"`
+	Qty               float64 `json:"qty"`
+	Entry             float64 `json:"entry"`
+	TP                float64 `json:"tp"`
+	SL                float64 `json:"sl"`
+	TPDist            float64 `json:"tp_dist"`
+	SLDist            float64 `json:"sl_dist"`
+	FeeOpenEst        float64 `json:"fee_open_est"`
+	FeeCloseEst       float64 `json:"fee_close_est"`
+	FundingEst        float64 `json:"funding_est"`
+	BreakevenMove     float64 `json:"breakeven_move"`
+	TickSize          float64 `json:"tick_size"`
+	StepSize          float64 `json:"step_size"`
+	TPOrderType       string  `json:"tp_order_type"`
+	SLOrderType       string  `json:"sl_order_type"`
+	ReduceOnlyTP      bool    `json:"reduce_only_tp"`
+	ReduceOnlySL      bool    `json:"reduce_only_sl"`
+	TrailActivation   float64 `json:"trail_activation"`
+	BreakevenProgress float64 `json:"breakeven_progress"`
+}
+
+func (t *Trader) logTradeEvent(event string, payload tradeEventLog) {
+	payload.Event = event
+	if payload.TradeID == "" {
+		payload.TradeID = fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	if payload.TickSize == 0 {
+		payload.TickSize = t.State.Instr.TickSize
+	}
+	if payload.StepSize == 0 {
+		payload.StepSize = t.State.Instr.QtyStep
+	}
+	if payload.TPOrderType == "" {
+		payload.TPOrderType = "trading-stop"
+	}
+	if payload.SLOrderType == "" {
+		payload.SLOrderType = "trading-stop"
+	}
+	if payload.TrailActivation == 0 {
+		payload.TrailActivation = t.Config.TrailActivation
+	}
+	if payload.BreakevenProgress == 0 {
+		payload.BreakevenProgress = t.Config.BreakevenProgress
+	}
+	bytes, err := json.Marshal(payload)
+	if err != nil {
+		t.Logger.Error("failed to marshal trade log: %v", err)
+		return
+	}
+	t.Logger.Info("trade_event %s", string(bytes))
 }
 
 type tpslCalcDetails struct {
@@ -145,6 +201,18 @@ func (t *Trader) feeBuffer(entry float64) float64 {
 		buf = math.Ceil(buf/tick) * tick
 	}
 	return buf
+}
+
+func (t *Trader) estimateRoundTripFee(entry, exit, qty float64) float64 {
+	feePerc := t.Config.RoundTripFeePerc
+	if feePerc <= 0 {
+		feePerc = 0.0012
+	}
+	price := entry
+	if exit > 0 {
+		price = (entry + exit) / 2
+	}
+	return math.Abs(price*qty) * feePerc
 }
 
 func (t *Trader) higherTimeframeBias(atr float64) string {
@@ -667,7 +735,8 @@ func (t *Trader) openPosition(newSide string, price float64) {
 				}
 			}
 
-			profit := t.PositionManager.CalculatePositionProfit(side, entryPrice, exitPrice, qty)
+			feeEst := t.estimateRoundTripFee(entryPrice, exitPrice, qty)
+			profit := t.PositionManager.CalculatePositionNetProfit(side, entryPrice, exitPrice, qty, feeEst, 0)
 			signalType := "CLOSE_LONG"
 			if side == "SHORT" {
 				signalType = "CLOSE_SHORT"
@@ -719,10 +788,21 @@ func (t *Trader) openPosition(newSide string, price float64) {
 	}
 
 	// Place market order
+	tradeID := fmt.Sprintf("%d", time.Now().UnixNano())
 	orderSide := "Buy"
 	if t.PositionManager.NormalizeSide(newSide) == "SHORT" {
 		orderSide = "Sell"
 	}
+	t.logTradeEvent("entry_intent", tradeEventLog{
+		TradeID:           tradeID,
+		Side:              newSide,
+		Qty:               qty,
+		Entry:             price,
+		TPOrderType:       "market",
+		SLOrderType:       "market",
+		TrailActivation:   t.Config.TrailActivation,
+		BreakevenProgress: t.Config.BreakevenProgress,
+	})
 	t.Logger.Info("Placing market order: %s %.4f", orderSide, qty)
 	if err := t.OrderManager.PlaceOrderMarket(orderSide, qty, false); err != nil {
 		t.Logger.Error("Error opening position %s: %v", newSide, err)
@@ -744,6 +824,27 @@ func (t *Trader) openPosition(newSide string, price float64) {
 
 	// Calculate TP/SL with 2:1 ratio based on 15-minute projection
 	tp, sl := t.calculateInitialTPSL(entry, newSide)
+	feeBuf := t.feeBuffer(entry)
+	tpDist := math.Abs(tp - entry)
+	slDist := math.Abs(entry - sl)
+	t.logTradeEvent("order_setup", tradeEventLog{
+		TradeID:           tradeID,
+		Side:              newSide,
+		Qty:               qty,
+		Entry:             entry,
+		TP:                tp,
+		SL:                sl,
+		TPDist:            tpDist,
+		SLDist:            slDist,
+		FeeOpenEst:        feeBuf / 2,
+		FeeCloseEst:       feeBuf / 2,
+		FundingEst:        0,
+		BreakevenMove:     feeBuf,
+		ReduceOnlyTP:      false,
+		ReduceOnlySL:      false,
+		TrailActivation:   t.Config.TrailActivation,
+		BreakevenProgress: t.Config.BreakevenProgress,
+	})
 
 	minPocket := t.minPocketDistance(entry)
 
@@ -770,10 +871,18 @@ func (t *Trader) calculateInitialTPSL(entry float64, positionSide string) (float
 	}
 
 	minPocket := t.minPocketDistance(entry)
-	// SL is derived from TP (SLdist = TPdist/2), so the SL-side constraint we enforce here
-	// is the "pocket" distance. Fee floors and minimum profit are enforced on the TP side.
-	minSLDist := minPocket
-	requiredTPDist := math.Max(details.tpDist, 2*minSLDist)
+	feeBuf := t.feeBuffer(entry)
+	minSLFee := feeBuf * t.Config.SLFeeFloorMult
+	if t.Config.SLFeeFloorMult <= 0 {
+		minSLFee = feeBuf
+	}
+	minSLDist := math.Max(minPocket, minSLFee)
+	minTPDist := math.Max(details.tpDist, feeBuf*t.Config.TPFeeFloorMult)
+	requiredTPDist := math.Max(minTPDist, 2*minSLDist)
+	if feeBuf > 0 && t.Config.TPFeeFloorMult <= 0 {
+		requiredTPDist = math.Max(requiredTPDist, feeBuf)
+	}
+	// SL is derived from TP (SLdist = TPdist/2), so we enforce pocket+fee constraints for both sides.
 
 	// 1) Calculate TP first.
 	tpDist := details.tpDist
@@ -829,6 +938,31 @@ func (t *Trader) calculateInitialTPSL(entry float64, positionSide string) (float
 		} else {
 			tp -= 2 * tick
 		}
+		invariantAdjusted = true
+		tpDistFinal = math.Abs(tp - entry)
+		sl = entry - tpDistFinal/2
+		if details.side == "SHORT" {
+			sl = entry + tpDistFinal/2
+		}
+		sl = t.roundSL(entry, sl, tick, details.side)
+	}
+
+	// Ensure RR doesn't collapse due to SL rounding away from entry.
+	for i := 0; i < 8; i++ {
+		slDistFinal := math.Abs(entry - sl)
+		if slDistFinal <= 0 {
+			break
+		}
+		if tpDistFinal/slDistFinal >= 2.0-1e-9 {
+			break
+		}
+		desiredTPDist := slDistFinal * 2
+		if details.side == "LONG" {
+			tp = entry + desiredTPDist
+		} else {
+			tp = entry - desiredTPDist
+		}
+		tp = t.roundTP(entry, tp, tick, details.side)
 		invariantAdjusted = true
 		tpDistFinal = math.Abs(tp - entry)
 		sl = entry - tpDistFinal/2
@@ -976,10 +1110,10 @@ func (t *Trader) roundSL(entry, sl, tick float64, side string) float64 {
 		return sl
 	}
 	if side == "LONG" {
-		return math.Ceil(sl/tick) * tick
+		return math.Floor(sl/tick) * tick
 	}
 	if side == "SHORT" {
-		return math.Floor(sl/tick) * tick
+		return math.Ceil(sl/tick) * tick
 	}
 	return math.Round(sl/tick) * tick
 }
@@ -1443,7 +1577,8 @@ func (t *Trader) closeOppositePosition(newSide string) {
 			exitPrice = entryPrice // Fallback if we can't get current price
 		}
 
-		profit := t.PositionManager.CalculatePositionProfit(side, entryPrice, exitPrice, qty)
+		feeEst := t.estimateRoundTripFee(entryPrice, exitPrice, qty)
+		profit := t.PositionManager.CalculatePositionNetProfit(side, entryPrice, exitPrice, qty, feeEst, 0)
 		signalType := "CLOSE_LONG"
 		if side == "SHORT" {
 			signalType = "CLOSE_SHORT"
@@ -1454,6 +1589,62 @@ func (t *Trader) closeOppositePosition(newSide string) {
 		t.State.LastExitAt = time.Now()
 		t.State.LastExitDir = side
 		t.State.Unlock()
+	}
+}
+
+// HandleExecutionFill recalculates TP/SL after a fill using actual position size.
+func (t *Trader) HandleExecutionFill(side string, qty, price float64, execID, orderID string) {
+	if qty <= 0 {
+		return
+	}
+	exists, posSide, posQty, curTP, curSL := t.PositionManager.HasOpenPosition()
+	if !exists {
+		return
+	}
+	posSide = t.PositionManager.NormalizeSide(posSide)
+	entry := t.PositionManager.GetLastEntryPrice()
+	if entry == 0 {
+		entry = price
+	}
+
+	tpNew, slNew := t.calculateInitialTPSL(entry, posSide)
+	tick := t.State.Instr.TickSize
+	if tick <= 0 {
+		tick = 0.1
+	}
+	tpNew = t.roundTP(entry, tpNew, tick, posSide)
+	slNew = t.roundSL(entry, slNew, tick, posSide)
+
+	feeBuf := t.feeBuffer(entry)
+	tradeID := execID
+	if tradeID == "" {
+		tradeID = orderID
+	}
+	t.logTradeEvent("fill_sync", tradeEventLog{
+		TradeID:           tradeID,
+		Side:              posSide,
+		Qty:               posQty,
+		Entry:             entry,
+		TP:                tpNew,
+		SL:                slNew,
+		TPDist:            math.Abs(tpNew - entry),
+		SLDist:            math.Abs(entry - slNew),
+		FeeOpenEst:        feeBuf / 2,
+		FeeCloseEst:       feeBuf / 2,
+		BreakevenMove:     feeBuf,
+		ReduceOnlyTP:      false,
+		ReduceOnlySL:      false,
+		TrailActivation:   t.Config.TrailActivation,
+		BreakevenProgress: t.Config.BreakevenProgress,
+	})
+
+	if math.Abs(tpNew-curTP) < tick && math.Abs(slNew-curSL) < tick {
+		return
+	}
+	if err := t.PositionManager.UpdatePositionTPSL(t.Config.Symbol, tpNew, slNew); err != nil {
+		t.Logger.Error("fill sync TP/SL update error: %v (tp=%.2f sl=%.2f tick=%.4f)", err, tpNew, slNew, tick)
+	} else {
+		t.Logger.Info("Fill sync TP/SL ▶ TP %.2f SL %.2f (qty=%.4f side=%s)", tpNew, slNew, posQty, posSide)
 	}
 }
 
@@ -1667,8 +1858,25 @@ func (t *Trader) SyncPositionRealTime() {
 			lastTPSLAttempt = time.Now()
 			tpNew, slNew := t.calculateInitialTPSL(entry, side)
 			t.Logger.Info("Missing TP/SL detected for %s position, setting TP %.2f SL %.2f", side, tpNew, slNew)
+			feeBuf := t.feeBuffer(entry)
+			t.logTradeEvent("missing_tpsl", tradeEventLog{
+				Side:              side,
+				Qty:               qty,
+				Entry:             entry,
+				TP:                tpNew,
+				SL:                slNew,
+				TPDist:            math.Abs(tpNew - entry),
+				SLDist:            math.Abs(entry - slNew),
+				FeeOpenEst:        feeBuf / 2,
+				FeeCloseEst:       feeBuf / 2,
+				BreakevenMove:     feeBuf,
+				ReduceOnlyTP:      false,
+				ReduceOnlySL:      false,
+				TrailActivation:   t.Config.TrailActivation,
+				BreakevenProgress: t.Config.BreakevenProgress,
+			})
 			if err := t.PositionManager.UpdatePositionTPSL(t.Config.Symbol, tpNew, slNew); err != nil {
-				t.Logger.Error("Error setting missing TP/SL: %v", err)
+				t.Logger.Error("Error setting missing TP/SL: %v (tp=%.2f sl=%.2f tick=%.4f)", err, tpNew, slNew, t.State.Instr.TickSize)
 			} else {
 				t.Logger.Info("TP/SL placed ▶ TP %.2f  SL %.2f", tpNew, slNew)
 			}
@@ -1721,9 +1929,26 @@ func (t *Trader) SyncPositionRealTime() {
 				if target > price-tick {
 					target = price - tick
 				}
+				target = t.roundSL(entry, target, tick, side)
 				if target > sl {
+					t.logTradeEvent("breakeven_adjust", tradeEventLog{
+						Side:              side,
+						Qty:               qty,
+						Entry:             entry,
+						TP:                tp,
+						SL:                target,
+						TPDist:            math.Abs(tp - entry),
+						SLDist:            math.Abs(entry - target),
+						FeeOpenEst:        feeBuf / 2,
+						FeeCloseEst:       feeBuf / 2,
+						BreakevenMove:     feeBuf,
+						ReduceOnlyTP:      false,
+						ReduceOnlySL:      false,
+						TrailActivation:   t.Config.TrailActivation,
+						BreakevenProgress: t.Config.BreakevenProgress,
+					})
 					if err := t.PositionManager.UpdatePositionTPSL(t.Config.Symbol, tp, target); err != nil {
-						t.Logger.Error("Breakeven SL update error: %v", err)
+						t.Logger.Error("Breakeven SL update error: %v (target=%.2f tick=%.4f)", err, target, tick)
 					} else {
 						t.Logger.Info("Moved SL to lock %.2f for LONG", target)
 						sl = target
@@ -1735,9 +1960,26 @@ func (t *Trader) SyncPositionRealTime() {
 				if target < price+tick {
 					target = price + tick
 				}
+				target = t.roundSL(entry, target, tick, side)
 				if sl == 0 || target < sl {
+					t.logTradeEvent("breakeven_adjust", tradeEventLog{
+						Side:              side,
+						Qty:               qty,
+						Entry:             entry,
+						TP:                tp,
+						SL:                target,
+						TPDist:            math.Abs(tp - entry),
+						SLDist:            math.Abs(entry - target),
+						FeeOpenEst:        feeBuf / 2,
+						FeeCloseEst:       feeBuf / 2,
+						BreakevenMove:     feeBuf,
+						ReduceOnlyTP:      false,
+						ReduceOnlySL:      false,
+						TrailActivation:   t.Config.TrailActivation,
+						BreakevenProgress: t.Config.BreakevenProgress,
+					})
 					if err := t.PositionManager.UpdatePositionTPSL(t.Config.Symbol, tp, target); err != nil {
-						t.Logger.Error("Breakeven SL update error: %v", err)
+						t.Logger.Error("Breakeven SL update error: %v (target=%.2f tick=%.4f)", err, target, tick)
 					} else {
 						t.Logger.Info("Moved SL to lock %.2f for SHORT", target)
 						sl = target
@@ -1774,8 +2016,24 @@ func (t *Trader) SyncPositionRealTime() {
 						be = price + tick
 					}
 					be = t.roundSL(entry, be, tick, side)
+					t.logTradeEvent("partial_be_adjust", tradeEventLog{
+						Side:              side,
+						Qty:               qty,
+						Entry:             entry,
+						TP:                tp,
+						SL:                be,
+						TPDist:            math.Abs(tp - entry),
+						SLDist:            math.Abs(entry - be),
+						FeeOpenEst:        feeBuf / 2,
+						FeeCloseEst:       feeBuf / 2,
+						BreakevenMove:     feeBuf,
+						ReduceOnlyTP:      false,
+						ReduceOnlySL:      false,
+						TrailActivation:   t.Config.TrailActivation,
+						BreakevenProgress: t.Config.BreakevenProgress,
+					})
 					if err := t.PositionManager.UpdatePositionTPSL(t.Config.Symbol, tp, be); err != nil {
-						t.Logger.Error("Breakeven SL update after partial error: %v", err)
+						t.Logger.Error("Breakeven SL update after partial error: %v (target=%.2f tick=%.4f)", err, be, tick)
 					} else {
 						t.Logger.Info("Moved SL to breakeven %.2f after partial TP", be)
 						sl = be
@@ -1827,6 +2085,7 @@ func (t *Trader) SyncPositionRealTime() {
 				targetSL = math.Max(targetSL, price-tightBuffer)
 			}
 			targetSL = math.Min(targetSL, price-tick)
+			targetSL = t.roundSL(entry, targetSL, tick, side)
 			if targetSL <= sl {
 				continue
 			}
@@ -1840,14 +2099,30 @@ func (t *Trader) SyncPositionRealTime() {
 				targetSL = math.Min(targetSL, price+tightBuffer)
 			}
 			targetSL = math.Max(targetSL, price+tick)
+			targetSL = t.roundSL(entry, targetSL, tick, side)
 			if targetSL >= sl {
 				continue
 			}
 		}
 
+		t.logTradeEvent("trail_adjust", tradeEventLog{
+			Side:          side,
+			Qty:           qty,
+			Entry:         entry,
+			TP:            tp,
+			SL:            targetSL,
+			TPDist:        math.Abs(tp - entry),
+			SLDist:        math.Abs(entry - targetSL),
+			FeeOpenEst:    feeBuf / 2,
+			FeeCloseEst:   feeBuf / 2,
+			FundingEst:    0,
+			BreakevenMove: feeBuf,
+			ReduceOnlyTP:  false,
+			ReduceOnlySL:  false,
+		})
 		t.Logger.Info("Trailing stop: updating SL from %.2f to %.2f (%.0f%% way to TP)", sl, targetSL, prog*100)
 		if err := t.PositionManager.UpdatePositionTPSL(t.Config.Symbol, tp, targetSL); err != nil {
-			t.Logger.Error("Trailing SL update error: %v", err)
+			t.Logger.Error("Trailing SL update error: %v (target=%.2f tick=%.4f)", err, targetSL, tick)
 		} else {
 			t.Logger.Info("SL → %.2f (%.0f%% way to TP)", targetSL, prog*100)
 		}

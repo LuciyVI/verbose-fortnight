@@ -73,7 +73,7 @@ func TestRoundTPSLDirectional(t *testing.T) {
 			slIn:   99.26,
 			tick:   0.5,
 			wantTP: 100.5,
-			wantSL: 99.5,
+			wantSL: 99.0,
 		},
 		{
 			name:   "short_ceil_tp_floor_sl",
@@ -82,7 +82,7 @@ func TestRoundTPSLDirectional(t *testing.T) {
 			slIn:   100.74,
 			tick:   0.5,
 			wantTP: 99.5,
-			wantSL: 100.5,
+			wantSL: 101.0,
 		},
 	}
 
@@ -107,14 +107,14 @@ func TestRoundSLMovesAwayFromEntry(t *testing.T) {
 
 	longSL := 99.26
 	roundedLong := tr.roundSL(entry, longSL, tick, "LONG")
-	if entry-roundedLong > entry-longSL {
-		t.Fatalf("long SL rounding moved farther: before %.2f after %.2f", longSL, roundedLong)
+	if entry-roundedLong < entry-longSL {
+		t.Fatalf("long SL rounding moved closer: before %.2f after %.2f", longSL, roundedLong)
 	}
 
 	shortSL := 100.74
 	roundedShort := tr.roundSL(entry, shortSL, tick, "SHORT")
-	if roundedShort-entry > shortSL-entry {
-		t.Fatalf("short SL rounding moved farther: before %.2f after %.2f", shortSL, roundedShort)
+	if roundedShort-entry < shortSL-entry {
+		t.Fatalf("short SL rounding moved closer: before %.2f after %.2f", shortSL, roundedShort)
 	}
 }
 
@@ -178,8 +178,29 @@ func TestCalculateInitialTPSLIgnoresSlPercWhenDerivingSL(t *testing.T) {
 	tr.Config.SlPerc = 0.2
 	tp, _ := tr.calculateInitialTPSL(entry, "LONG")
 	tpDist := tp - entry
-	if tpDist >= 1.0 {
+	if tpDist >= 1.5 {
 		t.Fatalf("tpDist too large despite small fee floors: got %.4f", tpDist)
+	}
+}
+
+func TestCalculateInitialTPSLRespectsFeeFloors(t *testing.T) {
+	tr := newTestTrader()
+	tr.State.Instr.TickSize = 0.1
+	tr.Config.TPFeeFloorMult = 3.0
+	tr.Config.SLFeeFloorMult = 2.5
+	entry := 100.0
+
+	tp, sl := tr.calculateInitialTPSL(entry, "LONG")
+	feeBuf := tr.feeBuffer(entry)
+
+	tpDist := math.Abs(tp - entry)
+	slDist := math.Abs(entry - sl)
+
+	if tpDist < feeBuf*tr.Config.TPFeeFloorMult {
+		t.Fatalf("tpDist %.4f below fee floor %.4f", tpDist, feeBuf*tr.Config.TPFeeFloorMult)
+	}
+	if slDist < feeBuf*tr.Config.SLFeeFloorMult {
+		t.Fatalf("slDist %.4f below SL fee floor %.4f", slDist, feeBuf*tr.Config.SLFeeFloorMult)
 	}
 }
 

@@ -153,16 +153,16 @@ func connectPrivateWS(apiClient *api.RESTClient, state *models.State) (*websocke
 	}
 	dbg("Received authentication response from exchange: %s", string(authResp))
 
-	// Subscribe to wallet and position
+	// Subscribe to wallet, position, execution
 	subReq := map[string]interface{}{
 		"op":   "subscribe",
-		"args": []string{"wallet", "position"},
+		"args": []string{"wallet", "position", "execution"},
 	}
 	dbg("Sending subscription request to exchange: %v", subReq)
 
 	if err := ws.WriteJSON(map[string]interface{}{
 		"op":   "subscribe",
-		"args": []string{"wallet", "position"},
+		"args": []string{"wallet", "position", "execution"},
 	}); err != nil {
 		logError("Failed to send subscription to exchange: %v", err)
 		ws.Close()
@@ -326,6 +326,73 @@ func normalizeSide(side string) string {
 		return "SHORT"
 	default:
 		return ""
+	}
+}
+
+type executionMsg struct {
+	Topic string                   `json:"topic"`
+	Data  []map[string]interface{} `json:"data"`
+}
+
+func getStringField(m map[string]interface{}, keys ...string) string {
+	for _, k := range keys {
+		if v, ok := m[k]; ok && v != nil {
+			switch val := v.(type) {
+			case string:
+				return val
+			case json.Number:
+				return val.String()
+			case float64:
+				return strconv.FormatFloat(val, 'f', -1, 64)
+			}
+		}
+	}
+	return ""
+}
+
+func getFloatField(m map[string]interface{}, keys ...string) float64 {
+	for _, k := range keys {
+		if v, ok := m[k]; ok && v != nil {
+			switch val := v.(type) {
+			case float64:
+				return val
+			case string:
+				f, _ := strconv.ParseFloat(val, 64)
+				return f
+			case json.Number:
+				f, _ := val.Float64()
+				return f
+			}
+		}
+	}
+	return 0
+}
+
+func handleExecutionMessage(raw []byte, trader *strategy.Trader, symbol string) {
+	var msg executionMsg
+	if json.Unmarshal(raw, &msg) != nil || len(msg.Data) == 0 {
+		return
+	}
+	for _, item := range msg.Data {
+		sym := getStringField(item, "symbol")
+		if symbol != "" && sym != "" && sym != symbol {
+			continue
+		}
+		side := normalizeSide(getStringField(item, "side"))
+		execQty := getFloatField(item, "execQty", "qty")
+		execPrice := getFloatField(item, "execPrice", "price")
+		execID := getStringField(item, "execId", "execID")
+		orderID := getStringField(item, "orderId", "orderID")
+		if execID != "" {
+			trader.State.Lock()
+			trader.State.LastExecID = execID
+			if orderID != "" {
+				trader.State.LastOrderID = orderID
+			}
+			trader.State.Unlock()
+		}
+		logInfo("Execution fill: side=%s qty=%.4f price=%.2f execId=%s orderId=%s", side, execQty, execPrice, execID, orderID)
+		trader.HandleExecutionFill(side, execQty, execPrice, execID, orderID)
 	}
 }
 
@@ -634,6 +701,15 @@ func main() {
 			select {
 			case raw := <-walletChan:
 				dbg("Received private message from exchange: %s", string(raw))
+				var peek struct {
+					Topic string `json:"topic"`
+				}
+				if json.Unmarshal(raw, &peek) == nil {
+					switch peek.Topic {
+					case "execution":
+						handleExecutionMessage(raw, trader, cfg.Symbol)
+					}
+				}
 			default:
 				break drainWallet
 			}

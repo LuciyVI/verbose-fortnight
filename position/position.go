@@ -240,7 +240,7 @@ func (pm *PositionManager) UpdateSignalStats(signalType string, profit float64) 
 	}
 }
 
-// CalculatePositionProfit calculates the profit of a position based on entry and exit prices
+// CalculatePositionProfit calculates the gross profit of a position based on entry and exit prices.
 func (pm *PositionManager) CalculatePositionProfit(side string, entryPrice, exitPrice, qty float64) float64 {
 	if entryPrice <= 0 || exitPrice <= 0 || qty <= 0 {
 		return 0 // Can't calculate profit without valid prices and quantity
@@ -264,6 +264,31 @@ func (pm *PositionManager) CalculatePositionProfit(side string, entryPrice, exit
 	pm.State.Unlock()
 
 	return profit
+}
+
+// CalculatePositionNetProfit calculates net profit including fee/funding estimates.
+func (pm *PositionManager) CalculatePositionNetProfit(side string, entryPrice, exitPrice, qty, fee, funding float64) float64 {
+	if entryPrice <= 0 || exitPrice <= 0 || qty <= 0 {
+		return 0
+	}
+	var gross float64
+	if side == "LONG" {
+		gross = (exitPrice - entryPrice) * qty
+	} else if side == "SHORT" {
+		gross = (entryPrice - exitPrice) * qty
+	}
+	net := gross - math.Abs(fee) - math.Abs(funding)
+
+	pm.State.Lock()
+	pm.State.RealizedPnL += net
+	if net > 0 {
+		pm.State.TotalProfit += net
+	} else {
+		pm.State.TotalLoss += math.Abs(net)
+	}
+	pm.State.Unlock()
+
+	return net
 }
 
 // GetMaxValue returns the maximum of three values

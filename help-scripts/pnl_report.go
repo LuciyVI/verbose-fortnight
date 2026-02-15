@@ -65,6 +65,11 @@ type exitEvent struct {
 	EndReason     string
 }
 
+const (
+	reasonFlatProbe = "FLAT_PROBE"
+	reasonWSClose   = "WS_CLOSE"
+)
+
 func parseFloat(s string) float64 {
 	v, _ := strconv.ParseFloat(strings.TrimSpace(s), 64)
 	return v
@@ -146,6 +151,9 @@ func collectLogFiles(path string) ([]string, error) {
 		if d.IsDir() {
 			return nil
 		}
+		if d.Type()&os.ModeSymlink != 0 {
+			return nil
+		}
 		name := d.Name()
 		if !strings.HasPrefix(name, "trading_bot") {
 			return nil
@@ -193,7 +201,7 @@ func openMaybeGzip(path string) (io.ReadCloser, error) {
 	return f, nil
 }
 
-func loadExitEvents(logPath string) ([]exitEvent, error) {
+func loadExitEvents(logPath string, loc *time.Location, offset time.Duration, debugf func(string, ...any)) ([]exitEvent, error) {
 	files, err := collectLogFiles(logPath)
 	if err != nil {
 		return nil, err
@@ -201,10 +209,18 @@ func loadExitEvents(logPath string) ([]exitEvent, error) {
 	if len(files) == 0 {
 		return nil, nil
 	}
+	if debugf != nil {
+		debugf("scanning %d log files for exit events", len(files))
+	}
 
 	timeLayout := "2006/01/02 15:04:05.000000"
+	if loc == nil {
+		loc = time.Local
+	}
 	openRe := regexp.MustCompile(`^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}\.\d+).+Position opened: (LONG|SHORT) ([0-9.]+) @ ([0-9.]+) \| TP ([0-9.]+)  SL ([0-9.]+)`)
 	foundRe := regexp.MustCompile(`^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}\.\d+).+Found open position: Side=([A-Za-z]+), Size=([0-9.]+), TP=([0-9.]+), SL=([0-9.]+)`)
+	updateRe := regexp.MustCompile(`^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}\.\d+).+Position updated: Side=([A-Za-z]+), Size=([0-9.]+) TP=([0-9.]+) SL=([0-9.]+)`)
+	closeRe := regexp.MustCompile(`^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}\.\d+).+Position closed`)
 	noPosRe := regexp.MustCompile(`^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}\.\d+).+No open positions found`)
 
 	var events []exitEvent
@@ -252,17 +268,27 @@ func loadExitEvents(logPath string) ([]exitEvent, error) {
 	}
 
 	for _, path := range files {
+		if debugf != nil {
+			debugf("scan log %s", path)
+		}
 		r, err := openMaybeGzip(path)
 		if err != nil {
-			return nil, err
+			if debugf != nil {
+				debugf("skip log %s: %v", path, err)
+			}
+			continue
 		}
 		scanner := bufio.NewScanner(r)
+		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 		for scanner.Scan() {
 			line := scanner.Text()
 			if m := openRe.FindStringSubmatch(line); len(m) == 7 {
-				ts, err := time.ParseInLocation(timeLayout, m[1], time.Local)
+				ts, err := time.ParseInLocation(timeLayout, m[1], loc)
 				if err != nil {
 					continue
+				}
+				if offset != 0 {
+					ts = ts.Add(offset)
 				}
 				side := normalizeSide(m[2])
 				size := parseFloat(m[3])
@@ -299,9 +325,12 @@ func loadExitEvents(logPath string) ([]exitEvent, error) {
 				continue
 			}
 			if m := foundRe.FindStringSubmatch(line); len(m) == 6 {
-				ts, err := time.ParseInLocation(timeLayout, m[1], time.Local)
+				ts, err := time.ParseInLocation(timeLayout, m[1], loc)
 				if err != nil {
 					continue
+				}
+				if offset != 0 {
+					ts = ts.Add(offset)
 				}
 				side := normalizeSide(m[2])
 				size := parseFloat(m[3])
@@ -335,13 +364,75 @@ func loadExitEvents(logPath string) ([]exitEvent, error) {
 				cur.slFinal = sl
 				continue
 			}
-			if m := noPosRe.FindStringSubmatch(line); len(m) == 2 {
-				ts, err := time.ParseInLocation(timeLayout, m[1], time.Local)
+			if m := updateRe.FindStringSubmatch(line); len(m) == 5 {
+				ts, err := time.ParseInLocation(timeLayout, m[1], loc)
 				if err != nil {
 					continue
 				}
+				if offset != 0 {
+					ts = ts.Add(offset)
+				}
+				side := normalizeSide(m[2])
+				size := parseFloat(m[3])
+				tp := parseFloat(m[4])
+				sl := parseFloat(m[5])
+				if cur.active && cur.side != "" && cur.side != side {
+					closeSession(ts, "REVERSE")
+				}
+				if size <= 0 {
+					if cur.active {
+						closeSession(ts, reasonWSClose)
+					}
+					continue
+				}
+				if !cur.active {
+					cur.active = true
+					cur.start = ts
+					cur.side = side
+					cur.size = size
+					cur.tpInit = tp
+					cur.slInit = sl
+				}
+				cur.lastSeen = ts
+				if cur.tpInit == 0 {
+					cur.tpInit = tp
+				}
+				if cur.slInit == 0 {
+					cur.slInit = sl
+				}
+				if cur.tpFinal != 0 && cur.tpFinal != tp {
+					cur.trailActive = true
+				}
+				if cur.slFinal != 0 && cur.slFinal != sl {
+					cur.trailActive = true
+				}
+				cur.tpFinal = tp
+				cur.slFinal = sl
+				continue
+			}
+			if m := closeRe.FindStringSubmatch(line); len(m) == 2 {
+				ts, err := time.ParseInLocation(timeLayout, m[1], loc)
+				if err != nil {
+					continue
+				}
+				if offset != 0 {
+					ts = ts.Add(offset)
+				}
 				if cur.active {
-					closeSession(ts, "FLAT")
+					closeSession(ts, reasonWSClose)
+				}
+				continue
+			}
+			if m := noPosRe.FindStringSubmatch(line); len(m) == 2 {
+				ts, err := time.ParseInLocation(timeLayout, m[1], loc)
+				if err != nil {
+					continue
+				}
+				if offset != 0 {
+					ts = ts.Add(offset)
+				}
+				if cur.active {
+					closeSession(ts, reasonFlatProbe)
 				}
 			}
 		}
@@ -354,31 +445,42 @@ func loadExitEvents(logPath string) ([]exitEvent, error) {
 }
 
 func pickExitEvent(events []exitEvent, exitTime time.Time, side string, maxDelta time.Duration, used []bool) (int, *exitEvent) {
-	bestIdx := -1
-	var bestDelta time.Duration
-	for i, ev := range events {
-		if used[i] {
-			continue
+	find := func(ignoreFlat bool) (int, time.Duration) {
+		bestIdx := -1
+		var bestDelta time.Duration
+		for i, ev := range events {
+			if used[i] {
+				continue
+			}
+			if ev.Side != "" && ev.Side != side {
+				continue
+			}
+			if ignoreFlat && ev.EndReason == reasonFlatProbe {
+				continue
+			}
+			delta := exitTime.Sub(ev.Time)
+			if delta < 0 {
+				delta = -delta
+			}
+			if delta > maxDelta {
+				continue
+			}
+			if bestIdx == -1 || delta < bestDelta {
+				bestIdx = i
+				bestDelta = delta
+			}
 		}
-		if ev.Side != "" && ev.Side != side {
-			continue
-		}
-		delta := exitTime.Sub(ev.Time)
-		if delta < 0 {
-			delta = -delta
-		}
-		if delta > maxDelta {
-			continue
-		}
-		if bestIdx == -1 || delta < bestDelta {
-			bestIdx = i
-			bestDelta = delta
-		}
+		return bestIdx, bestDelta
 	}
-	if bestIdx == -1 {
-		return -1, nil
+
+	if idx, _ := find(true); idx != -1 {
+		return idx, &events[idx]
 	}
-	return bestIdx, &events[bestIdx]
+	if idx, _ := find(false); idx != -1 {
+		return idx, &events[idx]
+	}
+
+	return -1, nil
 }
 
 func inferExitReason(exitPrice float64, ev *exitEvent) string {
@@ -400,12 +502,48 @@ func inferExitReason(exitPrice float64, ev *exitEvent) string {
 		return "REVERSE"
 	case "FLAT":
 		return "TIME"
+	case reasonFlatProbe:
+		return "TIME"
+	case reasonWSClose:
+		return "CLOSE"
 	default:
 		return "OTHER"
 	}
 }
 
-func fetchClosedPnlPage(client *api.RESTClient, symbol string, start, end int64, cursor string) ([]closedPnlItem, string, error) {
+func closestExitEvent(events []exitEvent, exitTime time.Time, side string) (time.Duration, *exitEvent) {
+	bestIdx := -1
+	var bestDelta time.Duration
+	for i, ev := range events {
+		if side != "" && ev.Side != "" && ev.Side != side {
+			continue
+		}
+		delta := exitTime.Sub(ev.Time)
+		if delta < 0 {
+			delta = -delta
+		}
+		if bestIdx == -1 || delta < bestDelta {
+			bestIdx = i
+			bestDelta = delta
+		}
+	}
+	if bestIdx == -1 {
+		return 0, nil
+	}
+	return bestDelta, &events[bestIdx]
+}
+
+func clampClosedPnlLimit(limit int) int {
+	if limit <= 0 {
+		return 200
+	}
+	if limit > 200 {
+		return 200
+	}
+	return limit
+}
+
+func fetchClosedPnlPageWithOptions(client *api.RESTClient, symbol string, start, end int64, cursor string, limit int, useTimeRange bool) ([]closedPnlItem, string, error) {
 	const path = "/v5/position/closed-pnl"
 
 	q := url.Values{}
@@ -413,9 +551,11 @@ func fetchClosedPnlPage(client *api.RESTClient, symbol string, start, end int64,
 	if symbol != "" {
 		q.Set("symbol", symbol)
 	}
-	q.Set("startTime", fmt.Sprintf("%d", start))
-	q.Set("endTime", fmt.Sprintf("%d", end))
-	q.Set("limit", "200")
+	if useTimeRange {
+		q.Set("startTime", fmt.Sprintf("%d", start))
+		q.Set("endTime", fmt.Sprintf("%d", end))
+	}
+	q.Set("limit", fmt.Sprintf("%d", clampClosedPnlLimit(limit)))
 	if cursor != "" {
 		q.Set("cursor", cursor)
 	}
@@ -453,6 +593,10 @@ func fetchClosedPnlPage(client *api.RESTClient, symbol string, start, end int64,
 	return r.Result.List, r.Result.NextPageCursor, nil
 }
 
+func fetchClosedPnlPage(client *api.RESTClient, symbol string, start, end int64, cursor string) ([]closedPnlItem, string, error) {
+	return fetchClosedPnlPageWithOptions(client, symbol, start, end, cursor, 200, true)
+}
+
 func fetchClosedPnl(client *api.RESTClient, symbol string, start, end int64) ([]closedPnlItem, error) {
 	var all []closedPnlItem
 	cursor := ""
@@ -463,6 +607,34 @@ func fetchClosedPnl(client *api.RESTClient, symbol string, start, end int64) ([]
 		}
 		all = append(all, page...)
 		if next == "" || len(page) == 0 {
+			break
+		}
+		cursor = next
+	}
+	return all, nil
+}
+
+func fetchLatestClosedPnl(client *api.RESTClient, symbol string, maxRows int) ([]closedPnlItem, error) {
+	if maxRows <= 0 {
+		return nil, nil
+	}
+
+	all := make([]closedPnlItem, 0, maxRows)
+	cursor := ""
+	for len(all) < maxRows {
+		remaining := maxRows - len(all)
+		page, next, err := fetchClosedPnlPageWithOptions(client, symbol, 0, 0, cursor, remaining, false)
+		if err != nil {
+			return nil, err
+		}
+		if len(page) == 0 {
+			break
+		}
+		if len(page) > remaining {
+			page = page[:remaining]
+		}
+		all = append(all, page...)
+		if next == "" {
 			break
 		}
 		cursor = next
@@ -496,10 +668,43 @@ func main() {
 	hours := flag.Int("hours", 24, "lookback window in hours")
 	symbolFlag := flag.String("symbol", "", "instrument symbol (defaults to config Symbol)")
 	today := flag.Bool("today", false, "limit to current calendar day (local time); overrides -hours")
+	lastN := flag.Int("last", 0, "show latest N closed trades (fast mode, ignores -hours/-today and skips log parsing)")
 	outCSV := flag.String("out", "report.csv", "path to write CSV report (empty to disable)")
 	logPath := flag.String("logs", "logs", "log file or directory for exit reason join (supports .log/.log.gz)")
+	noLogJoin := flag.Bool("no-log-join", false, "disable log parsing and exit reason join")
 	joinWindowSec := flag.Int("log-join-window", 300, "max seconds between log exit event and trade exit time")
+	logTZ := flag.String("log-tz", "", "IANA timezone for log timestamps (e.g., Europe/Moscow); defaults to local")
+	logOffsetSec := flag.Int("log-time-offset", 0, "apply fixed offset (seconds) to log timestamps before join")
+	debug := flag.Bool("debug", false, "enable verbose log-join diagnostics")
+	httpTimeoutSec := flag.Int("http-timeout", 30, "HTTP timeout in seconds for API calls (0 disables)")
 	flag.Parse()
+
+	debugf := func(format string, args ...any) {
+		if *debug {
+			fmt.Fprintf(os.Stderr, "[pnl_report] "+format+"\n", args...)
+		}
+	}
+
+	if *httpTimeoutSec > 0 {
+		http.DefaultClient.Timeout = time.Duration(*httpTimeoutSec) * time.Second
+	}
+	if *lastN < 0 {
+		fmt.Fprintln(os.Stderr, "-last must be >= 0")
+		os.Exit(1)
+	}
+	if *lastN > 0 {
+		*noLogJoin = true
+	}
+
+	logLoc := time.Local
+	if *logTZ != "" {
+		if loc, err := time.LoadLocation(*logTZ); err == nil {
+			logLoc = loc
+		} else {
+			fmt.Fprintf(os.Stderr, "invalid log-tz %q: %v (using local)\n", *logTZ, err)
+		}
+	}
+	logOffset := time.Duration(*logOffsetSec) * time.Second
 
 	cfg := config.LoadConfig()
 	if *symbolFlag != "" {
@@ -516,29 +721,51 @@ func main() {
 		start = startOfDay.UnixMilli()
 	}
 
-	items, err := fetchClosedPnl(client, cfg.Symbol, start, end)
+	var (
+		items []closedPnlItem
+		err   error
+	)
+	if *lastN > 0 {
+		debugf("fetching latest %d closed PnL rows symbol=%s", *lastN, cfg.Symbol)
+		items, err = fetchLatestClosedPnl(client, cfg.Symbol, *lastN)
+	} else {
+		debugf("fetching closed PnL symbol=%s start=%s end=%s", cfg.Symbol, time.UnixMilli(start).Format(time.RFC3339), time.UnixMilli(end).Format(time.RFC3339))
+		items, err = fetchClosedPnl(client, cfg.Symbol, start, end)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error fetching closed PnL: %v\n", err)
 		os.Exit(1)
 	}
+	debugf("fetched %d closed PnL rows", len(items))
+	debugf("log join tz=%s offset=%s", logLoc, logOffset)
 
 	var exitEvents []exitEvent
-	if *logPath != "" {
-		events, err := loadExitEvents(*logPath)
+	if *noLogJoin {
+		debugf("log join disabled")
+	} else if *logPath != "" {
+		events, err := loadExitEvents(*logPath, logLoc, logOffset, debugf)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "log join disabled: %v\n", err)
 		} else {
 			exitEvents = events
+			debugf("loaded %d exit events from %s", len(exitEvents), *logPath)
 		}
 	}
 	usedEvents := make([]bool, len(exitEvents))
 	joinWindow := time.Duration(*joinWindowSec) * time.Second
 
-	openPositions, openErr := fetchOpenPositions(client, cfg.Symbol)
-	if openErr != nil {
-		fmt.Fprintf(os.Stderr, "error fetching open positions: %v\n", openErr)
+	var openPositions []openPosition
+	if *lastN == 0 {
+		openPositions, err = fetchOpenPositions(client, cfg.Symbol)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error fetching open positions: %v\n", err)
+		}
 	}
 	if len(items) == 0 && len(openPositions) == 0 {
+		if *lastN > 0 {
+			fmt.Println("No closed positions found.")
+			return
+		}
 		fmt.Println("No closed positions in the selected window.")
 		return
 	}
@@ -550,6 +777,9 @@ func main() {
 	windowLabel := fmt.Sprintf("last %dh", *hours)
 	if *today {
 		windowLabel = "today"
+	}
+	if *lastN > 0 {
+		windowLabel = fmt.Sprintf("last %d trades", *lastN)
 	}
 
 	fmt.Printf("Closed PnL %s for %s\n", windowLabel, cfg.Symbol)
@@ -579,7 +809,7 @@ func main() {
 		trailDistance := ""
 
 		if len(exitEvents) > 0 {
-			exitTime := parseTimeMs(it.UpdatedTime).In(time.Local)
+			exitTime := parseTimeMs(it.UpdatedTime).In(logLoc)
 			side := normalizeSide(it.Side)
 			if idx, ev := pickExitEvent(exitEvents, exitTime, side, joinWindow, usedEvents); ev != nil {
 				usedEvents[idx] = true
@@ -603,6 +833,16 @@ func main() {
 					}
 				} else {
 					trailActive = "false"
+				}
+				debugf("match trade time=%s side=%s exit=%.2f reason=%s tpInit=%.2f tpFinal=%.2f slInit=%.2f slFinal=%.2f trail=%t",
+					exitTime.Format(time.RFC3339), side, exit, exitReason, ev.TPInit, ev.TPFinal, ev.SLInit, ev.SLFinal, ev.TrailActive)
+			} else if *debug {
+				minDelta, closest := closestExitEvent(exitEvents, exitTime, side)
+				if closest != nil {
+					debugf("no match trade time=%s side=%s exit=%.2f window=%s closest=%s at=%s reason=%s",
+						exitTime.Format(time.RFC3339), side, exit, joinWindow, minDelta, closest.Time.Format(time.RFC3339), closest.EndReason)
+				} else {
+					debugf("no match trade time=%s side=%s exit=%.2f window=%s", exitTime.Format(time.RFC3339), side, exit, joinWindow)
 				}
 			}
 		}
@@ -701,5 +941,15 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Printf("CSV saved to %s\n", *outCSV)
+	}
+
+	if *debug && len(exitEvents) > 0 {
+		unmatched := 0
+		for _, used := range usedEvents {
+			if !used {
+				unmatched++
+			}
+		}
+		debugf("unmatched exit events: %d/%d", unmatched, len(exitEvents))
 	}
 }

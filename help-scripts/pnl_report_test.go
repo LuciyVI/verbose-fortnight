@@ -20,8 +20,13 @@ func TestParseTimeMsHandlesSeconds(t *testing.T) {
 
 func TestFetchClosedPnlPagination(t *testing.T) {
 	callCount := 0
+	var starts, ends, limits []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		callCount++
+		q := r.URL.Query()
+		starts = append(starts, q.Get("startTime"))
+		ends = append(ends, q.Get("endTime"))
+		limits = append(limits, q.Get("limit"))
 		if callCount == 1 {
 			_, _ = w.Write([]byte(`{"retCode":0,"retMsg":"OK","result":{"list":[{"symbol":"BTCUSDT","side":"Buy","closedPnl":"1","avgEntryPrice":"10","avgExitPrice":"11","qty":"1","createdTime":"1","updatedTime":"1","execFee":"0"}],"nextPageCursor":"c1"}}`))
 		} else {
@@ -46,6 +51,65 @@ func TestFetchClosedPnlPagination(t *testing.T) {
 	}
 	if items[0].Side != "Buy" || items[1].Side != "Sell" {
 		t.Fatalf("unexpected items: %#v", items)
+	}
+	if len(starts) != callCount || len(ends) != callCount || len(limits) != callCount {
+		t.Fatalf("unexpected query capture sizes starts=%d ends=%d limits=%d calls=%d", len(starts), len(ends), len(limits), callCount)
+	}
+	for i := range starts {
+		if starts[i] == "" || ends[i] == "" {
+			t.Fatalf("expected start/end on request %d, got start=%q end=%q", i+1, starts[i], ends[i])
+		}
+		if limits[i] != "200" {
+			t.Fatalf("expected limit=200 on request %d, got %q", i+1, limits[i])
+		}
+	}
+}
+
+func TestFetchLatestClosedPnlUsesRemainingLimitWithoutTimeRange(t *testing.T) {
+	callCount := 0
+	var starts, ends, limits, cursors []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		q := r.URL.Query()
+		starts = append(starts, q.Get("startTime"))
+		ends = append(ends, q.Get("endTime"))
+		limits = append(limits, q.Get("limit"))
+		cursors = append(cursors, q.Get("cursor"))
+		if callCount == 1 {
+			_, _ = w.Write([]byte(`{"retCode":0,"retMsg":"OK","result":{"list":[{"symbol":"BTCUSDT","side":"Buy","closedPnl":"1","avgEntryPrice":"10","avgExitPrice":"11","qty":"1","createdTime":"1","updatedTime":"1","execFee":"0"},{"symbol":"BTCUSDT","side":"Sell","closedPnl":"2","avgEntryPrice":"12","avgExitPrice":"11","qty":"1","createdTime":"2","updatedTime":"2","execFee":"0"}],"nextPageCursor":"c1"}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"retCode":0,"retMsg":"OK","result":{"list":[{"symbol":"BTCUSDT","side":"Buy","closedPnl":"3","avgEntryPrice":"13","avgExitPrice":"12","qty":"1","createdTime":"3","updatedTime":"3","execFee":"0"},{"symbol":"BTCUSDT","side":"Sell","closedPnl":"4","avgEntryPrice":"14","avgExitPrice":"13","qty":"1","createdTime":"4","updatedTime":"4","execFee":"0"}],"nextPageCursor":"c2"}}`))
+	}))
+	defer srv.Close()
+
+	cfg := config.LoadConfig()
+	cfg.DemoRESTHost = srv.URL
+	cfg.APIKey = "k"
+	cfg.APISecret = "s"
+	client := api.NewRESTClient(cfg, nil)
+
+	items, err := fetchLatestClosedPnl(client, "BTCUSDT", 3)
+	if err != nil {
+		t.Fatalf("fetchLatestClosedPnl error: %v", err)
+	}
+	if len(items) != 3 {
+		t.Fatalf("expected 3 items, got %d", len(items))
+	}
+	if callCount != 2 {
+		t.Fatalf("expected 2 calls, got %d", callCount)
+	}
+	if items[0].Side != "Buy" || items[1].Side != "Sell" || items[2].Side != "Buy" {
+		t.Fatalf("unexpected items sequence: %#v", items)
+	}
+	if limits[0] != "3" || limits[1] != "1" {
+		t.Fatalf("expected limits [3 1], got %v", limits)
+	}
+	if starts[0] != "" || starts[1] != "" || ends[0] != "" || ends[1] != "" {
+		t.Fatalf("expected no time range params, got starts=%v ends=%v", starts, ends)
+	}
+	if cursors[0] != "" || cursors[1] != "c1" {
+		t.Fatalf("unexpected cursors: %v", cursors)
 	}
 }
 
