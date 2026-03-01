@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"verbose-fortnight/api"
@@ -47,10 +48,21 @@ func (om *OrderManager) FormatQty(qty, step float64) string {
 	return strconv.FormatFloat(qty, 'f', dec, 64)
 }
 
-// PlaceOrderMarket places a market order
+// PlaceOrderMarket places a market order.
 func (om *OrderManager) PlaceOrderMarket(side string, qty float64, reduceOnly bool) error {
+	_, err := om.PlaceOrderMarketWithID(side, qty, reduceOnly)
+	return err
+}
+
+// PlaceOrderMarketWithID places a market order and returns exchange order id.
+func (om *OrderManager) PlaceOrderMarketWithID(side string, qty float64, reduceOnly bool) (string, error) {
+	return om.PlaceOrderMarketWithLinkID(side, qty, reduceOnly, "")
+}
+
+// PlaceOrderMarketWithLinkID places a market order and optionally sets orderLinkId.
+func (om *OrderManager) PlaceOrderMarketWithLinkID(side string, qty float64, reduceOnly bool, orderLinkID string) (string, error) {
 	if side == "" {
-		return fmt.Errorf("invalid side: empty")
+		return "", fmt.Errorf("invalid side: empty")
 	}
 	const path = "/v5/order/create"
 	body := map[string]interface{}{
@@ -64,6 +76,9 @@ func (om *OrderManager) PlaceOrderMarket(side string, qty float64, reduceOnly bo
 	}
 	if reduceOnly {
 		body["reduceOnly"] = true
+	}
+	if strings.TrimSpace(orderLinkID) != "" {
+		body["orderLinkId"] = strings.TrimSpace(orderLinkID)
 	}
 
 	raw, _ := json.Marshal(body)
@@ -83,7 +98,7 @@ func (om *OrderManager) PlaceOrderMarket(side string, qty float64, reduceOnly bo
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		om.Logger.Error("Failed to send POST request to exchange: %v", err)
-		return err
+		return "", err
 	}
 	defer resp.Body.Close()
 
@@ -101,7 +116,7 @@ func (om *OrderManager) PlaceOrderMarket(side string, qty float64, reduceOnly bo
 	}
 	if json.Unmarshal(reply, &r) != nil || r.RetCode != 0 {
 		om.Logger.Error("Error in market order response: %d: %s", r.RetCode, r.RetMsg)
-		return fmt.Errorf("error placing market order: %d: %s", r.RetCode, r.RetMsg)
+		return "", fmt.Errorf("error placing market order: %d: %s", r.RetCode, r.RetMsg)
 	}
 	if r.Result.OrderID != "" {
 		om.State.Lock()
@@ -110,11 +125,16 @@ func (om *OrderManager) PlaceOrderMarket(side string, qty float64, reduceOnly bo
 		om.Logger.Info("Market order id: %s", r.Result.OrderID)
 	}
 	om.Logger.Info("Market %s %.4f OK", side, qty)
-	return nil
+	return r.Result.OrderID, nil
 }
 
 // PlaceTakeProfitOrder places a take profit order
 func (om *OrderManager) PlaceTakeProfitOrder(side string, qty, price float64) error {
+	return om.PlaceTakeProfitOrderWithLink(side, qty, price, "")
+}
+
+// PlaceTakeProfitOrderWithLink places a take profit order and optionally sets orderLinkId.
+func (om *OrderManager) PlaceTakeProfitOrderWithLink(side string, qty, price float64, orderLinkID string) error {
 	const path = "/v5/order/create"
 	body := map[string]interface{}{
 		"category":    "linear",
@@ -126,6 +146,9 @@ func (om *OrderManager) PlaceTakeProfitOrder(side string, qty, price float64) er
 		"timeInForce": "GTC",
 		"reduceOnly":  true,
 		"positionIdx": 0,
+	}
+	if strings.TrimSpace(orderLinkID) != "" {
+		body["orderLinkId"] = strings.TrimSpace(orderLinkID)
 	}
 
 	raw, _ := json.Marshal(body)
@@ -160,6 +183,11 @@ func (om *OrderManager) PlaceTakeProfitOrder(side string, qty, price float64) er
 
 // PlaceStopLossOrder places a stop loss order
 func (om *OrderManager) PlaceStopLossOrder(side string, qty, price float64) error {
+	return om.PlaceStopLossOrderWithLink(side, qty, price, "")
+}
+
+// PlaceStopLossOrderWithLink places a stop loss order and optionally sets orderLinkId.
+func (om *OrderManager) PlaceStopLossOrderWithLink(side string, qty, price float64, orderLinkID string) error {
 	const path = "/v5/order/create"
 	body := map[string]interface{}{
 		"category":    "linear",
@@ -171,6 +199,9 @@ func (om *OrderManager) PlaceStopLossOrder(side string, qty, price float64) erro
 		"timeInForce": "GTC",
 		"reduceOnly":  true,
 		"positionIdx": 0,
+	}
+	if strings.TrimSpace(orderLinkID) != "" {
+		body["orderLinkId"] = strings.TrimSpace(orderLinkID)
 	}
 
 	raw, _ := json.Marshal(body)
