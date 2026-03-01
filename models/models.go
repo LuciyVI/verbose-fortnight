@@ -120,6 +120,99 @@ type KlineData struct {
 	Confirm bool   `json:"confirm"`
 }
 
+// PositionFSMState is the deterministic lifecycle stage of a position.
+type PositionFSMState string
+
+const (
+	PositionStateFlat    PositionFSMState = "FLAT"
+	PositionStateOpening PositionFSMState = "OPENING"
+	PositionStateOpen    PositionFSMState = "OPEN"
+	PositionStateClosing PositionFSMState = "CLOSING"
+)
+
+// StopIntent requests a TP/SL update. Only StopController may write to exchange.
+type StopIntent struct {
+	Kind        string
+	TradeID     string
+	LifecycleID string
+	Side        string
+	Entry       float64
+	QtyLeft     float64
+	FeeEstimate float64
+	TP          float64
+	SL          float64
+	Breakeven   bool
+	Reason      string
+	TS          time.Time
+}
+
+// StopController keeps desired/applied TP/SL levels for idempotent writes.
+type StopController struct {
+	DesiredTP float64
+	DesiredSL float64
+	AppliedTP float64
+	AppliedSL float64
+	TradeID   string
+	Reason    string
+	UpdatedAt time.Time
+}
+
+// ExecutionEvent is a normalized execution payload used by strategy/FSM logic.
+type ExecutionEvent struct {
+	TradeID           string
+	ExecID            string
+	OrderID           string
+	OrderLinkID       string
+	ExecSide          string
+	PositionSide      string
+	ReduceOnly        bool
+	Qty               float64
+	Price             float64
+	ClosedSize        float64
+	LeavesQty         float64
+	PositionSizeAfter float64
+}
+
+// TradingBlockReason is a typed reason for trading gate status.
+type TradingBlockReason string
+
+const (
+	BlockedReasonNone      TradingBlockReason = ""
+	BlockedReasonReconnect TradingBlockReason = "RECONNECT"
+	BlockedReasonInvariant TradingBlockReason = "INVARIANT"
+	BlockedReasonFatalAPI  TradingBlockReason = "FATAL_API"
+	BlockedReasonManual    TradingBlockReason = "MANUAL"
+)
+
+// RuntimeCounters contains lightweight operational counters for P2.x features.
+type RuntimeCounters struct {
+	EdgePass               uint64 `json:"edgePass"`
+	EdgeReject             uint64 `json:"edgeReject"`
+	EdgeRejectMinDepth     uint64 `json:"edgeRejectMinDepth"`
+	EdgeRejectWideSpread   uint64 `json:"edgeRejectWideSpread"`
+	EdgeRejectLowImbalance uint64 `json:"edgeRejectLowImbalance"`
+
+	BEIntentSent                 uint64 `json:"beIntentSent"`
+	BEIntentSkippedAlreadyBetter uint64 `json:"beIntentSkippedAlreadyBetter"`
+
+	BackfillFetched   uint64 `json:"backfillFetched"`
+	BackfillProcessed uint64 `json:"backfillProcessed"`
+	BackfillDeduped   uint64 `json:"backfillDeduped"`
+	BackfillGaps      uint64 `json:"backfillGaps"`
+	BackfillErrors    uint64 `json:"backfillErrors"`
+}
+
+// RuntimeHealth contains recent runtime timestamps/errors for operator diagnostics.
+type RuntimeHealth struct {
+	LastBackfillCycleTS time.Time `json:"lastBackfillCycleTs"`
+	LastBackfillError   string    `json:"lastBackfillError"`
+	LastBackfillErrorTS time.Time `json:"lastBackfillErrorTs"`
+	LastWSExecutionTS   time.Time `json:"lastWsExecutionTs"`
+	LastEdgeDecisionTS  time.Time `json:"lastEdgeDecisionTs"`
+	StatusServerError   string    `json:"statusServerError"`
+	StatusServerStarted time.Time `json:"statusServerStartedTs"`
+}
+
 // CloseFloat returns the close price as float64
 func (k KlineData) CloseFloat() float64 {
 	f, _ := strconv.ParseFloat(k.Close, 64)
@@ -149,7 +242,7 @@ type State struct {
 	PubPtr  atomic.Pointer[websocket.Conn]
 
 	// Constants for trading
-	SlPerc    float64 // Процент SL от TP (1%)
+	SlPerc    float64 // Процент фиксированного SL от цены входа (0.25%)
 	TrailPerc float64 // Процент трейлинг-стопа (0.5%)
 	SmaLen    int     // окно для SMA-воркера
 
@@ -157,6 +250,7 @@ type State struct {
 	OrderbookReady atomic.Bool
 	PosSide        string
 	OrderQty       float64
+	PositionState  PositionFSMState
 
 	// Strategy state
 	Closes    []float64
@@ -200,6 +294,31 @@ type State struct {
 	LastEntryDir   string
 	LastOrderID    string
 	LastExecID     string
+	LastExecCursor string
+	ActiveTradeID  string
+	PendingSide    string
+	PendingPrice   float64
+	PendingTradeID string
+	OrderTradeIDs  map[string]string
+	ExecTradeIDs   map[string]string
+	OpeningExecAck bool
+	OpeningPosAck  bool
+	TradingBlocked bool
+	BlockReason    TradingBlockReason
+	BlockMessage   string
+	BlockSetAt     time.Time
+	StopCtrl       StopController
+	ProcessedExec  map[string]time.Time
+	ExecSeenOrder  []string
+	ExecDedupMax   int
+	ExecDedupTTL   time.Duration
+	// MoveSLToBE dedup guard (per lifecycle/target).
+	LastBEIntentTradeID string
+	LastBEIntentSL      float64
+	LastBEIntentTS      time.Time
+	// Runtime counters/health for observability.
+	RuntimeCounters RuntimeCounters
+	RuntimeHealth   RuntimeHealth
 
 	// Volume tracking
 	RecentVolumes []float64 // Store recent volumes for calculating average/surge detection
@@ -240,8 +359,140 @@ type State struct {
 
 	// Channels
 	TPChan          chan TPJob
+	StopIntentChan  chan StopIntent
 	SigChan         chan Signal
 	MarketRegime    string
 	RegimeCandidate string
 	RegimeStreak    int
+}
+
+func (s *State) RecordEdgeDecision(pass bool, reason string, ts time.Time) {
+	if s == nil {
+		return
+	}
+	if ts.IsZero() {
+		ts = time.Now()
+	}
+	s.Lock()
+	if pass {
+		s.RuntimeCounters.EdgePass++
+	} else {
+		s.RuntimeCounters.EdgeReject++
+		switch reason {
+		case "min_depth":
+			s.RuntimeCounters.EdgeRejectMinDepth++
+		case "wide_spread":
+			s.RuntimeCounters.EdgeRejectWideSpread++
+		case "low_imbalance":
+			s.RuntimeCounters.EdgeRejectLowImbalance++
+		}
+	}
+	s.RuntimeHealth.LastEdgeDecisionTS = ts
+	s.Unlock()
+}
+
+func (s *State) RecordBEIntentSent(tradeID string, targetSL float64, ts time.Time) {
+	if s == nil {
+		return
+	}
+	if ts.IsZero() {
+		ts = time.Now()
+	}
+	s.Lock()
+	s.RuntimeCounters.BEIntentSent++
+	s.LastBEIntentTradeID = tradeID
+	s.LastBEIntentSL = targetSL
+	s.LastBEIntentTS = ts
+	s.Unlock()
+}
+
+func (s *State) RecordBEIntentSkippedAlreadyBetter() {
+	if s == nil {
+		return
+	}
+	s.Lock()
+	s.RuntimeCounters.BEIntentSkippedAlreadyBetter++
+	s.Unlock()
+}
+
+func (s *State) RecordBackfillCycle(fetched, processed, deduped, gaps uint64, ts time.Time) {
+	if s == nil {
+		return
+	}
+	if ts.IsZero() {
+		ts = time.Now()
+	}
+	s.Lock()
+	s.RuntimeCounters.BackfillFetched += fetched
+	s.RuntimeCounters.BackfillProcessed += processed
+	s.RuntimeCounters.BackfillDeduped += deduped
+	s.RuntimeCounters.BackfillGaps += gaps
+	s.RuntimeHealth.LastBackfillCycleTS = ts
+	s.RuntimeHealth.LastBackfillError = ""
+	s.RuntimeHealth.LastBackfillErrorTS = time.Time{}
+	s.Unlock()
+}
+
+func (s *State) RecordBackfillError(errMsg string, ts time.Time) {
+	if s == nil {
+		return
+	}
+	if ts.IsZero() {
+		ts = time.Now()
+	}
+	s.Lock()
+	s.RuntimeCounters.BackfillErrors++
+	s.RuntimeHealth.LastBackfillCycleTS = ts
+	s.RuntimeHealth.LastBackfillError = errMsg
+	s.RuntimeHealth.LastBackfillErrorTS = ts
+	s.Unlock()
+}
+
+func (s *State) RecordWSExecution(ts time.Time) {
+	if s == nil {
+		return
+	}
+	if ts.IsZero() {
+		ts = time.Now()
+	}
+	s.Lock()
+	s.RuntimeHealth.LastWSExecutionTS = ts
+	s.Unlock()
+}
+
+func (s *State) RecordStatusServerStarted(ts time.Time) {
+	if s == nil {
+		return
+	}
+	if ts.IsZero() {
+		ts = time.Now()
+	}
+	s.Lock()
+	s.RuntimeHealth.StatusServerStarted = ts
+	s.RuntimeHealth.StatusServerError = ""
+	s.Unlock()
+}
+
+func (s *State) RecordStatusServerError(errMsg string, ts time.Time) {
+	if s == nil {
+		return
+	}
+	if ts.IsZero() {
+		ts = time.Now()
+	}
+	s.Lock()
+	s.RuntimeHealth.StatusServerError = errMsg
+	if s.RuntimeHealth.StatusServerStarted.IsZero() {
+		s.RuntimeHealth.StatusServerStarted = ts
+	}
+	s.Unlock()
+}
+
+func (s *State) RuntimeSnapshot() (RuntimeCounters, RuntimeHealth) {
+	if s == nil {
+		return RuntimeCounters{}, RuntimeHealth{}
+	}
+	s.RLock()
+	defer s.RUnlock()
+	return s.RuntimeCounters, s.RuntimeHealth
 }

@@ -85,11 +85,18 @@ type Config struct {
 	LogCompress   bool
 	LogLevel      int // 0=DEBUG, 1=INFO, 2=WARNING, 3=ERROR
 	// Status server configuration
-	StatusAddr string
+	StatusAddr         string
+	EnableStatusServer bool
 	// Daemon configuration
 	DaemonMode bool
 	// Trailing configuration
 	DisableTrailing bool
+	// Feature flags for staged rollout of P1/P2 improvements
+	EnableFillJSONLog       bool
+	EnableLifecycleID       bool
+	EnableExecutionBackfill bool
+	EnablePartialBERule     bool
+	EnableEdgeFilter        bool
 }
 
 // LoadConfig loads configuration from environment variables or uses defaults
@@ -130,7 +137,7 @@ func LoadConfig() *Config {
 		AtrTPCapMultRange:          2.0,
 		AtrTPCapMultTrend:          3.5,
 		EnableTPSLStage1:           true,
-		SlPerc:                     0.01,
+		SlPerc:                     0.0025,
 		TrailPerc:                  0.005,
 		TrailActivation:            0.6,
 		TrailTightPerc:             0.0015,
@@ -146,11 +153,11 @@ func LoadConfig() *Config {
 		DynamicTP:                  false,
 		DynamicTPK:                 getEnvAsFloat("DYNAMIC_TP_K", 1.0),
 		DynamicTPVolatilityFactor:  getEnvAsFloat("DYNAMIC_TP_VOLATILITY_FACTOR", 6.0),
-		DynamicTPMinPerc:           getEnvAsFloat("DYNAMIC_TP_MIN_PERC", 0.4),
-		DynamicTPMaxPerc:           getEnvAsFloat("DYNAMIC_TP_MAX_PERC", 1.8),
-		OrderbookStrengthThreshold: 0.5,
-		OrderbookLevels:            5,
-		OrderbookMinDepth:          0,
+		DynamicTPMinPerc:           getEnvAsFloat("DYNAMIC_TP_MIN_PERC", 0.7),
+		DynamicTPMaxPerc:           getEnvAsFloat("DYNAMIC_TP_MAX_PERC", 0.7),
+		OrderbookStrengthThreshold: getEnvAsFloat("ORDERBOOK_STRENGTH_THRESHOLD", 0.5),
+		OrderbookLevels:            getEnvAsInt("ORDERBOOK_LEVELS", 5),
+		OrderbookMinDepth:          getEnvAsFloat("ORDERBOOK_MIN_DEPTH", 0),
 		// Trim orderbook imbalance history to avoid perpetual instability filtering
 		OrderbookStabilityLookback: 8,
 		OrderbookStabilityRange:    3.0,
@@ -160,10 +167,10 @@ func LoadConfig() *Config {
 		PartialTakeProfitRatio:     0.4, // close 40% at first target
 		PartialTakeProfitProgress:  0.6, // first target at 60% progress to TP
 		SLSetDelaySec:              1,   // delay before sending SL to avoid immediate noise
-		SLPocketPerc:               0.0005,
-		PocketFeeMult:              2.0,
-		SLFeeFloorMult:             4.0,
-		TPFeeFloorMult:             5.0,
+		SLPocketPerc:               getEnvAsFloat("SL_POCKET_PERC", 0.0005),
+		PocketFeeMult:              getEnvAsFloat("POCKET_FEE_MULT", 1.0),
+		SLFeeFloorMult:             getEnvAsFloat("SL_FEE_FLOOR_MULT", 1.0),
+		TPFeeFloorMult:             getEnvAsFloat("TP_FEE_FLOOR_MULT", 1.0),
 		GracePeriodSec:             45,  // do not flip/close within this time after entry
 		MinReentryFeeBufferMult:    3.0, // require at least 3x fee buffer move before re-enter/flip
 		// Logging defaults
@@ -174,11 +181,18 @@ func LoadConfig() *Config {
 		LogCompress:   true,
 		LogLevel:      1, // INFO level
 		// Status server defaults
-		StatusAddr: getEnv("STATUS_ADDR", "127.0.0.1:6061"),
+		StatusAddr:         getEnv("STATUS_ADDR", "127.0.0.1:6061"),
+		EnableStatusServer: getEnvAsBool("ENABLE_STATUS_SERVER", true),
 		// Daemon defaults
 		DaemonMode: getEnvAsBool("DAEMON_MODE", false),
 		// Trailing defaults
 		DisableTrailing: true,
+		// P1/P2 feature flags
+		EnableFillJSONLog:       getEnvAsBool("ENABLE_FILL_JSON_LOG", false),
+		EnableLifecycleID:       getEnvAsBool("ENABLE_LIFECYCLE_ID", false),
+		EnableExecutionBackfill: getEnvAsBool("ENABLE_EXECUTION_BACKFILL", false),
+		EnablePartialBERule:     getEnvAsBool("ENABLE_PARTIAL_BE_RULE", false),
+		EnableEdgeFilter:        getEnvAsBool("ENABLE_EDGE_FILTER", false),
 	}
 }
 
@@ -203,6 +217,18 @@ func getEnvAsFloat(key string, defaultValue float64) float64 {
 		return defaultValue
 	}
 	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return defaultValue
+	}
+	return parsed
+}
+
+func getEnvAsInt(key string, defaultValue int) int {
+	value := getEnv(key, "")
+	if value == "" {
+		return defaultValue
+	}
+	parsed, err := strconv.Atoi(value)
 	if err != nil {
 		return defaultValue
 	}

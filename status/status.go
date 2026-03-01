@@ -21,10 +21,16 @@ type statusResponse struct {
 	Signal       *models.SignalSnapshot    `json:"signal,omitempty"`
 	Indicators   *models.IndicatorSnapshot `json:"indicators,omitempty"`
 	Position     *models.PositionSnapshot  `json:"position,omitempty"`
+	Counters     models.RuntimeCounters    `json:"counters"`
+	Health       models.RuntimeHealth      `json:"health"`
 }
 
 // StartServer starts a local HTTP status server for diagnostics.
 func StartServer(cfg *config.Config, state *models.State, logger logging.LoggerInterface) *http.Server {
+	if cfg != nil && !cfg.EnableStatusServer {
+		logger.Info("Status server disabled by ENABLE_STATUS_SERVER=0")
+		return nil
+	}
 	addr := strings.TrimSpace(cfg.StatusAddr)
 	if addr == "" || strings.EqualFold(addr, "off") || strings.EqualFold(addr, "disabled") {
 		logger.Info("Status server disabled")
@@ -59,6 +65,7 @@ func StartServer(cfg *config.Config, state *models.State, logger logging.LoggerI
 			posCopy := lastPosition
 			position = &posCopy
 		}
+		counters, health := state.RuntimeSnapshot()
 
 		resp := statusResponse{
 			Time:         time.Now(),
@@ -69,6 +76,8 @@ func StartServer(cfg *config.Config, state *models.State, logger logging.LoggerI
 			Signal:       signal,
 			Indicators:   indicators,
 			Position:     position,
+			Counters:     counters,
+			Health:       health,
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -87,9 +96,15 @@ func StartServer(cfg *config.Config, state *models.State, logger logging.LoggerI
 	}
 
 	go func() {
+		if state != nil {
+			state.RecordStatusServerStarted(time.Now().UTC())
+		}
 		logger.Info("Status server listening on %s", addr)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logger.Error("Status server error: %v", err)
+			if state != nil {
+				state.RecordStatusServerError(err.Error(), time.Now().UTC())
+			}
+			logger.Warning("Status server degraded (continuing without /status): %v", err)
 		}
 	}()
 

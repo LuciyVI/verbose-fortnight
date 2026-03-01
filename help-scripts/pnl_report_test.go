@@ -113,77 +113,173 @@ func TestFetchLatestClosedPnlUsesRemainingLimitWithoutTimeRange(t *testing.T) {
 	}
 }
 
-func TestCalcPnLShortProfit(t *testing.T) {
-	entry := 94000.0
-	exit := 92308.2
-	qty := 0.001
-	fee := 0.1100
-
-	gross, net := CalcPnL("Sell", entry, exit, qty, fee)
-	if math.Abs(net-1.5818) > 1e-4 {
-		t.Fatalf("short profit net got %.4f want 1.5818", net)
+func TestCalcPnLByPositionSide(t *testing.T) {
+	tests := []struct {
+		name         string
+		positionSide string
+		entry        float64
+		exit         float64
+		qty          float64
+		wantGross    float64
+	}{
+		{
+			name:         "long profit",
+			positionSide: "Buy",
+			entry:        100,
+			exit:         110,
+			qty:          1,
+			wantGross:    10,
+		},
+		{
+			name:         "short loss",
+			positionSide: "Sell",
+			entry:        100,
+			exit:         110,
+			qty:          1,
+			wantGross:    -10,
+		},
+		{
+			name:         "short profit",
+			positionSide: "Sell",
+			entry:        110,
+			exit:         100,
+			qty:          1,
+			wantGross:    10,
+		},
 	}
-	if gross <= 0 {
-		t.Fatalf("short profit gross should be positive, got %.4f", gross)
+
+	for _, tc := range tests {
+		got := CalcPnLByPositionSide(tc.positionSide, tc.entry, tc.exit, tc.qty)
+		if math.Abs(got-tc.wantGross) > 1e-9 {
+			t.Fatalf("%s gross got %.6f want %.6f", tc.name, got, tc.wantGross)
+		}
 	}
 }
 
-func TestCalcPnLShortLoss(t *testing.T) {
-	entry := 90000.0
-	exit := 93330.0
-	qty := 0.001
-	fee := 0.1200
-
-	gross, net := CalcPnL("Sell", entry, exit, qty, fee)
-	if math.Abs(net-(-3.4500)) > 1e-4 {
-		t.Fatalf("short loss net got %.4f want -3.4500", net)
+func TestResolveNetPnLUsesExchangeValue(t *testing.T) {
+	item := closedPnlItem{CurPnl: "1.2345"}
+	net, fromExchange := resolveNetPnL(item, 2.0, 0.3, 0)
+	if !fromExchange {
+		t.Fatalf("expected exchange net source")
 	}
-	if gross >= 0 {
-		t.Fatalf("short loss gross should be negative, got %.4f", gross)
+	if math.Abs(net-1.2345) > 1e-9 {
+		t.Fatalf("expected net 1.2345, got %.6f", net)
 	}
 }
 
-func TestCalcPnLLongProfit(t *testing.T) {
-	gross, net := CalcPnL("Buy", 100, 110, 1, 0.5)
-	if math.Abs(gross-10) > 1e-9 {
-		t.Fatalf("long profit gross got %.4f want 10.0000", gross)
+func TestResolveNetPnLUsesExchangeZeroValue(t *testing.T) {
+	item := closedPnlItem{CurPnl: "0"}
+	net, fromExchange := resolveNetPnL(item, 2.0, 0.3, 0)
+	if !fromExchange {
+		t.Fatalf("expected exchange net source for explicit zero")
 	}
-	if math.Abs(net-9.5) > 1e-9 {
-		t.Fatalf("long profit net got %.4f want 9.5000", net)
-	}
-}
-
-func TestCalcPnLLongLoss(t *testing.T) {
-	gross, net := CalcPnL("Buy", 110, 100, 1, 0.5)
-	if math.Abs(gross-(-10)) > 1e-9 {
-		t.Fatalf("long loss gross got %.4f want -10.0000", gross)
-	}
-	if math.Abs(net-(-10.5)) > 1e-9 {
-		t.Fatalf("long loss net got %.4f want -10.5000", net)
+	if math.Abs(net) > 1e-9 {
+		t.Fatalf("expected zero net, got %.6f", net)
 	}
 }
 
-func TestCalcPnLZeroMove(t *testing.T) {
-	gross, net := CalcPnL("Buy", 100, 100, 1, 0.25)
-	if math.Abs(gross) > 1e-9 {
-		t.Fatalf("zero move gross got %.6f want 0", gross)
+func TestResolveNetPnLFallbackToCalculated(t *testing.T) {
+	item := closedPnlItem{CurPnl: ""}
+	tests := []struct {
+		name        string
+		gross       float64
+		fee         float64
+		fundingCost float64
+	}{
+		{name: "funding cost positive", gross: 2.0, fee: 0.3, fundingCost: 0.1},
+		{name: "funding cost negative", gross: 2.0, fee: 0.3, fundingCost: -0.1},
 	}
-	if math.Abs(net-(-0.25)) > 1e-9 {
-		t.Fatalf("zero move net got %.6f want -0.25", net)
+	for _, tc := range tests {
+		net, fromExchange := resolveNetPnL(item, tc.gross, tc.fee, tc.fundingCost)
+		if fromExchange {
+			t.Fatalf("%s: expected calculated net source", tc.name)
+		}
+		expected := tc.gross - tc.fee - tc.fundingCost
+		if math.Abs(net-expected) > 1e-9 {
+			t.Fatalf("%s: expected net %.6f, got %.6f", tc.name, expected, net)
+		}
 	}
 }
 
-func TestCalcGrossSymmetryBySide(t *testing.T) {
-	entry := 100.0
-	exit := 110.0
-	qty := 1.0
+func TestPositionSideFromCloseSide(t *testing.T) {
+	tests := []struct {
+		closeSide string
+		want      string
+	}{
+		{closeSide: "Buy", want: "Sell"},
+		{closeSide: "Sell", want: "Buy"},
+		{closeSide: " buy ", want: "Sell"},
+		{closeSide: "unknown", want: ""},
+	}
+	for _, tc := range tests {
+		got := positionSideFromCloseSide(tc.closeSide)
+		if got != tc.want {
+			t.Fatalf("closeSide=%q got %q want %q", tc.closeSide, got, tc.want)
+		}
+	}
+}
 
-	longGross, longNet := CalcPnL("Buy", entry, exit, qty, 0.1)
-	shortGross, shortNet := CalcPnL("Sell", entry, exit, qty, 0.1)
-	if math.Abs(longGross+shortGross) > 1e-9 {
-		t.Fatalf("expected gross symmetry, got long %.4f short %.4f", longGross, shortGross)
+func TestLogSideFromPositionSide(t *testing.T) {
+	tests := []struct {
+		positionSide string
+		want         string
+	}{
+		{positionSide: "Buy", want: "LONG"},
+		{positionSide: "Sell", want: "SHORT"},
+		{positionSide: " buy ", want: "LONG"},
+		{positionSide: "unknown", want: "UNKNOWN"},
 	}
-	if math.Abs(longNet+shortNet+0.2) > 1e-9 {
-		t.Fatalf("expected net symmetry with fees, got long %.4f short %.4f", longNet, shortNet)
+	for _, tc := range tests {
+		got := logSideFromPositionSide(tc.positionSide)
+		if got != tc.want {
+			t.Fatalf("positionSide=%q got %q want %q", tc.positionSide, got, tc.want)
+		}
 	}
+}
+
+func TestCalcFees(t *testing.T) {
+	t.Run("cum fees", func(t *testing.T) {
+		item := closedPnlItem{
+			CumEntryFee: "-0.4",
+			CumExitFee:  "0.6",
+		}
+		entryFee, exitFee, totalFee := calcFees(item, 0, 0, 0, 0)
+		if math.Abs(entryFee-0.4) > 1e-9 || math.Abs(exitFee-0.6) > 1e-9 || math.Abs(totalFee-1.0) > 1e-9 {
+			t.Fatalf("cum fees got entry=%.6f exit=%.6f total=%.6f", entryFee, exitFee, totalFee)
+		}
+	})
+
+	t.Run("exec fee fallback", func(t *testing.T) {
+		item := closedPnlItem{ExecFee: "-0.7"}
+		entryFee, exitFee, totalFee := calcFees(item, 0, 0, 0, 0)
+		if math.Abs(entryFee) > 1e-9 || math.Abs(exitFee-0.7) > 1e-9 || math.Abs(totalFee-0.7) > 1e-9 {
+			t.Fatalf("exec fee fallback got entry=%.6f exit=%.6f total=%.6f", entryFee, exitFee, totalFee)
+		}
+	})
+}
+
+func TestFundingSign(t *testing.T) {
+	t.Run("negative funding reduces net", func(t *testing.T) {
+		item := closedPnlItem{FundingFee: "-0.1"}
+		fundingSigned, found := parseFunding(item)
+		if !found {
+			t.Fatalf("expected funding to be found")
+		}
+		calcNet := calcNetWithFundingSigned(2.0, 0.3, fundingSigned)
+		if math.Abs(calcNet-1.6) > 1e-9 {
+			t.Fatalf("calc net got %.6f want 1.6", calcNet)
+		}
+	})
+
+	t.Run("positive funding increases net", func(t *testing.T) {
+		item := closedPnlItem{FundingFee: "0.1"}
+		fundingSigned, found := parseFunding(item)
+		if !found {
+			t.Fatalf("expected funding to be found")
+		}
+		calcNet := calcNetWithFundingSigned(2.0, 0.3, fundingSigned)
+		if math.Abs(calcNet-1.8) > 1e-9 {
+			t.Fatalf("calc net got %.6f want 1.8", calcNet)
+		}
+	})
 }

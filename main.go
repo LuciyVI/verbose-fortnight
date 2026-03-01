@@ -368,7 +368,80 @@ func getFloatField(m map[string]interface{}, keys ...string) float64 {
 	return 0
 }
 
-func handleExecutionMessage(raw []byte, trader *strategy.Trader, symbol string) {
+func getBoolField(m map[string]interface{}, keys ...string) bool {
+	for _, k := range keys {
+		if v, ok := m[k]; ok && v != nil {
+			switch val := v.(type) {
+			case bool:
+				return val
+			case string:
+				switch strings.ToLower(strings.TrimSpace(val)) {
+				case "1", "true", "yes":
+					return true
+				}
+			case float64:
+				return val != 0
+			case json.Number:
+				i, _ := val.Int64()
+				return i != 0
+			}
+		}
+	}
+	return false
+}
+
+func buildExecutionFillLogPayload(item map[string]interface{}, symbol, source, lifecycleID string, lifecycleInferred bool) map[string]interface{} {
+	fillSymbol := getStringField(item, "symbol")
+	if fillSymbol == "" {
+		fillSymbol = symbol
+	}
+	execSide := normalizeSide(getStringField(item, "execSide", "side"))
+	positionSide := normalizeSide(getStringField(item, "positionSide", "side"))
+	if positionSide == "" {
+		positionSide = execSide
+	}
+	return map[string]interface{}{
+		"ts":                time.Now().UTC().Format(time.RFC3339Nano),
+		"symbol":            fillSymbol,
+		"source":            source,
+		"lifecycleId":       lifecycleID,
+		"lifecycleInferred": lifecycleInferred,
+		"orderId":           getStringField(item, "orderId", "orderID"),
+		"orderLinkId":       getStringField(item, "orderLinkId", "orderLinkID"),
+		"execId":            getStringField(item, "execId", "execID"),
+		"tradeId":           getStringField(item, "tradeId", "tradeID"),
+		"side":              execSide,
+		"positionSide":      positionSide,
+		"execQty":           getFloatField(item, "execQty", "qty"),
+		"execPrice":         getFloatField(item, "execPrice", "price"),
+		"execFee":           getFloatField(item, "execFee"),
+		"feeRate":           getFloatField(item, "feeRate"),
+		"isMaker":           getBoolField(item, "isMaker"),
+		"execPnl":           getFloatField(item, "execPnl", "closedPnl"),
+		"createType":        getStringField(item, "createType"),
+		"stopOrderType":     getStringField(item, "stopOrderType"),
+		"reduceOnly":        getBoolField(item, "reduceOnly"),
+		"closeOnTrigger":    getBoolField(item, "closeOnTrigger"),
+		"triggerPrice":      getFloatField(item, "triggerPrice"),
+		"markPrice":         getFloatField(item, "markPrice"),
+		"indexPrice":        getFloatField(item, "indexPrice"),
+		"orderType":         getStringField(item, "orderType"),
+		"timeInForce":       getStringField(item, "timeInForce"),
+		"lastLiquidityInd":  getStringField(item, "lastLiquidityInd"),
+	}
+}
+
+func logExecutionFillJSON(item map[string]interface{}, symbol, source, lifecycleID string, lifecycleInferred bool) {
+	payload := buildExecutionFillLogPayload(item, symbol, source, lifecycleID, lifecycleInferred)
+	b, err := json.Marshal(payload)
+	if err != nil {
+		logError("failed to marshal execution fill JSON log: %v", err)
+		return
+	}
+	logInfo("execution_fill %s", string(b))
+}
+
+func handleExecutionMessage(raw []byte, trader *strategy.Trader, symbol, source string) {
 	var msg executionMsg
 	if json.Unmarshal(raw, &msg) != nil || len(msg.Data) == 0 {
 		return
@@ -378,21 +451,59 @@ func handleExecutionMessage(raw []byte, trader *strategy.Trader, symbol string) 
 		if symbol != "" && sym != "" && sym != symbol {
 			continue
 		}
-		side := normalizeSide(getStringField(item, "side"))
+		execSideRaw := getStringField(item, "execSide", "side")
+		positionSideRaw := getStringField(item, "positionSide", "side")
+		execSide := normalizeSide(execSideRaw)
+		positionSide := normalizeSide(positionSideRaw)
+		if positionSide == "" {
+			positionSide = execSide
+		}
 		execQty := getFloatField(item, "execQty", "qty")
 		execPrice := getFloatField(item, "execPrice", "price")
 		execID := getStringField(item, "execId", "execID")
 		orderID := getStringField(item, "orderId", "orderID")
-		if execID != "" {
-			trader.State.Lock()
-			trader.State.LastExecID = execID
-			if orderID != "" {
-				trader.State.LastOrderID = orderID
+		orderLinkID := getStringField(item, "orderLinkId", "orderLinkID")
+		if source == "ws" {
+			markExecutionSeenFromWS(execID)
+			if trader != nil && trader.State != nil {
+				trader.State.RecordWSExecution(time.Now().UTC())
 			}
-			trader.State.Unlock()
 		}
-		logInfo("Execution fill: side=%s qty=%.4f price=%.2f execId=%s orderId=%s", side, execQty, execPrice, execID, orderID)
-		trader.HandleExecutionFill(side, execQty, execPrice, execID, orderID)
+		reduceOnly := getBoolField(item, "reduceOnly")
+		closedSize := getFloatField(item, "closedSize")
+		leavesQty := getFloatField(item, "leavesQty")
+		positionSizeAfter := getFloatField(item, "positionSizeAfter", "positionSize")
+		tradeID := ""
+		lifecycleInferred := false
+		if cfg != nil && cfg.EnableLifecycleID {
+			tradeID, lifecycleInferred = trader.ResolveExecutionLifecycleID(orderID, execID, orderLinkID)
+		} else {
+			tradeID = trader.ResolveExecutionTradeID(orderID, execID)
+		}
+		if lifecycleInferred {
+			logWarning("Lifecycle inferred for execution: source=%s orderId=%s orderLinkId=%s execId=%s lifecycleId=%s",
+				source, orderID, orderLinkID, execID, tradeID)
+		}
+		if cfg != nil && cfg.EnableFillJSONLog {
+			logExecutionFillJSON(item, symbol, source, tradeID, lifecycleInferred)
+		} else {
+			logInfo("Execution fill: tradeID=%s execSide=%s positionSide=%s reduceOnly=%t closedSize=%.4f leavesQty=%.4f positionSizeAfter=%.4f execQty=%.4f execPrice=%.2f execId=%s orderId=%s",
+				tradeID, execSide, positionSide, reduceOnly, closedSize, leavesQty, positionSizeAfter, execQty, execPrice, execID, orderID)
+		}
+		trader.ProcessExecutionEvent(models.ExecutionEvent{
+			TradeID:           tradeID,
+			ExecID:            execID,
+			OrderID:           orderID,
+			OrderLinkID:       orderLinkID,
+			ExecSide:          execSide,
+			PositionSide:      positionSide,
+			ReduceOnly:        reduceOnly,
+			Qty:               execQty,
+			Price:             execPrice,
+			ClosedSize:        closedSize,
+			LeavesQty:         leavesQty,
+			PositionSizeAfter: positionSizeAfter,
+		}, source)
 	}
 }
 
@@ -462,12 +573,39 @@ func applyPositionItem(state *models.State, item positionItem) {
 	state.StatusLock.Unlock()
 
 	if size > 0 {
+		state.Lock()
 		state.PosSide = side
 		state.OrderQty = size
+		if state.PositionState == "" {
+			state.PositionState = models.PositionStateFlat
+		}
+		if state.PositionState == models.PositionStateOpening {
+			state.OpeningPosAck = true
+			if state.OpeningExecAck {
+				state.PositionState = models.PositionStateOpen
+			}
+		}
+		if state.PositionState == models.PositionStateFlat {
+			state.PositionState = models.PositionStateOpen
+			state.OpeningExecAck = true
+			state.OpeningPosAck = true
+		}
+		state.Unlock()
 		logInfo("Position updated: Side=%s, Size=%.4f TP=%.2f SL=%.2f", side, size, tp, sl)
 	} else {
+		state.Lock()
 		state.PosSide = ""
 		state.OrderQty = 0
+		if state.PositionState == "" {
+			state.PositionState = models.PositionStateFlat
+		}
+		if state.PositionState == models.PositionStateClosing || state.PositionState == models.PositionStateOpen || state.PositionState == models.PositionStateOpening {
+			state.PositionState = models.PositionStateFlat
+			state.OpeningExecAck = false
+			state.OpeningPosAck = false
+			state.ActiveTradeID = ""
+		}
+		state.Unlock()
 		logInfo("Position closed")
 	}
 }
@@ -481,6 +619,95 @@ func parseFloat(raw string) float64 {
 		return 0
 	}
 	return val
+}
+
+func resyncPrivateState(apiClient *api.RESTClient, trader *strategy.Trader, state *models.State, symbol string) error {
+	logInfo("Private WS resync started")
+
+	positions, err := apiClient.GetPositionList(symbol)
+	if err != nil {
+		return fmt.Errorf("resync getPosition: %w", err)
+	}
+	openOrders, err := apiClient.GetOpenOrders(symbol)
+	if err != nil {
+		return fmt.Errorf("resync getOpenOrders: %w", err)
+	}
+	tp, sl, err := apiClient.GetTradingStop(symbol)
+	if err != nil {
+		return fmt.Errorf("resync getTradingStop: %w", err)
+	}
+
+	side := ""
+	size := 0.0
+	entry := 0.0
+	for _, p := range positions {
+		psize := parseFloat(p.Size)
+		if psize <= 0 {
+			continue
+		}
+		side = normalizeSide(p.Side)
+		size = psize
+		entry = parseFloat(p.AvgPrice)
+		if p.TakeProfit != "" {
+			tp = parseFloat(p.TakeProfit)
+		}
+		if p.StopLoss != "" {
+			sl = parseFloat(p.StopLoss)
+		}
+		break
+	}
+
+	now := time.Now()
+	state.StatusLock.Lock()
+	state.LastPosition = models.PositionSnapshot{
+		Side:       side,
+		Size:       size,
+		EntryPrice: entry,
+		TakeProfit: tp,
+		StopLoss:   sl,
+		UpdatedAt:  now,
+	}
+	state.StatusLock.Unlock()
+
+	if size > 0 {
+		state.Lock()
+		state.PosSide = side
+		state.OrderQty = size
+		state.PositionState = models.PositionStateOpen
+		state.OpeningExecAck = true
+		state.OpeningPosAck = true
+		state.Unlock()
+		if trader.ActiveTradeID() == "" {
+			trader.ResolveExecutionTradeID("", "resync-"+strconv.FormatInt(now.UnixNano(), 10))
+		}
+	} else {
+		state.Lock()
+		state.PosSide = ""
+		state.OrderQty = 0
+		state.PositionState = models.PositionStateFlat
+		state.OpeningExecAck = false
+		state.OpeningPosAck = false
+		state.ActiveTradeID = ""
+		state.Unlock()
+	}
+
+	state.Lock()
+	state.StopCtrl.AppliedTP = tp
+	state.StopCtrl.AppliedSL = sl
+	state.StopCtrl.DesiredTP = tp
+	state.StopCtrl.DesiredSL = sl
+	state.StopCtrl.UpdatedAt = now
+	state.Unlock()
+
+	execStats, err := runExecutionBackfillCycle(apiClient, trader, state, symbol, "resync", 200, 3, 600)
+	if err != nil {
+		return fmt.Errorf("resync execution backfill: %w", err)
+	}
+	_ = trader.ClearTradingBlock(models.BlockedReasonReconnect, "resync_complete")
+
+	logInfo("Private WS resync complete: positionSize=%.4f side=%s openOrders=%d executions=%d processed=%d deduped=%d pages=%d cursor_before=%s cursor_after=%s tp=%.2f sl=%.2f",
+		size, side, len(openOrders), execStats.Fetched, execStats.Processed, execStats.Deduped, execStats.Pages, execStats.CursorBefore, execStats.CursorAfter, tp, sl)
+	return nil
 }
 
 func main() {
@@ -543,6 +770,29 @@ func main() {
 	logInfo("Application starting...")
 	logInfo("Daemon mode: %t", cfg.DaemonMode)
 
+	// Initialize state early so status endpoint is available even when startup network checks fail.
+	state := &models.State{
+		Debug:           cfg.Debug,
+		DynamicTP:       cfg.DynamicTP,
+		SlPerc:          cfg.SlPerc,
+		TrailPerc:       cfg.TrailPerc,
+		SmaLen:          cfg.SmaLen,
+		PositionState:   models.PositionStateFlat,
+		BidsMap:         make(map[string]float64),
+		AsksMap:         make(map[string]float64),
+		TPChan:          make(chan models.TPJob, 8),
+		StopIntentChan:  make(chan models.StopIntent, 128),
+		SigChan:         make(chan models.Signal, 128),
+		MarketRegime:    "range", // default
+		RegimeCandidate: "range",
+		OrderTradeIDs:   make(map[string]string),
+		ExecTradeIDs:    make(map[string]string),
+		ProcessedExec:   make(map[string]time.Time),
+		ExecDedupMax:    5000,
+		ExecDedupTTL:    24 * time.Hour,
+	}
+	statusServer := status.StartServer(cfg, state, logger)
+
 	// Create API client
 	apiClient := api.NewRESTClient(cfg, logger)
 
@@ -553,21 +803,6 @@ func main() {
 	}
 
 	logInfo("API connection established successfully")
-
-	// Initialize state
-	state := &models.State{
-		Debug:           cfg.Debug,
-		DynamicTP:       cfg.DynamicTP,
-		SlPerc:          cfg.SlPerc,
-		TrailPerc:       cfg.TrailPerc,
-		SmaLen:          cfg.SmaLen,
-		BidsMap:         make(map[string]float64),
-		AsksMap:         make(map[string]float64),
-		TPChan:          make(chan models.TPJob, 8),
-		SigChan:         make(chan models.Signal, 128),
-		MarketRegime:    "range", // default
-		RegimeCandidate: "range",
-	}
 
 	// Initialize instrument info
 	var err error
@@ -591,10 +826,6 @@ func main() {
 	if err != nil {
 		logFatal("Private WS dial: %v", err)
 	}
-
-	walletChan := make(chan []byte, 16)
-	walletDone := make(chan struct{})
-	go walletListener(privConn, walletChan, walletDone, state, cfg.Symbol)
 
 	// Connect to public WebSocket
 	pubWSURL := cfg.DemoWSPublicURL
@@ -658,13 +889,24 @@ func main() {
 
 	// Create trader
 	trader := strategy.NewTrader(apiClient, cfg, state, logger)
-	statusServer := status.StartServer(cfg, state, logger)
+	trader.SetTradingBlocked(models.BlockedReasonReconnect, "startup_resync")
+	if err := resyncPrivateState(apiClient, trader, state, cfg.Symbol); err != nil {
+		logFatal("Private WS initial resync failed: %v", err)
+	}
+	_ = trader.ClearTradingBlock(models.BlockedReasonReconnect, "startup_resync_ok")
+
+	walletChan := make(chan []byte, 16)
+	walletDone := make(chan struct{})
+	go walletListener(privConn, walletChan, walletDone, state, cfg.Symbol)
+	runtimeCtx, runtimeCancel := context.WithCancel(context.Background())
+	defer runtimeCancel()
 
 	// Start indicator and trading goroutines
+	go trader.StartStopController()
 	go trader.SMAMovingAverageWorker()
 	go trader.Trader()
 	go trader.SyncPositionRealTime()
-	go trader.TPWorker() // take profit worker
+	startExecutionBackfillWorker(runtimeCtx, apiClient, trader, state, cfg.Symbol)
 
 	// Start signal stats logging
 	go func() {
@@ -707,7 +949,7 @@ func main() {
 				if json.Unmarshal(raw, &peek) == nil {
 					switch peek.Topic {
 					case "execution":
-						handleExecutionMessage(raw, trader, cfg.Symbol)
+						handleExecutionMessage(raw, trader, cfg.Symbol, "ws")
 					}
 				}
 			default:
@@ -765,11 +1007,18 @@ func main() {
 		select {
 		case <-walletDone:
 			logError("Private WS closed — reconnect…")
+			trader.SetTradingBlocked(models.BlockedReasonReconnect, "private_ws_disconnected")
 			for retry := 1; ; retry++ {
 				time.Sleep(time.Duration(retry*2) * time.Second)
 				logInfo("Attempting private WebSocket reconnect #%d", retry)
 				if privConn, err = connectPrivateWS(apiClient, state); err == nil {
-					logInfo("Successfully reconnected to private WebSocket")
+					if err := resyncPrivateState(apiClient, trader, state, cfg.Symbol); err != nil {
+						logError("Private reconnect resync failed: %v", err)
+						privConn.Close()
+						continue
+					}
+					_ = trader.ClearTradingBlock(models.BlockedReasonReconnect, "private_ws_resync_ok")
+					logInfo("Successfully reconnected to private WebSocket and resynced state")
 					walletDone = make(chan struct{})
 					go walletListener(privConn, walletChan, walletDone, state, cfg.Symbol)
 					break
@@ -778,6 +1027,7 @@ func main() {
 			}
 		case sig := <-signals:
 			logInfo("Received signal %s, shutting down gracefully...", sig)
+			runtimeCancel()
 			// Cancel all active orders to avoid unwanted positions
 			if trader != nil {
 				logInfo("Cancelling all active orders before shutdown...")
@@ -800,6 +1050,7 @@ func main() {
 				_ = statusServer.Shutdown(ctx)
 				cancel()
 			}
+			trader.Shutdown()
 			if err := logger.Sync(); err != nil {
 				logError("Error syncing logger: %v", err)
 			}
