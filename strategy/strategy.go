@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"verbose-fortnight/api"
@@ -23,9 +24,60 @@ type Trader struct {
 	APIClient       *api.RESTClient
 	Config          *config.Config
 	State           *models.State
-	OrderManager    *order.OrderManager
-	PositionManager *position.PositionManager
+	OrderManager    OrderManager
+	PositionManager PositionManager
 	Logger          logging.LoggerInterface
+	lifecycle       *lifecycleMapper
+	edgeObs         edgeObservability
+}
+
+type edgeObservability struct {
+	mu sync.Mutex
+
+	summaryWindowStart   time.Time
+	summaryPass          int
+	summaryReject        int
+	summaryRejectMin     int
+	summaryRejectSpread  int
+	summaryRejectImb     int
+	summaryDecisionCount int
+	summaryScoreSum      float64
+
+	rejectBurstCount  int
+	rejectBurstStart  time.Time
+	lastRejectWarnLog time.Time
+}
+
+const (
+	edgeRejectBurstThreshold = 50
+	edgeRejectBurstWindow    = 5 * time.Minute
+	edgeRejectWarnCooldown   = 1 * time.Minute
+	edgeSummaryWindow        = 60 * time.Second
+)
+
+// OrderManager is the strategy-facing order interface.
+type OrderManager interface {
+	PlaceOrderMarketWithID(side string, qty float64, reduceOnly bool) (string, error)
+	PlaceTakeProfitOrder(side string, qty, price float64) error
+}
+
+type orderManagerWithLink interface {
+	PlaceOrderMarketWithLinkID(side string, qty float64, reduceOnly bool, orderLinkID string) (string, error)
+}
+
+type orderManagerWithTPSLLink interface {
+	PlaceTakeProfitOrderWithLink(side string, qty, price float64, orderLinkID string) error
+}
+
+// PositionManager is the strategy-facing position interface.
+type PositionManager interface {
+	HasOpenPosition() (bool, string, float64, float64, float64)
+	NormalizeSide(side string) string
+	GetLastEntryPrice() float64
+	UpdatePositionTPSL(symbol string, tp, sl float64) error
+	GetLastBidPrice() float64
+	GetLastAskPrice() float64
+	CancelAllOrders(symbol string)
 }
 
 type tradeEventLog struct {
@@ -112,6 +164,8 @@ type dynamicTPDetails struct {
 	MaxPercent       float64
 }
 
+const fixedStopLossFraction = 0.0025 // 0.25%
+
 func (t *Trader) dynamicTP(entry, atr float64, regime string) dynamicTPDetails {
 	k := t.Config.DynamicTPK
 	if k <= 0 {
@@ -162,13 +216,26 @@ func NewTrader(apiClient *api.RESTClient, cfg *config.Config, state *models.Stat
 	orderManager := order.NewOrderManager(apiClient, cfg, state, logger)
 	positionManager := position.NewPositionManager(apiClient, cfg, state, logger)
 
-	return &Trader{
+	tr := &Trader{
 		APIClient:       apiClient,
 		Config:          cfg,
 		State:           state,
 		OrderManager:    orderManager,
 		PositionManager: positionManager,
 		Logger:          logger,
+	}
+	if cfg != nil && cfg.EnableLifecycleID {
+		tr.lifecycle = newLifecycleMapper(defaultLifecycleMapPath(), logger)
+	}
+	return tr
+}
+
+func (t *Trader) Shutdown() {
+	if t == nil {
+		return
+	}
+	if t.lifecycle != nil {
+		t.lifecycle.Close()
 	}
 }
 
@@ -306,7 +373,7 @@ func (t *Trader) TPWorker() {
 		}
 
 		t.Logger.Info("Placing take profit order: %s, Qty=%.4f, Price=%.2f", orderSide, job.Qty, finalTP)
-		if err := t.OrderManager.PlaceTakeProfitOrder(orderSide, job.Qty, finalTP); err != nil {
+		if err := t.placeTakeProfitOrderWithLifecycle(orderSide, job.Qty, finalTP, t.activeTradeID()); err != nil {
 			t.Logger.Error("Error placing TP: %v", err)
 		} else {
 			t.Logger.Info("Successfully placed take profit order")
@@ -502,6 +569,294 @@ func (t *Trader) CheckOrderbookStrength(side string, lastPrice float64) (bool, s
 	return true, fmt.Sprintf("ratio %.2f depth %.2f", ratio, totalDepth)
 }
 
+type edgeScoreResult struct {
+	Score      float64
+	OK         bool
+	Reason     string
+	Spread     float64
+	SumBid     float64
+	SumAsk     float64
+	LevelsUsed int
+}
+
+func calcEdgeScore(side string, bidsMap, asksMap map[string]float64, levels int, minDepth float64) (score float64, ok bool, reason string) {
+	res := calcEdgeScoreDetailed(side, bidsMap, asksMap, levels, minDepth)
+	return res.Score, res.OK, res.Reason
+}
+
+func calcEdgeScoreDetailed(side string, bidsMap, asksMap map[string]float64, levels int, minDepth float64) edgeScoreResult {
+	type level struct {
+		price float64
+		size  float64
+	}
+	if levels <= 0 {
+		levels = 1
+	}
+
+	bids := make([]level, 0, len(bidsMap))
+	for ps, sz := range bidsMap {
+		if sz <= 0 {
+			continue
+		}
+		p, err := strconv.ParseFloat(ps, 64)
+		if err != nil || p <= 0 {
+			continue
+		}
+		bids = append(bids, level{price: p, size: sz})
+	}
+	asks := make([]level, 0, len(asksMap))
+	for ps, sz := range asksMap {
+		if sz <= 0 {
+			continue
+		}
+		p, err := strconv.ParseFloat(ps, 64)
+		if err != nil || p <= 0 {
+			continue
+		}
+		asks = append(asks, level{price: p, size: sz})
+	}
+	sort.Slice(bids, func(i, j int) bool { return bids[i].price > bids[j].price })
+	sort.Slice(asks, func(i, j int) bool { return asks[i].price < asks[j].price })
+	levelsUsed := levels
+	if len(bids) < levelsUsed {
+		levelsUsed = len(bids)
+	}
+	if len(asks) < levelsUsed {
+		levelsUsed = len(asks)
+	}
+	if levelsUsed <= 0 {
+		return edgeScoreResult{Reason: "min_depth"}
+	}
+
+	sumBid := 0.0
+	sumAsk := 0.0
+	for i := 0; i < levelsUsed; i++ {
+		sumBid += bids[i].size
+		sumAsk += asks[i].size
+	}
+	totalTopDepth := sumBid + sumAsk
+	if minDepth > 0 && totalTopDepth < minDepth {
+		return edgeScoreResult{
+			Reason:     "min_depth",
+			SumBid:     sumBid,
+			SumAsk:     sumAsk,
+			LevelsUsed: levelsUsed,
+		}
+	}
+	if sumBid <= 0 || sumAsk <= 0 {
+		return edgeScoreResult{
+			Reason:     "min_depth",
+			SumBid:     sumBid,
+			SumAsk:     sumAsk,
+			LevelsUsed: levelsUsed,
+		}
+	}
+
+	bestBid := bids[0].price
+	bestAsk := asks[0].price
+	if bestBid <= 0 || bestAsk <= 0 || bestAsk <= bestBid {
+		return edgeScoreResult{
+			Reason:     "wide_spread",
+			SumBid:     sumBid,
+			SumAsk:     sumAsk,
+			LevelsUsed: levelsUsed,
+		}
+	}
+	spread := bestAsk - bestBid
+	mid := (bestAsk + bestBid) / 2
+	spreadPct := 0.0
+	if mid > 0 {
+		spreadPct = spread / mid
+	}
+	// Conservative hard gate: do not enter on abnormally wide spread.
+	if spreadPct > 0.003 {
+		return edgeScoreResult{
+			Reason:     "wide_spread",
+			Spread:     spread,
+			SumBid:     sumBid,
+			SumAsk:     sumAsk,
+			LevelsUsed: levelsUsed,
+		}
+	}
+
+	side = strings.ToUpper(strings.TrimSpace(side))
+	directional := 0.0
+	switch side {
+	case "LONG":
+		directional = sumBid / sumAsk
+	case "SHORT":
+		directional = sumAsk / sumBid
+	default:
+		return edgeScoreResult{
+			Reason:     "low_imbalance",
+			Spread:     spread,
+			SumBid:     sumBid,
+			SumAsk:     sumAsk,
+			LevelsUsed: levelsUsed,
+		}
+	}
+
+	// Penalize score for wider spread while preserving existing threshold scale.
+	score := directional - spreadPct*100
+	if score < 0 {
+		score = 0
+	}
+	if directional <= 1 {
+		return edgeScoreResult{
+			Score:      score,
+			OK:         false,
+			Reason:     "low_imbalance",
+			Spread:     spread,
+			SumBid:     sumBid,
+			SumAsk:     sumAsk,
+			LevelsUsed: levelsUsed,
+		}
+	}
+	return edgeScoreResult{
+		Score:      score,
+		OK:         true,
+		Reason:     "ok",
+		Spread:     spread,
+		SumBid:     sumBid,
+		SumAsk:     sumAsk,
+		LevelsUsed: levelsUsed,
+	}
+}
+
+func (t *Trader) edgeFilterCheck(side string) (pass bool, score float64, reason string, res edgeScoreResult) {
+	t.State.ObLock.Lock()
+	bidsCopy := make(map[string]float64, len(t.State.BidsMap))
+	asksCopy := make(map[string]float64, len(t.State.AsksMap))
+	for k, v := range t.State.BidsMap {
+		bidsCopy[k] = v
+	}
+	for k, v := range t.State.AsksMap {
+		asksCopy[k] = v
+	}
+	t.State.ObLock.Unlock()
+
+	res = calcEdgeScoreDetailed(side, bidsCopy, asksCopy, t.Config.OrderbookLevels, t.Config.OrderbookMinDepth)
+	threshold := t.Config.OrderbookStrengthThreshold
+	pass = res.OK && res.Score >= threshold
+	score = res.Score
+	reason = res.Reason
+	if res.OK && res.Score < threshold {
+		reason = "low_imbalance"
+	}
+	return pass, score, reason, res
+}
+
+func (t *Trader) logEdgeFilterDecision(pass bool, side string, score, threshold float64, reason string, res edgeScoreResult) {
+	now := time.Now().UTC()
+	status := "reject"
+	if pass {
+		status = "pass"
+	}
+	symbol := ""
+	if t.Config != nil {
+		symbol = t.Config.Symbol
+	}
+	payload := map[string]interface{}{
+		"ts":         now.Format(time.RFC3339Nano),
+		"symbol":     symbol,
+		"side":       side,
+		"score":      score,
+		"threshold":  threshold,
+		"reason":     reason,
+		"spread":     res.Spread,
+		"sumBid":     res.SumBid,
+		"sumAsk":     res.SumAsk,
+		"levelsUsed": res.LevelsUsed,
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Logger.Info("edge_filter_%s side=%s score=%.4f threshold=%.4f reason=%s spread=%.6f sumBid=%.4f sumAsk=%.4f levelsUsed=%d",
+			status, side, score, threshold, reason, res.Spread, res.SumBid, res.SumAsk, res.LevelsUsed)
+		t.recordEdgeDecisionObservability(pass, score, reason, now)
+		return
+	}
+	t.Logger.Info("edge_filter_%s %s", status, string(raw))
+	t.recordEdgeDecisionObservability(pass, score, reason, now)
+}
+
+func (t *Trader) recordEdgeDecisionObservability(pass bool, score float64, reason string, now time.Time) {
+	if t.State != nil {
+		t.State.RecordEdgeDecision(pass, reason, now)
+	}
+	obs := &t.edgeObs
+	obs.mu.Lock()
+
+	if obs.summaryWindowStart.IsZero() {
+		obs.summaryWindowStart = now
+	}
+	obs.summaryDecisionCount++
+	obs.summaryScoreSum += score
+	if pass {
+		obs.summaryPass++
+		obs.rejectBurstCount = 0
+		obs.rejectBurstStart = time.Time{}
+	} else {
+		obs.summaryReject++
+		switch reason {
+		case "min_depth":
+			obs.summaryRejectMin++
+		case "wide_spread":
+			obs.summaryRejectSpread++
+		case "low_imbalance":
+			obs.summaryRejectImb++
+		}
+		if obs.rejectBurstCount == 0 || obs.rejectBurstStart.IsZero() || now.Sub(obs.rejectBurstStart) > edgeRejectBurstWindow {
+			obs.rejectBurstCount = 1
+			obs.rejectBurstStart = now
+		} else {
+			obs.rejectBurstCount++
+		}
+	}
+
+	shouldWarn := false
+	rejectCount := obs.rejectBurstCount
+	rejectWindowSec := int(now.Sub(obs.rejectBurstStart).Seconds())
+	if !pass && obs.rejectBurstCount > edgeRejectBurstThreshold && now.Sub(obs.rejectBurstStart) <= edgeRejectBurstWindow {
+		if obs.lastRejectWarnLog.IsZero() || now.Sub(obs.lastRejectWarnLog) >= edgeRejectWarnCooldown {
+			obs.lastRejectWarnLog = now
+			shouldWarn = true
+		}
+	}
+
+	shouldSummary := obs.summaryDecisionCount > 0 && now.Sub(obs.summaryWindowStart) >= edgeSummaryWindow
+	summaryPass := obs.summaryPass
+	summaryReject := obs.summaryReject
+	summaryMin := obs.summaryRejectMin
+	summarySpread := obs.summaryRejectSpread
+	summaryImb := obs.summaryRejectImb
+	summaryDecisions := obs.summaryDecisionCount
+	summaryAvg := 0.0
+	if summaryDecisions > 0 {
+		summaryAvg = obs.summaryScoreSum / float64(summaryDecisions)
+	}
+	windowSec := int(now.Sub(obs.summaryWindowStart).Seconds())
+	if shouldSummary {
+		obs.summaryWindowStart = now
+		obs.summaryPass = 0
+		obs.summaryReject = 0
+		obs.summaryRejectMin = 0
+		obs.summaryRejectSpread = 0
+		obs.summaryRejectImb = 0
+		obs.summaryDecisionCount = 0
+		obs.summaryScoreSum = 0
+	}
+	obs.mu.Unlock()
+
+	if shouldWarn {
+		t.Logger.Warning("edge_filter_reject_burst count=%d window_sec=%d threshold=%d reason=%s",
+			rejectCount, rejectWindowSec, edgeRejectBurstThreshold, reason)
+	}
+	if shouldSummary {
+		t.Logger.Info("edge_filter_summary pass=%d reject=%d reasons={min_depth:%d wide_spread:%d low_imbalance:%d} avg_score=%.4f window_sec=%d",
+			summaryPass, summaryReject, summaryMin, summarySpread, summaryImb, summaryAvg, windowSec)
+	}
+}
+
 // DetectMarketRegime detects market regime (trend vs range)
 func (t *Trader) DetectMarketRegime() {
 	minLen := 50
@@ -629,49 +984,110 @@ func calculateTrendStrength(closes []float64) float64 {
 
 // HandleLongSignal processes a long signal
 func (t *Trader) HandleLongSignal(closePrice float64) {
-	exists, side, _, _, _ := t.PositionManager.HasOpenPosition()
-	side = t.PositionManager.NormalizeSide(side)
-	newSide := t.PositionManager.NormalizeSide("LONG")
-
-	if !exists {
-		if t.Config.Debug {
-			t.Logger.Debug("openPosition called: side=%s reason=no_existing_position", newSide)
-		}
-		t.openPosition(newSide, closePrice)
-	} else if side == newSide {
-		t.adjustTPSL(closePrice)
-	} else {
-		// Close opposite position first
-		t.closeOppositePosition(newSide)
-		// Then open new position
-		if t.Config.Debug {
-			t.Logger.Debug("openPosition called: side=%s reason=flip_position", newSide)
-		}
-		t.openPosition(newSide, closePrice)
-	}
+	t.handleDirectionalSignal("LONG", closePrice)
 }
 
 // HandleShortSignal processes a short signal
 func (t *Trader) HandleShortSignal(closePrice float64) {
+	t.handleDirectionalSignal("SHORT", closePrice)
+}
+
+func (t *Trader) handleDirectionalSignal(targetSide string, closePrice float64) {
+	blocked, reason, message := t.isTradingBlocked()
+	if blocked {
+		t.Logger.Error("Signal rejected while trading blocked: side=%s reason=%s message=%s", targetSide, reason, message)
+		return
+	}
+
+	targetSide = t.PositionManager.NormalizeSide(targetSide)
 	exists, side, _, _, _ := t.PositionManager.HasOpenPosition()
 	side = t.PositionManager.NormalizeSide(side)
-	newSide := t.PositionManager.NormalizeSide("SHORT")
+	fsm := t.currentFSMState()
 
-	if !exists {
-		if t.Config.Debug {
-			t.Logger.Debug("openPosition called: side=%s reason=no_existing_position", newSide)
+	if !exists && fsm == models.PositionStateOpen {
+		t.forceFSM(models.PositionStateFlat, "signal_sync_no_position", t.activeTradeID())
+		fsm = models.PositionStateFlat
+	}
+	if exists && fsm == models.PositionStateFlat {
+		t.forceFSM(models.PositionStateOpen, "signal_sync_existing_position", t.activeTradeID())
+		fsm = models.PositionStateOpen
+	}
+	if t.Config != nil && t.Config.EnableEdgeFilter {
+		needsEdgeCheck := false
+		switch fsm {
+		case models.PositionStateFlat:
+			needsEdgeCheck = true
+		case models.PositionStateOpen:
+			needsEdgeCheck = exists && side != "" && side != targetSide
 		}
-		t.openPosition(newSide, closePrice)
-	} else if side == newSide {
-		t.adjustTPSLForShort(closePrice)
-	} else {
-		// Close opposite position first
-		t.closeOppositePosition(newSide)
-		// Then open new position
-		if t.Config.Debug {
-			t.Logger.Debug("openPosition called: side=%s reason=flip_position", newSide)
+		if needsEdgeCheck {
+			threshold := t.Config.OrderbookStrengthThreshold
+			pass, score, reason, res := t.edgeFilterCheck(targetSide)
+			t.logEdgeFilterDecision(pass, targetSide, score, threshold, reason, res)
+			if !pass {
+				return
+			}
 		}
-		t.openPosition(newSide, closePrice)
+	}
+
+	switch fsm {
+	case models.PositionStateFlat:
+		tradeID := newTradeID()
+		if !t.transitionFSM(models.PositionStateOpening, "signal_accepted", tradeID) {
+			return
+		}
+		t.setActiveTradeID(tradeID)
+		t.logTradeEvent("signal_accepted", tradeEventLog{
+			TradeID: tradeID,
+			Side:    targetSide,
+			Entry:   closePrice,
+		})
+		if err := t.openPosition(targetSide, closePrice, tradeID); err != nil {
+			t.Logger.Error("Open position failed after accepted signal: %v", err)
+			t.forceFSM(models.PositionStateFlat, "open_failed", tradeID)
+		}
+	case models.PositionStateOpen:
+		if !exists || side == "" {
+			t.forceFSM(models.PositionStateFlat, "open_state_without_live_position", t.activeTradeID())
+			t.handleDirectionalSignal(targetSide, closePrice)
+			return
+		}
+		if side == targetSide {
+			if targetSide == "LONG" {
+				t.adjustTPSL(closePrice)
+			} else {
+				t.adjustTPSLForShort(closePrice)
+			}
+			return
+		}
+
+		currentTradeID := t.activeTradeID()
+		if currentTradeID == "" {
+			currentTradeID = newTradeID()
+			t.setActiveTradeID(currentTradeID)
+		}
+		nextTradeID := newTradeID()
+		t.queuePendingReverse(targetSide, closePrice, nextTradeID)
+		if !t.transitionFSM(models.PositionStateClosing, "reverse_close_intent", currentTradeID) {
+			return
+		}
+		t.State.Lock()
+		t.State.StopCtrl.DesiredTP = 0
+		t.State.StopCtrl.DesiredSL = 0
+		t.State.StopCtrl.Reason = "closing_disable_stops"
+		t.State.StopCtrl.UpdatedAt = time.Now()
+		t.State.Unlock()
+		t.logTradeEvent("close_intent", tradeEventLog{
+			TradeID: currentTradeID,
+			Side:    side,
+			Qty:     t.State.OrderQty,
+			Entry:   closePrice,
+		})
+		t.closeCurrentPosition(side, t.State.OrderQty, currentTradeID, "reverse_to_"+targetSide)
+	case models.PositionStateOpening, models.PositionStateClosing:
+		t.Logger.Warning("Signal ignored while FSM=%s side=%s", fsm, targetSide)
+	default:
+		t.Logger.Warning("Signal ignored with unknown FSM=%s side=%s", fsm, targetSide)
 	}
 }
 
@@ -691,67 +1107,49 @@ func roundUpToStep(qty, step float64) float64 {
 	return math.Ceil(qty/step-1e-9) * step
 }
 
-// openPosition opens a new position
-func (t *Trader) openPosition(newSide string, price float64) {
+func (t *Trader) placeMarketOrderWithLifecycle(side string, qty float64, reduceOnly bool, lifecycleID, leg string) (orderID, orderLinkID string, err error) {
+	if t.Config != nil && t.Config.EnableLifecycleID && lifecycleID != "" {
+		orderLinkID = lifecycleOrderLinkID(lifecycleID, leg)
+		if om, ok := t.OrderManager.(orderManagerWithLink); ok {
+			orderID, err = om.PlaceOrderMarketWithLinkID(side, qty, reduceOnly, orderLinkID)
+			return orderID, orderLinkID, err
+		}
+		t.Logger.Warning("Lifecycle enabled but order manager does not support orderLinkId; fallback to plain order/create")
+	}
+	orderID, err = t.OrderManager.PlaceOrderMarketWithID(side, qty, reduceOnly)
+	return orderID, "", err
+}
+
+func (t *Trader) placeTakeProfitOrderWithLifecycle(side string, qty, price float64, lifecycleID string) error {
+	if t.Config != nil && t.Config.EnableLifecycleID && lifecycleID != "" {
+		orderLinkID := lifecycleOrderLinkID(lifecycleID, "tp")
+		if om, ok := t.OrderManager.(orderManagerWithTPSLLink); ok {
+			return om.PlaceTakeProfitOrderWithLink(side, qty, price, orderLinkID)
+		}
+		t.Logger.Warning("Lifecycle enabled but order manager does not support TP orderLinkId; fallback to plain order/create")
+	}
+	return t.OrderManager.PlaceTakeProfitOrder(side, qty, price)
+}
+
+// openPosition opens a new position from FLAT->OPENING lifecycle only.
+func (t *Trader) openPosition(newSide string, price float64, tradeID string) error {
 	t.Logger.Info("Attempting to open new position: %s @ price %.2f", newSide, price)
+	if blocked, reason, message := t.isTradingBlocked(); blocked {
+		return fmt.Errorf("trading blocked: reason=%s message=%s", reason, message)
+	}
+	if t.currentFSMState() != models.PositionStateOpening {
+		return fmt.Errorf("cannot open: fsm=%s", t.currentFSMState())
+	}
 	t.State.Lock()
 	t.State.PartialTPDone = false
 	t.State.Unlock()
-
-	// Close opposite position if it exists and calculate profit
-	if exists, side, qty, _, _ := t.PositionManager.HasOpenPosition(); exists {
-		side = t.PositionManager.NormalizeSide(side)
-		newSide = t.PositionManager.NormalizeSide(newSide)
-		if side != "" && side != newSide && qty > 0 {
-			t.Logger.Info("Closing opposite position: %s", side)
-
-			// Get entry price for profit calculation
-			entryPrice := t.PositionManager.GetLastEntryPrice()
-
-			reduceSide := "Sell"
-			if side == "SHORT" {
-				reduceSide = "Buy"
-			}
-			if err := t.OrderManager.PlaceOrderMarket(reduceSide, qty, true); err != nil {
-				t.Logger.Error("Error closing position %s: %v", side, err)
-				return
-			}
-
-			t.Logger.Info("Successfully sent order to close position %s", side)
-
-			// Calculate profit based on current price and entry price
-			exitPrice := price // Using the current price as the exit price
-			if side == "LONG" {
-				// For LONG positions, we sell to close, so we might get a slightly lower price
-				exitPrice = t.PositionManager.GetLastBidPrice()
-				if exitPrice <= 0 {
-					exitPrice = price
-				}
-			} else if side == "SHORT" {
-				// For SHORT positions, we buy to close, so we might get a slightly higher price
-				exitPrice = t.PositionManager.GetLastAskPrice()
-				if exitPrice <= 0 {
-					exitPrice = price
-				}
-			}
-
-			feeEst := t.estimateRoundTripFee(entryPrice, exitPrice, qty)
-			profit := t.PositionManager.CalculatePositionNetProfit(side, entryPrice, exitPrice, qty, feeEst, 0)
-			signalType := "CLOSE_LONG"
-			if side == "SHORT" {
-				signalType = "CLOSE_SHORT"
-			}
-
-			t.PositionManager.UpdateSignalStats(signalType, profit)
-		}
-	}
 
 	// Calculate quantity
 	t.Logger.Info("Fetching balance from exchange...")
 	bal, err := t.APIClient.GetBalance("USDT")
 	if err != nil {
 		t.Logger.Error("Error getting balance: %v", err)
-		return
+		return err
 	}
 	t.Logger.Info("Current balance: %.2f USDT", bal)
 
@@ -761,7 +1159,7 @@ func (t *Trader) openPosition(newSide string, price float64) {
 	}
 	if step <= 0 {
 		t.Logger.Error("Invalid instrument step size: %.8f", step)
-		return
+		return fmt.Errorf("invalid instrument step size")
 	}
 
 	minQty := math.Max(t.State.Instr.MinQty, step)
@@ -784,11 +1182,10 @@ func (t *Trader) openPosition(newSide string, price float64) {
 	}
 	if bal < price*qty {
 		t.Logger.Error("Insufficient balance: %.2f USDT", bal)
-		return
+		return fmt.Errorf("insufficient balance")
 	}
 
 	// Place market order
-	tradeID := fmt.Sprintf("%d", time.Now().UnixNano())
 	orderSide := "Buy"
 	if t.PositionManager.NormalizeSide(newSide) == "SHORT" {
 		orderSide = "Sell"
@@ -804,10 +1201,12 @@ func (t *Trader) openPosition(newSide string, price float64) {
 		BreakevenProgress: t.Config.BreakevenProgress,
 	})
 	t.Logger.Info("Placing market order: %s %.4f", orderSide, qty)
-	if err := t.OrderManager.PlaceOrderMarket(orderSide, qty, false); err != nil {
+	orderID, orderLinkID, err := t.placeMarketOrderWithLifecycle(orderSide, qty, false, tradeID, "entry")
+	if err != nil {
 		t.Logger.Error("Error opening position %s: %v", newSide, err)
-		return
+		return err
 	}
+	t.bindOrderLifecycle(orderID, orderLinkID, tradeID)
 	t.Logger.Info("Successfully placed market order to open position %s", newSide)
 
 	// Set TP/SL with 2:1 ratio based on 15-minute projection
@@ -852,16 +1251,15 @@ func (t *Trader) openPosition(newSide string, price float64) {
 	t.Logger.Info("Position opened: %s %.4f @ %.2f | TP %.2f  SL %.2f (send after %s, minPocket %.4f)",
 		newSide, qty, entry, tp, sl, delay.String(), minPocket)
 
-	go func(tpVal, slVal float64) {
-		if delay > 0 {
-			time.Sleep(delay)
-		}
-		if err := t.PositionManager.UpdatePositionTPSL(t.Config.Symbol, tpVal, slVal); err != nil {
-			t.Logger.Error("Error setting TP/SL after delay: %v", err)
-			return
-		}
-		t.Logger.Info("TP/SL placed ▶ TP %.2f  SL %.2f", tpVal, slVal)
-	}(tp, sl)
+	t.enqueueDelayedStopIntent(models.StopIntent{
+		TradeID: tradeID,
+		Side:    newSide,
+		Entry:   entry,
+		TP:      tp,
+		SL:      sl,
+		Reason:  "entry_initial",
+	}, delay)
+	return nil
 }
 
 func (t *Trader) calculateInitialTPSL(entry float64, positionSide string) (float64, float64) {
@@ -872,17 +1270,13 @@ func (t *Trader) calculateInitialTPSL(entry float64, positionSide string) (float
 
 	minPocket := t.minPocketDistance(entry)
 	feeBuf := t.feeBuffer(entry)
-	minSLFee := feeBuf * t.Config.SLFeeFloorMult
-	if t.Config.SLFeeFloorMult <= 0 {
-		minSLFee = feeBuf
+
+	minTPFee := 0.0
+	if t.Config.TPFeeFloorMult > 0 {
+		minTPFee = feeBuf * t.Config.TPFeeFloorMult
 	}
-	minSLDist := math.Max(minPocket, minSLFee)
-	minTPDist := math.Max(details.tpDist, feeBuf*t.Config.TPFeeFloorMult)
-	requiredTPDist := math.Max(minTPDist, 2*minSLDist)
-	if feeBuf > 0 && t.Config.TPFeeFloorMult <= 0 {
-		requiredTPDist = math.Max(requiredTPDist, feeBuf)
-	}
-	// SL is derived from TP (SLdist = TPdist/2), so we enforce pocket+fee constraints for both sides.
+	minTPDist := math.Max(details.tpDist, minTPFee)
+	requiredTPDist := minTPDist
 
 	// 1) Calculate TP first.
 	tpDist := details.tpDist
@@ -917,65 +1311,13 @@ func (t *Trader) calculateInitialTPSL(entry float64, positionSide string) (float
 		tpDistFinal = math.Abs(tp - entry)
 	}
 
-	// 2) After TP is set, derive SL from TP distance: SLdist = TPdist/2.
-	sl := entry - tpDistFinal/2
+	// 2) Set SL to a fixed 0.25% distance from entry.
+	slRaw, sl := t.fixedStopLoss(entry, details.side, tick)
+
+	roundingApplied := tp != tpPreRound || sl != slRaw
+	roundingMode := "long_tp_floor_sl_floor"
 	if details.side == "SHORT" {
-		sl = entry + tpDistFinal/2
-	}
-	slPreRound := sl
-	sl = t.roundSL(entry, sl, tick, details.side)
-
-	// If rounding pulled SL too close, widen TP (and recompute SL) until pocket/floors hold.
-	invariantAdjusted := false
-	for i := 0; i < 8; i++ {
-		slDistFinal := math.Abs(entry - sl)
-		// Keep SL strictly outside the pocket after rounding.
-		if slDistFinal > minSLDist+1e-9 {
-			break
-		}
-		if details.side == "LONG" {
-			tp += 2 * tick
-		} else {
-			tp -= 2 * tick
-		}
-		invariantAdjusted = true
-		tpDistFinal = math.Abs(tp - entry)
-		sl = entry - tpDistFinal/2
-		if details.side == "SHORT" {
-			sl = entry + tpDistFinal/2
-		}
-		sl = t.roundSL(entry, sl, tick, details.side)
-	}
-
-	// Ensure RR doesn't collapse due to SL rounding away from entry.
-	for i := 0; i < 8; i++ {
-		slDistFinal := math.Abs(entry - sl)
-		if slDistFinal <= 0 {
-			break
-		}
-		if tpDistFinal/slDistFinal >= 2.0-1e-9 {
-			break
-		}
-		desiredTPDist := slDistFinal * 2
-		if details.side == "LONG" {
-			tp = entry + desiredTPDist
-		} else {
-			tp = entry - desiredTPDist
-		}
-		tp = t.roundTP(entry, tp, tick, details.side)
-		invariantAdjusted = true
-		tpDistFinal = math.Abs(tp - entry)
-		sl = entry - tpDistFinal/2
-		if details.side == "SHORT" {
-			sl = entry + tpDistFinal/2
-		}
-		sl = t.roundSL(entry, sl, tick, details.side)
-	}
-
-	roundingApplied := tp != tpPreRound || sl != slPreRound
-	roundingMode := "long_tp_floor_sl_ceil"
-	if details.side == "SHORT" {
-		roundingMode = "short_tp_ceil_sl_floor"
+		roundingMode = "short_tp_ceil_sl_ceil"
 	}
 
 	slDistFinal := math.Abs(entry - sl)
@@ -1012,7 +1354,7 @@ func (t *Trader) calculateInitialTPSL(entry float64, positionSide string) (float
 		ratioAdjusted,
 		roundingApplied,
 		roundingMode,
-		invariantAdjusted,
+		false,
 	)
 
 	return tp, sl
@@ -1085,11 +1427,108 @@ func (t *Trader) clampTPDistWithAtr(tpDist, atr float64, regime string) (float64
 
 func (t *Trader) minPocketDistance(entry float64) float64 {
 	feeBuf := t.feeBuffer(entry)
-	pocketMult := t.Config.PocketFeeMult
-	if pocketMult <= 0 {
-		pocketMult = 2.0
+	pocketFloor := entry * t.Config.SLPocketPerc
+	if pocketFloor < 0 {
+		pocketFloor = 0
 	}
-	return math.Max(entry*t.Config.SLPocketPerc, feeBuf*pocketMult)
+	feeFloor := 0.0
+	if t.Config.PocketFeeMult > 0 {
+		feeFloor = feeBuf * t.Config.PocketFeeMult
+	}
+	return math.Max(pocketFloor, feeFloor)
+}
+
+func calcSLToBE(side string, entry, pocket float64) float64 {
+	if pocket < 0 {
+		pocket = 0
+	}
+	switch strings.ToUpper(strings.TrimSpace(side)) {
+	case "SHORT":
+		return entry - pocket
+	case "LONG":
+		return entry + pocket
+	default:
+		return entry
+	}
+}
+
+func alignSLToBETick(side string, sl, tick float64) float64 {
+	if tick <= 0 {
+		return sl
+	}
+	switch strings.ToUpper(strings.TrimSpace(side)) {
+	case "LONG":
+		return math.Ceil(sl/tick) * tick
+	case "SHORT":
+		return math.Floor(sl/tick) * tick
+	default:
+		return math.Round(sl/tick) * tick
+	}
+}
+
+func (t *Trader) partialBEPocket(entry float64) float64 {
+	entryAbs := math.Abs(entry)
+	if entryAbs == 0 {
+		return 0
+	}
+	entryPocket := entryAbs * math.Max(0, t.Config.SLPocketPerc)
+	feePerc := t.Config.RoundTripFeePerc
+	if feePerc <= 0 {
+		feePerc = 0.0012
+	}
+	feeFloorMult := t.Config.SLFeeFloorMult
+	if feeFloorMult <= 0 {
+		feeFloorMult = 1.0
+	}
+	feePocketMult := t.Config.PocketFeeMult
+	if feePocketMult <= 0 {
+		feePocketMult = 0
+	}
+	feeFloor := entryAbs * feePerc * feeFloorMult
+	feePocket := feeFloor * feePocketMult
+	pocket := math.Max(entryPocket, feePocket)
+	tick := t.State.Instr.TickSize
+	if tick <= 0 {
+		tick = 0.1
+	}
+	if pocket > 0 {
+		pocket = math.Ceil(pocket/tick) * tick
+	}
+	return pocket
+}
+
+func shouldMoveSLToBE(side string, currentSL, targetSL, tick float64) bool {
+	eps := math.Max(tick/2, 1e-9)
+	switch strings.ToUpper(strings.TrimSpace(side)) {
+	case "LONG":
+		if currentSL <= 0 {
+			return true
+		}
+		return currentSL+eps < targetSL
+	case "SHORT":
+		if currentSL <= 0 {
+			return true
+		}
+		return currentSL-eps > targetSL
+	default:
+		return false
+	}
+}
+
+func (t *Trader) shouldSkipMoveSLToBEIntent(tradeID, side string, targetSL, tick float64) bool {
+	if t == nil || t.State == nil || tradeID == "" {
+		return false
+	}
+	t.State.RLock()
+	ctrl := t.State.StopCtrl
+	lastTradeID := t.State.LastBEIntentTradeID
+	lastTargetSL := t.State.LastBEIntentSL
+	t.State.RUnlock()
+
+	alreadyDesired := ctrl.TradeID == tradeID && !shouldMoveSLToBE(side, ctrl.DesiredSL, targetSL, tick)
+	alreadyApplied := ctrl.TradeID == tradeID && !shouldMoveSLToBE(side, ctrl.AppliedSL, targetSL, tick)
+	alreadyQueued := lastTradeID == tradeID && !shouldMoveSLToBE(side, lastTargetSL, targetSL, tick)
+	return alreadyDesired || alreadyApplied || alreadyQueued
 }
 
 func (t *Trader) roundTP(entry, tp, tick float64, side string) float64 {
@@ -1116,6 +1555,27 @@ func (t *Trader) roundSL(entry, sl, tick float64, side string) float64 {
 		return math.Ceil(sl/tick) * tick
 	}
 	return math.Round(sl/tick) * tick
+}
+
+func (t *Trader) fixedStopLoss(entry float64, side string, tick float64) (float64, float64) {
+	dist := math.Abs(entry) * fixedStopLossFraction
+	slRaw := entry - dist
+	if side == "SHORT" {
+		slRaw = entry + dist
+	}
+	sl := t.roundSL(entry, slRaw, tick, side)
+	for i := 0; i < 4; i++ {
+		slDistFinal := math.Abs(entry - sl)
+		if slDistFinal >= dist-1e-9 {
+			break
+		}
+		if side == "LONG" {
+			sl -= tick
+		} else if side == "SHORT" {
+			sl += tick
+		}
+	}
+	return slRaw, sl
 }
 
 // calculateTPSLWithRatio calculates TP/SL using ATR/projection with dynamic RR and caps.
@@ -1284,12 +1744,14 @@ func (t *Trader) adjustTPSL(closePrice float64) {
 		return
 	}
 
-	t.Logger.Info("Sending TP/SL update to exchange: TP %.2f, SL %.2f", newTP, newSL)
-	if err := t.PositionManager.UpdatePositionTPSL(t.Config.Symbol, newTP, newSL); err != nil {
-		t.Logger.Error("Error updating TP/SL: %v", err)
-	} else {
-		t.Logger.Info("TP/SL updated ▶ TP %.2f  SL %.2f", newTP, newSL)
-	}
+	t.enqueueStopIntent(models.StopIntent{
+		TradeID: t.activeTradeID(),
+		Side:    "LONG",
+		Entry:   entry,
+		TP:      newTP,
+		SL:      newSL,
+		Reason:  "adjust_long_signal",
+	})
 }
 
 // adjustTPSLForShort adjusts TP/SL for short positions with 2:1 ratio
@@ -1312,12 +1774,14 @@ func (t *Trader) adjustTPSLForShort(closePrice float64) {
 		return
 	}
 
-	t.Logger.Info("Sending TP/SL update to exchange: TP %.2f, SL %.2f", newTP, newSL)
-	if err := t.PositionManager.UpdatePositionTPSL(t.Config.Symbol, newTP, newSL); err != nil {
-		t.Logger.Error("adjustTPSLForShort error: %v", err)
-	} else {
-		t.Logger.Info("Recalculated TP/SL ▶ TP %.2f SL %.2f", newTP, newSL)
-	}
+	t.enqueueStopIntent(models.StopIntent{
+		TradeID: t.activeTradeID(),
+		Side:    "SHORT",
+		Entry:   entry,
+		TP:      newTP,
+		SL:      newSL,
+		Reason:  "adjust_short_signal",
+	})
 }
 
 // SMAMovingAverageWorker generates signals with regime-aware logic
@@ -1534,7 +1998,45 @@ func (t *Trader) SMAMovingAverageWorker() {
 	}
 }
 
-// closeOppositePosition closes an existing position before opening a new one in the opposite direction
+func (t *Trader) closeCurrentPosition(posSide string, qty float64, tradeID, reason string) {
+	if blocked, bReason, message := t.isTradingBlocked(); blocked {
+		t.Logger.Warning("Close skipped while trading blocked: reason=%s message=%s trade_id=%s", bReason, message, tradeID)
+		return
+	}
+	posSide = t.PositionManager.NormalizeSide(posSide)
+	if posSide == "" {
+		return
+	}
+	if qty <= 0 {
+		_, _, liveQty, _, _ := t.PositionManager.HasOpenPosition()
+		qty = liveQty
+	}
+	if qty <= 0 {
+		return
+	}
+	reduceSide := "Sell"
+	if posSide == "SHORT" {
+		reduceSide = "Buy"
+	}
+	orderID, orderLinkID, err := t.placeMarketOrderWithLifecycle(reduceSide, qty, true, tradeID, "clos")
+	if err != nil {
+		t.Logger.Error("Error closing position %s: %v", posSide, err)
+		if t.currentFSMState() == models.PositionStateClosing {
+			t.forceFSM(models.PositionStateOpen, "close_order_failed", tradeID)
+		}
+		return
+	}
+	t.bindOrderLifecycle(orderID, orderLinkID, tradeID)
+	t.logTradeEvent("close_order", tradeEventLog{
+		TradeID: tradeID,
+		Side:    posSide,
+		Qty:     qty,
+		Entry:   t.PositionManager.GetLastEntryPrice(),
+	})
+	t.Logger.Info("Close order placed: trade_id=%s reason=%s side=%s qty=%.4f orderId=%s", tradeID, reason, posSide, qty, orderID)
+}
+
+// closeOppositePosition is retained for compatibility, but reversal is now gated by FSM.
 func (t *Trader) closeOppositePosition(newSide string) {
 	exists, side, qty, _, _ := t.PositionManager.HasOpenPosition()
 	if !exists {
@@ -1546,45 +2048,7 @@ func (t *Trader) closeOppositePosition(newSide string) {
 
 	// Only close if it's truly the opposite side
 	if side != "" && side != newSide {
-		t.Logger.Info("Closing opposite position: %s", side)
-
-		// Get entry price for profit calculation
-		entryPrice := t.PositionManager.GetLastEntryPrice()
-
-		reduceSide := "Sell"
-		if side == "SHORT" {
-			reduceSide = "Buy"
-		}
-
-		if err := t.OrderManager.PlaceOrderMarket(reduceSide, qty, true); err != nil {
-			t.Logger.Error("Error closing position %s: %v", side, err)
-			return
-		}
-
-		t.Logger.Info("Successfully sent order to close position %s", side)
-
-		// Calculate profit based on current price and entry price
-		var exitPrice float64
-		if side == "LONG" {
-			// For LONG positions, we sell to close
-			exitPrice = t.PositionManager.GetLastBidPrice()
-		} else if side == "SHORT" {
-			// For SHORT positions, we buy to close
-			exitPrice = t.PositionManager.GetLastAskPrice()
-		}
-
-		if exitPrice <= 0 {
-			exitPrice = entryPrice // Fallback if we can't get current price
-		}
-
-		feeEst := t.estimateRoundTripFee(entryPrice, exitPrice, qty)
-		profit := t.PositionManager.CalculatePositionNetProfit(side, entryPrice, exitPrice, qty, feeEst, 0)
-		signalType := "CLOSE_LONG"
-		if side == "SHORT" {
-			signalType = "CLOSE_SHORT"
-		}
-
-		t.PositionManager.UpdateSignalStats(signalType, profit)
+		t.closeCurrentPosition(side, qty, t.activeTradeID(), "legacy_close_opposite")
 		t.State.Lock()
 		t.State.LastExitAt = time.Now()
 		t.State.LastExitDir = side
@@ -1593,33 +2057,101 @@ func (t *Trader) closeOppositePosition(newSide string) {
 }
 
 // HandleExecutionFill recalculates TP/SL after a fill using actual position size.
-func (t *Trader) HandleExecutionFill(side string, qty, price float64, execID, orderID string) {
-	if qty <= 0 {
+func (t *Trader) HandleExecutionFill(evt models.ExecutionEvent) {
+	if evt.Qty <= 0 && evt.ClosedSize <= 0 {
 		return
 	}
-	exists, posSide, posQty, curTP, curSL := t.PositionManager.HasOpenPosition()
-	if !exists {
-		return
-	}
-	posSide = t.PositionManager.NormalizeSide(posSide)
-	entry := t.PositionManager.GetLastEntryPrice()
-	if entry == 0 {
-		entry = price
+	tradeID := evt.TradeID
+	if tradeID == "" {
+		tradeID = t.ResolveExecutionTradeID(evt.OrderID, evt.ExecID)
 	}
 
-	tpNew, slNew := t.calculateInitialTPSL(entry, posSide)
+	fsm := t.currentFSMState()
+	if fsm == models.PositionStateOpening && evt.ReduceOnly {
+		t.Logger.Error("FSM mismatch execution: OPENING received reduceOnly execution trade_id=%s exec_id=%s", tradeID, evt.ExecID)
+	}
+	if fsm == models.PositionStateClosing && !evt.ReduceOnly && evt.PositionSizeAfter > 0 {
+		t.Logger.Error("FSM mismatch execution: CLOSING received non-reduce execution trade_id=%s exec_id=%s", tradeID, evt.ExecID)
+	}
+	if fsm == models.PositionStateFlat && evt.PositionSizeAfter > 0 {
+		t.Logger.Error("FSM mismatch execution: FLAT received execution with non-zero positionSizeAfter trade_id=%s exec_id=%s", tradeID, evt.ExecID)
+	}
+
+	exists, posSide, posQty, curTP, curSL := t.PositionManager.HasOpenPosition()
+	posSide = t.PositionManager.NormalizeSide(posSide)
+	t.syncFSMFromPositionSnapshot(exists, posSide, posQty)
+	if exists && t.currentFSMState() == models.PositionStateOpening {
+		t.State.Lock()
+		t.State.OpeningExecAck = true
+		if t.State.OpeningPosAck {
+			t.State.PositionState = models.PositionStateOpen
+		}
+		t.State.Unlock()
+	}
+
+	if !exists {
+		if t.currentFSMState() == models.PositionStateClosing {
+			t.forceFSM(models.PositionStateFlat, "execution_confirmed_flat", tradeID)
+		}
+		return
+	}
+
+	entry := t.PositionManager.GetLastEntryPrice()
+	if entry == 0 {
+		entry = evt.Price
+	}
+
 	tick := t.State.Instr.TickSize
 	if tick <= 0 {
 		tick = 0.1
 	}
+
+	if t.Config != nil && t.Config.EnablePartialBERule && evt.ReduceOnly && evt.ClosedSize > 0 && posQty > 0 {
+		pocket := t.partialBEPocket(entry)
+		targetSL := calcSLToBE(posSide, entry, pocket)
+		targetSL = alignSLToBETick(posSide, targetSL, tick)
+		if t.shouldSkipMoveSLToBEIntent(tradeID, posSide, targetSL, tick) {
+			t.State.RecordBEIntentSkippedAlreadyBetter()
+			return
+		}
+		if !shouldMoveSLToBE(posSide, curSL, targetSL, tick) {
+			t.State.RecordBEIntentSkippedAlreadyBetter()
+			return
+		}
+		tpCurrent := curTP
+		if tpCurrent <= 0 {
+			tpCurrent, _ = t.calculateInitialTPSL(entry, posSide)
+		}
+		if tpCurrent > 0 {
+			now := time.Now().UTC()
+			t.State.Lock()
+			t.State.PartialTPDone = true
+			t.State.Unlock()
+			t.enqueueStopIntent(models.StopIntent{
+				Kind:        "MoveSLToBE",
+				TradeID:     tradeID,
+				LifecycleID: tradeID,
+				Side:        posSide,
+				Entry:       entry,
+				QtyLeft:     posQty,
+				FeeEstimate: pocket,
+				TP:          tpCurrent,
+				SL:          targetSL,
+				Breakeven:   true,
+				Reason:      "partial_tp",
+				TS:          now,
+			})
+			t.State.RecordBEIntentSent(tradeID, targetSL, now)
+			return
+		}
+		t.Logger.Warning("Partial BE intent skipped: missing TP snapshot trade_id=%s side=%s entry=%.2f", tradeID, posSide, entry)
+	}
+
+	tpNew, slNew := t.calculateInitialTPSL(entry, posSide)
 	tpNew = t.roundTP(entry, tpNew, tick, posSide)
 	slNew = t.roundSL(entry, slNew, tick, posSide)
 
 	feeBuf := t.feeBuffer(entry)
-	tradeID := execID
-	if tradeID == "" {
-		tradeID = orderID
-	}
 	t.logTradeEvent("fill_sync", tradeEventLog{
 		TradeID:           tradeID,
 		Side:              posSide,
@@ -1641,11 +2173,14 @@ func (t *Trader) HandleExecutionFill(side string, qty, price float64, execID, or
 	if math.Abs(tpNew-curTP) < tick && math.Abs(slNew-curSL) < tick {
 		return
 	}
-	if err := t.PositionManager.UpdatePositionTPSL(t.Config.Symbol, tpNew, slNew); err != nil {
-		t.Logger.Error("fill sync TP/SL update error: %v (tp=%.2f sl=%.2f tick=%.4f)", err, tpNew, slNew, tick)
-	} else {
-		t.Logger.Info("Fill sync TP/SL ▶ TP %.2f SL %.2f (qty=%.4f side=%s)", tpNew, slNew, posQty, posSide)
-	}
+	t.enqueueStopIntent(models.StopIntent{
+		TradeID: tradeID,
+		Side:    posSide,
+		Entry:   entry,
+		TP:      tpNew,
+		SL:      slNew,
+		Reason:  "execution_fill_sync",
+	})
 }
 
 // Trader processes signals and executes trades
@@ -1660,6 +2195,11 @@ func (t *Trader) Trader() {
 	}
 
 	for sig := range t.State.SigChan {
+		if blocked, reason, message := t.isTradingBlocked(); blocked {
+			t.Logger.Error("Skipping signal while trading blocked: reason=%s message=%s", reason, message)
+			continue
+		}
+
 		if sig.CandleSeq != 0 && sig.CandleSeq != lastCandleSeq {
 			t.resetSignalStrength(&signalStrength)
 			if t.Config.Debug {
@@ -1794,12 +2334,6 @@ func (t *Trader) Trader() {
 				t.Logger.Debug("Confirmed LONG signal: strength=%d (threshold=%d) highConf=%t", signalStrength["LONG"], threshold, sig.HighConf)
 			}
 
-			exists, side, _, _, _ := t.PositionManager.HasOpenPosition()
-			if exists && t.PositionManager.NormalizeSide(side) == "SHORT" {
-				t.Logger.Info("Closing existing SHORT position before opening LONG")
-				t.closeOppositePosition("LONG")
-			}
-
 			t.HandleLongSignal(sig.ClosePrice)
 			lastDirection = "LONG"
 			t.resetSignalStrength(&signalStrength)
@@ -1807,12 +2341,6 @@ func (t *Trader) Trader() {
 		} else if dir == "SHORT" && signalStrength["SHORT"] >= threshold {
 			if t.Config.Debug {
 				t.Logger.Debug("Confirmed SHORT signal: strength=%d (threshold=%d) highConf=%t", signalStrength["SHORT"], threshold, sig.HighConf)
-			}
-
-			exists, side, _, _, _ := t.PositionManager.HasOpenPosition()
-			if exists && t.PositionManager.NormalizeSide(side) == "LONG" {
-				t.Logger.Info("Closing existing LONG position before opening SHORT")
-				t.closeOppositePosition("SHORT")
 			}
 
 			t.HandleShortSignal(sig.ClosePrice)
@@ -1834,19 +2362,43 @@ func (t *Trader) resetSignalStrength(m *map[string]int) {
 	}
 }
 
-// SyncPositionRealTime implements trailing stop logic
+// SyncPositionRealTime keeps TP/SL in sync for open positions.
+// SL is always fixed at 0.25% from entry; TP remains dynamic.
 func (t *Trader) SyncPositionRealTime() {
-	t.Logger.Info("Starting trailing stop logic...")
+	t.Logger.Info("Starting position sync logic...")
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 	var lastTPSLAttempt time.Time
 
 	for range ticker.C {
-		// Current position
 		exists, side, qty, tp, sl := t.PositionManager.HasOpenPosition()
-		if !exists {
+		side = t.PositionManager.NormalizeSide(side)
+
+		t.syncFSMFromPositionSnapshot(exists, side, qty)
+		if blocked, _, _ := t.isTradingBlocked(); blocked {
 			continue
 		}
+		if !exists {
+			if nextSide, nextPrice, nextTradeID, ok := t.popPendingReverseIfFlat(); ok {
+				if nextTradeID == "" {
+					nextTradeID = newTradeID()
+				}
+				if !t.transitionFSM(models.PositionStateOpening, "reverse_confirmed_flat", nextTradeID) {
+					t.queuePendingReverse(nextSide, nextPrice, nextTradeID)
+					continue
+				}
+				t.setActiveTradeID(nextTradeID)
+				if err := t.openPosition(nextSide, nextPrice, nextTradeID); err != nil {
+					t.Logger.Error("Pending reverse open failed: %v", err)
+					t.forceFSM(models.PositionStateFlat, "pending_reverse_open_failed", nextTradeID)
+				}
+			}
+			continue
+		}
+		if side == "" {
+			continue
+		}
+
 		entry := t.PositionManager.GetLastEntryPrice()
 		if entry == 0 {
 			continue
@@ -1860,6 +2412,7 @@ func (t *Trader) SyncPositionRealTime() {
 			t.Logger.Info("Missing TP/SL detected for %s position, setting TP %.2f SL %.2f", side, tpNew, slNew)
 			feeBuf := t.feeBuffer(entry)
 			t.logTradeEvent("missing_tpsl", tradeEventLog{
+				TradeID:           t.activeTradeID(),
 				Side:              side,
 				Qty:               qty,
 				Entry:             entry,
@@ -1875,15 +2428,36 @@ func (t *Trader) SyncPositionRealTime() {
 				TrailActivation:   t.Config.TrailActivation,
 				BreakevenProgress: t.Config.BreakevenProgress,
 			})
-			if err := t.PositionManager.UpdatePositionTPSL(t.Config.Symbol, tpNew, slNew); err != nil {
-				t.Logger.Error("Error setting missing TP/SL: %v (tp=%.2f sl=%.2f tick=%.4f)", err, tpNew, slNew, t.State.Instr.TickSize)
-			} else {
-				t.Logger.Info("TP/SL placed ▶ TP %.2f  SL %.2f", tpNew, slNew)
-			}
+			t.enqueueStopIntent(models.StopIntent{
+				TradeID: t.activeTradeID(),
+				Side:    side,
+				Entry:   entry,
+				TP:      tpNew,
+				SL:      slNew,
+				Reason:  "missing_tpsl_repair",
+			})
 			continue
 		}
 
-		// Current price
+		tick := t.State.Instr.TickSize
+		if tick <= 0 {
+			tick = 0.1
+		}
+
+		_, fixedSL := t.fixedStopLoss(entry, side, tick)
+		if fixedSL > 0 && math.Abs(sl-fixedSL) >= tick/2 {
+			t.Logger.Info("Fixed SL policy: resetting SL for %s from %.2f to %.2f", side, sl, fixedSL)
+			t.enqueueStopIntent(models.StopIntent{
+				TradeID: t.activeTradeID(),
+				Side:    side,
+				Entry:   entry,
+				TP:      tp,
+				SL:      fixedSL,
+				Reason:  "fixed_sl_sync",
+			})
+			sl = fixedSL
+		}
+
 		var price float64
 		if side == "LONG" {
 			price = t.PositionManager.GetLastBidPrice()
@@ -1894,12 +2468,6 @@ func (t *Trader) SyncPositionRealTime() {
 			continue
 		}
 
-		tick := t.State.Instr.TickSize
-		if tick <= 0 {
-			tick = 0.1
-		}
-
-		// Progress toward TP
 		var dist, prog float64
 		if side == "LONG" {
 			dist = tp - entry
@@ -1912,219 +2480,39 @@ func (t *Trader) SyncPositionRealTime() {
 			continue
 		}
 
-		feeBuf := t.feeBuffer(entry)
-		risk := math.Abs(entry - sl)
-		if risk == 0 && dist != 0 {
-			risk = math.Abs(dist) / 2 // fall back to 1R = half the TP distance
-		}
-
-		minTightenProg := t.Config.PartialTakeProfitProgress
-		allowTighten := minTightenProg <= 0 || prog >= minTightenProg
-
-		// Move SL to breakeven only when price has covered fees
-		if allowTighten && prog >= t.Config.BreakevenProgress {
-			lockStep := risk * 0.2 // lock 0.2R once in profit
-			if side == "LONG" && price-entry >= feeBuf {
-				target := math.Max(entry+feeBuf, entry+lockStep)
-				if target > price-tick {
-					target = price - tick
-				}
-				target = t.roundSL(entry, target, tick, side)
-				if target > sl {
-					t.logTradeEvent("breakeven_adjust", tradeEventLog{
-						Side:              side,
-						Qty:               qty,
-						Entry:             entry,
-						TP:                tp,
-						SL:                target,
-						TPDist:            math.Abs(tp - entry),
-						SLDist:            math.Abs(entry - target),
-						FeeOpenEst:        feeBuf / 2,
-						FeeCloseEst:       feeBuf / 2,
-						BreakevenMove:     feeBuf,
-						ReduceOnlyTP:      false,
-						ReduceOnlySL:      false,
-						TrailActivation:   t.Config.TrailActivation,
-						BreakevenProgress: t.Config.BreakevenProgress,
-					})
-					if err := t.PositionManager.UpdatePositionTPSL(t.Config.Symbol, tp, target); err != nil {
-						t.Logger.Error("Breakeven SL update error: %v (target=%.2f tick=%.4f)", err, target, tick)
-					} else {
-						t.Logger.Info("Moved SL to lock %.2f for LONG", target)
-						sl = target
-					}
-				}
-			}
-			if side == "SHORT" && entry-price >= feeBuf {
-				target := math.Min(entry-feeBuf, entry-lockStep)
-				if target < price+tick {
-					target = price + tick
-				}
-				target = t.roundSL(entry, target, tick, side)
-				if sl == 0 || target < sl {
-					t.logTradeEvent("breakeven_adjust", tradeEventLog{
-						Side:              side,
-						Qty:               qty,
-						Entry:             entry,
-						TP:                tp,
-						SL:                target,
-						TPDist:            math.Abs(tp - entry),
-						SLDist:            math.Abs(entry - target),
-						FeeOpenEst:        feeBuf / 2,
-						FeeCloseEst:       feeBuf / 2,
-						BreakevenMove:     feeBuf,
-						ReduceOnlyTP:      false,
-						ReduceOnlySL:      false,
-						TrailActivation:   t.Config.TrailActivation,
-						BreakevenProgress: t.Config.BreakevenProgress,
-					})
-					if err := t.PositionManager.UpdatePositionTPSL(t.Config.Symbol, tp, target); err != nil {
-						t.Logger.Error("Breakeven SL update error: %v (target=%.2f tick=%.4f)", err, target, tick)
-					} else {
-						t.Logger.Info("Moved SL to lock %.2f for SHORT", target)
-						sl = target
-					}
-				}
-			}
-		}
-
-		// Partial exit
 		t.State.RLock()
 		partialDone := t.State.PartialTPDone
 		t.State.RUnlock()
-		if !partialDone && prog >= t.Config.PartialTakeProfitProgress {
-			partialQty := qty * t.Config.PartialTakeProfitRatio
+		if !partialDone && t.Config.PartialTakeProfitProgress > 0 && prog >= t.Config.PartialTakeProfitProgress {
+			partialQty, remainingQty := partialClosePlan(qty, t.Config.PartialTakeProfitRatio)
 			if partialQty > 0 {
 				reduceSide := "Sell"
 				if side == "SHORT" {
 					reduceSide = "Buy"
 				}
-				if err := t.OrderManager.PlaceOrderMarket(reduceSide, partialQty, true); err != nil {
+				tradeID := t.activeTradeID()
+				orderID, orderLinkID, err := t.placeMarketOrderWithLifecycle(reduceSide, partialQty, true, tradeID, "ptp")
+				if err != nil {
 					t.Logger.Error("Partial TP order failed: %v", err)
 				} else {
+					t.bindOrderLifecycle(orderID, orderLinkID, tradeID)
 					t.State.Lock()
 					t.State.PartialTPDone = true
 					t.State.Unlock()
 					t.Logger.Info("Partial TP executed: %.2f (%s), progress=%.0f%%", partialQty, reduceSide, prog*100)
-
-					// After partial TP, move SL to breakeven (entry) for the remainder.
-					be := entry
-					if side == "LONG" && be > price-tick {
-						be = price - tick
-					}
-					if side == "SHORT" && be < price+tick {
-						be = price + tick
-					}
-					be = t.roundSL(entry, be, tick, side)
-					t.logTradeEvent("partial_be_adjust", tradeEventLog{
-						Side:              side,
-						Qty:               qty,
-						Entry:             entry,
-						TP:                tp,
-						SL:                be,
-						TPDist:            math.Abs(tp - entry),
-						SLDist:            math.Abs(entry - be),
-						FeeOpenEst:        feeBuf / 2,
-						FeeCloseEst:       feeBuf / 2,
-						BreakevenMove:     feeBuf,
-						ReduceOnlyTP:      false,
-						ReduceOnlySL:      false,
-						TrailActivation:   t.Config.TrailActivation,
-						BreakevenProgress: t.Config.BreakevenProgress,
-					})
-					if err := t.PositionManager.UpdatePositionTPSL(t.Config.Symbol, tp, be); err != nil {
-						t.Logger.Error("Breakeven SL update after partial error: %v (target=%.2f tick=%.4f)", err, be, tick)
-					} else {
-						t.Logger.Info("Moved SL to breakeven %.2f after partial TP", be)
-						sl = be
+					if remainingQty > 0 {
+						tpNew, slNew := t.calculateInitialTPSL(entry, side)
+						t.enqueueStopIntent(models.StopIntent{
+							TradeID: t.activeTradeID(),
+							Side:    side,
+							Entry:   entry,
+							TP:      tpNew,
+							SL:      slNew,
+							Reason:  "partial_tp_remainder",
+						})
 					}
 				}
 			}
-		}
-
-		if t.Config.DisableTrailing {
-			continue
-		}
-		if !allowTighten {
-			continue
-		}
-
-		// Trail only after a defined amount of progress to avoid churn in chop
-		trailStart := math.Max(t.Config.TrailActivation, t.Config.BreakevenProgress)
-		var realizedR float64
-		if risk > 0 {
-			if side == "LONG" {
-				realizedR = (price - entry) / risk
-			} else {
-				realizedR = (entry - price) / risk
-			}
-		}
-		if prog < trailStart || realizedR < t.Config.MinTrailRR {
-			continue
-		}
-
-		atr := indicators.CalculateATR(t.State.Highs, t.State.Lows, t.State.Closes, 14)
-
-		baseBuffer := price * t.Config.TrailPerc
-		if atr > 0 {
-			baseBuffer = math.Max(baseBuffer, atr*0.5)
-		}
-		tightBuffer := price * t.Config.TrailTightPerc
-		if atr > 0 {
-			tightBuffer = math.Max(tightBuffer, atr*0.25)
-		}
-
-		var targetSL float64
-		if side == "LONG" {
-			targetSL = price - baseBuffer
-			if risk > 0 {
-				targetSL = math.Max(targetSL, entry+risk*0.25) // lock at least 0.25R when trailing kicks in
-			}
-			targetSL = math.Max(targetSL, entry+feeBuf)
-			if prog >= 0.9 {
-				targetSL = math.Max(targetSL, price-tightBuffer)
-			}
-			targetSL = math.Min(targetSL, price-tick)
-			targetSL = t.roundSL(entry, targetSL, tick, side)
-			if targetSL <= sl {
-				continue
-			}
-		} else {
-			targetSL = price + baseBuffer
-			if risk > 0 {
-				targetSL = math.Min(targetSL, entry-risk*0.25) // move stop below entry to secure profit
-			}
-			targetSL = math.Min(targetSL, entry-feeBuf)
-			if prog >= 0.9 {
-				targetSL = math.Min(targetSL, price+tightBuffer)
-			}
-			targetSL = math.Max(targetSL, price+tick)
-			targetSL = t.roundSL(entry, targetSL, tick, side)
-			if targetSL >= sl {
-				continue
-			}
-		}
-
-		t.logTradeEvent("trail_adjust", tradeEventLog{
-			Side:          side,
-			Qty:           qty,
-			Entry:         entry,
-			TP:            tp,
-			SL:            targetSL,
-			TPDist:        math.Abs(tp - entry),
-			SLDist:        math.Abs(entry - targetSL),
-			FeeOpenEst:    feeBuf / 2,
-			FeeCloseEst:   feeBuf / 2,
-			FundingEst:    0,
-			BreakevenMove: feeBuf,
-			ReduceOnlyTP:  false,
-			ReduceOnlySL:  false,
-		})
-		t.Logger.Info("Trailing stop: updating SL from %.2f to %.2f (%.0f%% way to TP)", sl, targetSL, prog*100)
-		if err := t.PositionManager.UpdatePositionTPSL(t.Config.Symbol, tp, targetSL); err != nil {
-			t.Logger.Error("Trailing SL update error: %v (target=%.2f tick=%.4f)", err, targetSL, tick)
-		} else {
-			t.Logger.Info("SL → %.2f (%.0f%% way to TP)", targetSL, prog*100)
 		}
 	}
 }

@@ -140,3 +140,32 @@ func TestUpdatePositionTPSLUsesPositionIdxZero(t *testing.T) {
 		t.Fatalf("takeProfit/stopLoss unexpected: %v", body)
 	}
 }
+
+func TestUpdatePositionTPSLNotModified34040IsNoop(t *testing.T) {
+	stopCalls := 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v5/position/list", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"retCode":0,"retMsg":"OK","result":{"list":[{"side":"Buy","size":"0.01","takeProfit":"100.0","stopLoss":"99.0","avgPrice":"100.0"}]}}`))
+	})
+	mux.HandleFunc("/v5/position/trading-stop", func(w http.ResponseWriter, r *http.Request) {
+		stopCalls++
+		_, _ = w.Write([]byte(`{"retCode":34040,"retMsg":"not modified"}`))
+	})
+
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	cfg := config.LoadConfig()
+	cfg.DemoRESTHost = srv.URL
+	cfg.APIKey = "k"
+	cfg.APISecret = "s"
+	client := api.NewRESTClient(cfg, nopLogger{})
+	pm := NewPositionManager(client, cfg, &models.State{}, nopLogger{})
+
+	if err := pm.UpdatePositionTPSL("BTCUSDT", 100, 99); err != nil {
+		t.Fatalf("expected 34040 to be treated as noop, got err: %v", err)
+	}
+	if stopCalls != 1 {
+		t.Fatalf("expected exactly one stop update call, got %d", stopCalls)
+	}
+}

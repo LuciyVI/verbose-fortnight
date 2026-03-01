@@ -162,7 +162,15 @@ func (pm *PositionManager) UpdatePositionTPSL(symbol string, tp, sl float64) err
 		RetCode int    `json:"retCode"`
 		RetMsg  string `json:"retMsg"`
 	}
-	if json.Unmarshal(reply, &r) != nil || r.RetCode != 0 {
+	if json.Unmarshal(reply, &r) != nil {
+		pm.Logger.Error("Error in TP/SL update response: decode failed")
+		return fmt.Errorf("error updating TP/SL: decode failed")
+	}
+	if r.RetCode == 34040 {
+		pm.Logger.Info("TP/SL update noop (retCode=34040): %s", r.RetMsg)
+		return nil
+	}
+	if r.RetCode != 0 {
 		pm.Logger.Error("Error in TP/SL update response: %d: %s", r.RetCode, r.RetMsg)
 		return fmt.Errorf("error updating TP/SL: %d: %s", r.RetCode, r.RetMsg)
 	}
