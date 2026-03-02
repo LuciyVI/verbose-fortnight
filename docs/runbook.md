@@ -21,6 +21,15 @@ ENABLE_FILL_JSON_LOG=1 \
 go run .
 ```
 
+### Release hardening dry-run (no REST/WS network)
+```bash
+ENABLE_DRY_RUN=1 \
+ENABLE_STATUS_SERVER=1 \
+ENABLE_EXECUTION_BACKFILL=1 \
+go run .
+```
+In dry-run mode the process starts status/health/counters and internal tick workers without exchange connections.
+
 ### Restricted environment (no local bind allowed)
 ```bash
 ENABLE_STATUS_SERVER=0 go run .
@@ -55,6 +64,7 @@ Important fields:
 - `counters.backfillDeduped`
 - `counters.backfillGaps`
 - `counters.backfillErrors`
+- `counters.dryRunTicks`
 - `health.lastBackfillCycleTs`
 - `health.lastBackfillError`
 - `health.lastBackfillErrorTs`
@@ -62,6 +72,14 @@ Important fields:
 - `health.lastEdgeDecisionTs`
 - `health.statusServerError`
 - `health.statusServerStartedTs`
+- `health.lastDryRunTickTs`
+- `features.fillJsonLog`
+- `features.lifecycleId`
+- `features.executionBackfill`
+- `features.partialBERule`
+- `features.edgeFilter`
+- `features.statusServer`
+- `features.dryRun`
 
 ## Key Logs
 
@@ -78,6 +96,9 @@ rg -n "execution_fill|Execution backfill cycle|next_backoff|gap detected|edge_fi
   - app keeps running.
 - Auth:
   - `Please check your API credentials`
+- Config validation:
+  - `Invalid configuration: ...`
+  - app fails fast only on clearly invalid values (for example negative fee percent, invalid status addr format, non-positive orderbook levels).
 
 ## Smoke-check Checklist
 1. `go test ./...` is green.
@@ -88,6 +109,7 @@ rg -n "execution_fill|Execution backfill cycle|next_backoff|gap detected|edge_fi
 6. Backfill errors increase `counters.backfillErrors` and update `health.lastBackfillError*`.
 7. `edge_filter_summary` appears at a bounded cadence (not per decision).
 8. `Execution backfill cycle failed ... next_backoff=...` is rate-limited.
+9. In `ENABLE_DRY_RUN=1`, `counters.dryRunTicks` and `health.lastDryRunTickTs` advance without network.
 
 ## Rollback
 - Fast rollback by flags:
@@ -95,6 +117,7 @@ rg -n "execution_fill|Execution backfill cycle|next_backoff|gap detected|edge_fi
   - `ENABLE_PARTIAL_BE_RULE=0`
   - `ENABLE_EXECUTION_BACKFILL=0`
   - `ENABLE_LIFECYCLE_ID=0`
+  - `ENABLE_DRY_RUN=0`
   - `ENABLE_STATUS_SERVER=0`
 - Lifecycle storage reset (if needed):
   - remove `runtime/lifecycle_map.json` when bot is stopped.
