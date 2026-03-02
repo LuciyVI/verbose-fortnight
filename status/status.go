@@ -23,6 +23,7 @@ type statusResponse struct {
 	Position     *models.PositionSnapshot  `json:"position,omitempty"`
 	Counters     models.RuntimeCounters    `json:"counters"`
 	Health       models.RuntimeHealth      `json:"health"`
+	Features     models.RuntimeFeatures    `json:"features"`
 }
 
 // StartServer starts a local HTTP status server for diagnostics.
@@ -66,6 +67,7 @@ func StartServer(cfg *config.Config, state *models.State, logger logging.LoggerI
 			position = &posCopy
 		}
 		counters, health := state.RuntimeSnapshot()
+		features := state.RuntimeFeaturesSnapshot()
 
 		resp := statusResponse{
 			Time:         time.Now(),
@@ -78,6 +80,7 @@ func StartServer(cfg *config.Config, state *models.State, logger logging.LoggerI
 			Position:     position,
 			Counters:     counters,
 			Health:       health,
+			Features:     features,
 		}
 
 		w.Header().Set("Content-Type", "application/json")

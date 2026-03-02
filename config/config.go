@@ -97,6 +97,7 @@ type Config struct {
 	EnableExecutionBackfill bool
 	EnablePartialBERule     bool
 	EnableEdgeFilter        bool
+	EnableDryRun            bool
 }
 
 // LoadConfig loads configuration from environment variables or uses defaults
@@ -193,6 +194,7 @@ func LoadConfig() *Config {
 		EnableExecutionBackfill: getEnvAsBool("ENABLE_EXECUTION_BACKFILL", false),
 		EnablePartialBERule:     getEnvAsBool("ENABLE_PARTIAL_BE_RULE", false),
 		EnableEdgeFilter:        getEnvAsBool("ENABLE_EDGE_FILTER", false),
+		EnableDryRun:            getEnvAsBool("ENABLE_DRY_RUN", false),
 	}
 }
 

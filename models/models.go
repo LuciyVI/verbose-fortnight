@@ -200,6 +200,18 @@ type RuntimeCounters struct {
 	BackfillDeduped   uint64 `json:"backfillDeduped"`
 	BackfillGaps      uint64 `json:"backfillGaps"`
 	BackfillErrors    uint64 `json:"backfillErrors"`
+	DryRunTicks       uint64 `json:"dryRunTicks"`
+}
+
+// RuntimeFeatures exposes enabled/disabled runtime feature flags in status output.
+type RuntimeFeatures struct {
+	FillJSONLog       bool `json:"fillJsonLog"`
+	LifecycleID       bool `json:"lifecycleId"`
+	ExecutionBackfill bool `json:"executionBackfill"`
+	PartialBERule     bool `json:"partialBERule"`
+	EdgeFilter        bool `json:"edgeFilter"`
+	StatusServer      bool `json:"statusServer"`
+	DryRun            bool `json:"dryRun"`
 }
 
 // RuntimeHealth contains recent runtime timestamps/errors for operator diagnostics.
@@ -209,6 +221,7 @@ type RuntimeHealth struct {
 	LastBackfillErrorTS time.Time `json:"lastBackfillErrorTs"`
 	LastWSExecutionTS   time.Time `json:"lastWsExecutionTs"`
 	LastEdgeDecisionTS  time.Time `json:"lastEdgeDecisionTs"`
+	LastDryRunTickTS    time.Time `json:"lastDryRunTickTs"`
 	StatusServerError   string    `json:"statusServerError"`
 	StatusServerStarted time.Time `json:"statusServerStartedTs"`
 }
@@ -319,6 +332,7 @@ type State struct {
 	// Runtime counters/health for observability.
 	RuntimeCounters RuntimeCounters
 	RuntimeHealth   RuntimeHealth
+	RuntimeFeatures RuntimeFeatures
 
 	// Volume tracking
 	RecentVolumes []float64 // Store recent volumes for calculating average/surge detection
@@ -460,6 +474,19 @@ func (s *State) RecordWSExecution(ts time.Time) {
 	s.Unlock()
 }
 
+func (s *State) RecordDryRunTick(ts time.Time) {
+	if s == nil {
+		return
+	}
+	if ts.IsZero() {
+		ts = time.Now()
+	}
+	s.Lock()
+	s.RuntimeCounters.DryRunTicks++
+	s.RuntimeHealth.LastDryRunTickTS = ts
+	s.Unlock()
+}
+
 func (s *State) RecordStatusServerStarted(ts time.Time) {
 	if s == nil {
 		return
@@ -495,4 +522,22 @@ func (s *State) RuntimeSnapshot() (RuntimeCounters, RuntimeHealth) {
 	s.RLock()
 	defer s.RUnlock()
 	return s.RuntimeCounters, s.RuntimeHealth
+}
+
+func (s *State) SetRuntimeFeatures(features RuntimeFeatures) {
+	if s == nil {
+		return
+	}
+	s.Lock()
+	s.RuntimeFeatures = features
+	s.Unlock()
+}
+
+func (s *State) RuntimeFeaturesSnapshot() RuntimeFeatures {
+	if s == nil {
+		return RuntimeFeatures{}
+	}
+	s.RLock()
+	defer s.RUnlock()
+	return s.RuntimeFeatures
 }

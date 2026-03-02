@@ -791,7 +791,17 @@ func main() {
 		ExecDedupMax:    5000,
 		ExecDedupTTL:    24 * time.Hour,
 	}
+
+	applyRuntimeFeatures(state, cfg)
+	if err := config.Validate(cfg); err != nil {
+		logFatal("Invalid configuration: %v", err)
+	}
+
 	statusServer := status.StartServer(cfg, state, logger)
+	if cfg.EnableDryRun {
+		runDryRunMode(state, statusServer)
+		return
+	}
 
 	// Create API client
 	apiClient := api.NewRESTClient(cfg, logger)
