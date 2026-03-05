@@ -15,6 +15,7 @@ import (
 	"verbose-fortnight/config"
 	"verbose-fortnight/logging"
 	"verbose-fortnight/models"
+	"verbose-fortnight/pnl"
 )
 
 // PositionManager handles all position-related operations
@@ -254,12 +255,7 @@ func (pm *PositionManager) CalculatePositionProfit(side string, entryPrice, exit
 		return 0 // Can't calculate profit without valid prices and quantity
 	}
 
-	var profit float64
-	if side == "LONG" {
-		profit = (exitPrice - entryPrice) * qty
-	} else if side == "SHORT" {
-		profit = (entryPrice - exitPrice) * qty
-	}
+	profit := pnl.Gross(side, entryPrice, exitPrice, qty)
 
 	// Update state with profit information
 	pm.State.Lock()
@@ -279,13 +275,10 @@ func (pm *PositionManager) CalculatePositionNetProfit(side string, entryPrice, e
 	if entryPrice <= 0 || exitPrice <= 0 || qty <= 0 {
 		return 0
 	}
-	var gross float64
-	if side == "LONG" {
-		gross = (exitPrice - entryPrice) * qty
-	} else if side == "SHORT" {
-		gross = (entryPrice - exitPrice) * qty
-	}
-	net := gross - math.Abs(fee) - math.Abs(funding)
+	gross := pnl.Gross(side, entryPrice, exitPrice, qty)
+	// Keep legacy behavior here: funding arg is treated as cost magnitude.
+	fundingSigned := -math.Abs(funding)
+	net := pnl.NetFromComponents(gross, math.Abs(fee), fundingSigned)
 
 	pm.State.Lock()
 	pm.State.RealizedPnL += net

@@ -4,13 +4,45 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 
 	"verbose-fortnight/config"
+	"verbose-fortnight/logging"
 )
+
+type captureAPILogger struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (l *captureAPILogger) Debug(format string, v ...interface{})   {}
+func (l *captureAPILogger) Warning(format string, v ...interface{}) {}
+func (l *captureAPILogger) Error(format string, v ...interface{})   {}
+func (l *captureAPILogger) Fatal(format string, v ...interface{})   {}
+func (l *captureAPILogger) Sync() error                             { return nil }
+func (l *captureAPILogger) ChangeLogLevel(level logging.LogLevel)   {}
+func (l *captureAPILogger) Info(format string, v ...interface{}) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lines = append(l.lines, fmt.Sprintf(format, v...))
+}
+
+func (l *captureAPILogger) findPrefix(prefix string) (string, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, line := range l.lines {
+		if strings.HasPrefix(line, prefix) {
+			return line, true
+		}
+	}
+	return "", false
+}
 
 func TestSignREST(t *testing.T) {
 	cfg := &config.Config{}
@@ -335,6 +367,50 @@ func TestGetExecutionsSincePaginatesUntilBoundary(t *testing.T) {
 	}
 	if execs[0].ExecID != "e9" || execs[3].ExecID != "e6" {
 		t.Fatalf("unexpected order/content: %+v", execs)
+	}
+}
+
+func TestExecutionListResponseLog(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v5/execution/list" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{
+			"retCode":0,
+			"result":{
+				"nextPageCursor":"cursor-2",
+				"list":[
+					{"execId":"e1","orderId":"o1","orderLinkId":"lc-1","side":"Buy","execQty":"0.1","execPrice":"101","execFee":"0.01","execPnl":"0.2","execTime":"1700000001000"}
+				]
+			}
+		}`))
+	}))
+	defer srv.Close()
+
+	cfg := config.LoadConfig()
+	cfg.DemoRESTHost = srv.URL
+	cfg.EnableExecutionResponseLog = true
+	logCap := &captureAPILogger{}
+	client := NewRESTClient(cfg, logCap)
+
+	_, _, _, err := client.GetExecutionsPage("BTCUSDT", "", 50)
+	if err != nil {
+		t.Fatalf("GetExecutionsPage error: %v", err)
+	}
+	line, ok := logCap.findPrefix("execution_list_response ")
+	if !ok {
+		t.Fatalf("expected execution_list_response log, got %+v", logCap.lines)
+	}
+	payload := strings.TrimPrefix(line, "execution_list_response ")
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(payload), &decoded); err != nil {
+		t.Fatalf("invalid response payload: %v (%s)", err, payload)
+	}
+	if decoded["list_len"] != float64(1) {
+		t.Fatalf("unexpected list_len: %v", decoded["list_len"])
+	}
+	if decoded["firstExecId"] != "e1" || decoded["lastExecId"] != "e1" {
+		t.Fatalf("unexpected exec ids: %v", decoded)
 	}
 }
 

@@ -85,19 +85,33 @@ type Config struct {
 	LogCompress   bool
 	LogLevel      int // 0=DEBUG, 1=INFO, 2=WARNING, 3=ERROR
 	// Status server configuration
-	StatusAddr         string
-	EnableStatusServer bool
+	StatusAddr           string
+	EnableStatusServer   bool
+	EnableConfigEndpoint bool
 	// Daemon configuration
 	DaemonMode bool
 	// Trailing configuration
 	DisableTrailing bool
 	// Feature flags for staged rollout of P1/P2 improvements
-	EnableFillJSONLog       bool
-	EnableLifecycleID       bool
-	EnableExecutionBackfill bool
-	EnablePartialBERule     bool
-	EnableEdgeFilter        bool
-	EnableDryRun            bool
+	EnableFillJSONLog          bool
+	EnableExecutionResponseLog bool
+	EnableLifecycleID          bool
+	EnableExecutionBackfill    bool
+	EnablePartialBERule        bool
+	EnableEdgeFilter           bool
+	EnableMakerFirst           bool
+	EnableTradeSummaryLog      bool
+	EnableDryRun               bool
+	MakerTimeoutMs             int
+	EdgeGuardSpreadThreshold   float64
+	EdgeGuardImpactThreshold   float64
+	MakerMaxSlippagePct        float64
+	EnableKPIMonitoring        bool
+	KPISummaryIntervalSec      int
+	KPIMinMakerRatio           float64
+	KPIMaxFeeToGross           float64
+	KPIMinNetPerTrade          float64
+	KPIMaxEdgeBlockRate        float64
 }
 
 // LoadConfig loads configuration from environment variables or uses defaults
@@ -182,19 +196,33 @@ func LoadConfig() *Config {
 		LogCompress:   true,
 		LogLevel:      1, // INFO level
 		// Status server defaults
-		StatusAddr:         getEnv("STATUS_ADDR", "127.0.0.1:6061"),
-		EnableStatusServer: getEnvAsBool("ENABLE_STATUS_SERVER", true),
+		StatusAddr:           getEnv("STATUS_ADDR", "127.0.0.1:6061"),
+		EnableStatusServer:   getEnvAsBool("ENABLE_STATUS_SERVER", true),
+		EnableConfigEndpoint: getEnvAsBool("ENABLE_CONFIG_ENDPOINT", false),
 		// Daemon defaults
 		DaemonMode: getEnvAsBool("DAEMON_MODE", false),
 		// Trailing defaults
 		DisableTrailing: true,
 		// P1/P2 feature flags
-		EnableFillJSONLog:       getEnvAsBool("ENABLE_FILL_JSON_LOG", false),
-		EnableLifecycleID:       getEnvAsBool("ENABLE_LIFECYCLE_ID", false),
-		EnableExecutionBackfill: getEnvAsBool("ENABLE_EXECUTION_BACKFILL", false),
-		EnablePartialBERule:     getEnvAsBool("ENABLE_PARTIAL_BE_RULE", false),
-		EnableEdgeFilter:        getEnvAsBool("ENABLE_EDGE_FILTER", false),
-		EnableDryRun:            getEnvAsBool("ENABLE_DRY_RUN", false),
+		EnableFillJSONLog:          getEnvAsBool("ENABLE_FILL_JSON_LOG", false),
+		EnableExecutionResponseLog: getEnvAsBool("ENABLE_EXECUTION_RESPONSE_LOG", false),
+		EnableLifecycleID:          getEnvAsBool("ENABLE_LIFECYCLE_ID", false),
+		EnableExecutionBackfill:    getEnvAsBool("ENABLE_EXECUTION_BACKFILL", false),
+		EnablePartialBERule:        getEnvAsBool("ENABLE_PARTIAL_BE_RULE", false),
+		EnableEdgeFilter:           getEnvAsBool("ENABLE_EDGE_FILTER", false),
+		EnableMakerFirst:           getEnvAsBool("ENABLE_MAKER_FIRST", false),
+		EnableTradeSummaryLog:      getEnvAsBool("ENABLE_TRADE_SUMMARY_LOG", false),
+		EnableDryRun:               getEnvAsBool("ENABLE_DRY_RUN", false),
+		MakerTimeoutMs:             getEnvAsInt("MAKER_TIMEOUT_MS", 800),
+		EdgeGuardSpreadThreshold:   getEnvAsFloat("EDGE_GUARD_SPREAD_THRESHOLD", 0),
+		EdgeGuardImpactThreshold:   getEnvAsFloat("EDGE_GUARD_IMPACT_THRESHOLD", 0),
+		MakerMaxSlippagePct:        getEnvAsFloat("MAKER_MAX_SLIPPAGE_PCT", 0),
+		EnableKPIMonitoring:        getEnvAsBool("ENABLE_KPI_MONITORING", false),
+		KPISummaryIntervalSec:      getEnvAsInt("KPI_SUMMARY_INTERVAL_SEC", 60),
+		KPIMinMakerRatio:           getEnvAsFloat("KPI_MIN_MAKER_RATIO", 0),
+		KPIMaxFeeToGross:           getEnvAsFloat("KPI_MAX_FEE_TO_GROSS", 0),
+		KPIMinNetPerTrade:          getEnvAsFloat("KPI_MIN_NET_PER_TRADE", 0),
+		KPIMaxEdgeBlockRate:        getEnvAsFloat("KPI_MAX_EDGE_BLOCK_RATE", 0),
 	}
 }
 

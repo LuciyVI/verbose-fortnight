@@ -2,6 +2,7 @@ package models
 
 import (
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -141,9 +142,20 @@ type StopIntent struct {
 	FeeEstimate float64
 	TP          float64
 	SL          float64
-	Breakeven   bool
-	Reason      string
-	TS          time.Time
+	SLPolicy    string
+	// LastWinMovePct stores the latest profitable move fraction used by SL policy (0.01 = 1%).
+	LastWinMovePct float64
+	// DesiredSLPct is the pre-clamp SL fraction requested by policy (from entry).
+	DesiredSLPct float64
+	// SLPctFinal is the final SL fraction after clamp/guards (from entry).
+	SLPctFinal float64
+	// SLPriceFinal is the absolute final SL price intent sent to stop-controller.
+	SLPriceFinal float64
+	MinSLPct     float64
+	MaxSLPct     float64
+	Breakeven    bool
+	Reason       string
+	TS           time.Time
 }
 
 // StopController keeps desired/applied TP/SL levels for idempotent writes.
@@ -165,9 +177,18 @@ type ExecutionEvent struct {
 	OrderLinkID       string
 	ExecSide          string
 	PositionSide      string
+	HasIsMaker        bool
+	IsMaker           bool
+	LastLiquidityInd  string
 	ReduceOnly        bool
 	Qty               float64
 	Price             float64
+	ExecFee           float64
+	ExecPnl           float64
+	HasExchangeNet    bool
+	ExchangeNet       float64
+	CreateType        string
+	StopOrderType     string
 	ClosedSize        float64
 	LeavesQty         float64
 	PositionSizeAfter float64
@@ -201,17 +222,42 @@ type RuntimeCounters struct {
 	BackfillGaps      uint64 `json:"backfillGaps"`
 	BackfillErrors    uint64 `json:"backfillErrors"`
 	DryRunTicks       uint64 `json:"dryRunTicks"`
+
+	MakerFills         uint64  `json:"makerFills"`
+	TakerFills         uint64  `json:"takerFills"`
+	MakerFallbackCount uint64  `json:"makerFallbackCount"`
+	MakerTimeoutCount  uint64  `json:"makerTimeoutCount"`
+	TotalExecFee       float64 `json:"totalExecFee"`
+	TotalGrossRealised float64 `json:"totalGrossRealised"`
+	TotalNetRealised   float64 `json:"totalNetRealised"`
+	FeeToGrossRatio    float64 `json:"feeToGrossRatio"`
+	MakerRatio         float64 `json:"makerRatio"`
+
+	AvgTradeDuration    float64 `json:"avgTradeDuration"`
+	AvgWinDuration      float64 `json:"avgWinDuration"`
+	AvgLossDuration     float64 `json:"avgLossDuration"`
+	AvgNetPerTrade      float64 `json:"avgNetPerTrade"`
+	NetAfterFeePerTrade float64 `json:"netAfterFeePerTrade"`
+
+	SLPolicyHalfLastWinCount      uint64 `json:"slPolicyHalfLastWinCount"`
+	SLPolicyFallbackSmallWinCount uint64 `json:"slPolicyFallbackSmallWinCount"`
+	SLPolicyClampViolationCount   uint64 `json:"slPolicyClampViolationCount"`
 }
 
 // RuntimeFeatures exposes enabled/disabled runtime feature flags in status output.
 type RuntimeFeatures struct {
-	FillJSONLog       bool `json:"fillJsonLog"`
-	LifecycleID       bool `json:"lifecycleId"`
-	ExecutionBackfill bool `json:"executionBackfill"`
-	PartialBERule     bool `json:"partialBERule"`
-	EdgeFilter        bool `json:"edgeFilter"`
-	StatusServer      bool `json:"statusServer"`
-	DryRun            bool `json:"dryRun"`
+	FillJSONLog          bool `json:"fillJsonLog"`
+	ExecutionResponseLog bool `json:"executionResponseLog"`
+	LifecycleID          bool `json:"lifecycleId"`
+	ExecutionBackfill    bool `json:"executionBackfill"`
+	PartialBERule        bool `json:"partialBERule"`
+	EdgeFilter           bool `json:"edgeFilter"`
+	MakerFirst           bool `json:"makerFirst"`
+	TradeSummaryLog      bool `json:"tradeSummaryLog"`
+	KPIMonitoring        bool `json:"kpiMonitoring"`
+	StatusServer         bool `json:"statusServer"`
+	ConfigEndpoint       bool `json:"configEndpoint"`
+	DryRun               bool `json:"dryRun"`
 }
 
 // RuntimeHealth contains recent runtime timestamps/errors for operator diagnostics.
@@ -329,10 +375,29 @@ type State struct {
 	LastBEIntentTradeID string
 	LastBEIntentSL      float64
 	LastBEIntentTS      time.Time
+	// Last profitable move tracking for SL policy (fractions, e.g. 0.01 = 1%).
+	LastWinMovePct      float64
+	LastWinMovePctLong  float64
+	LastWinMovePctShort float64
+	LastWinMoveSide     string
+	LastWinMoveSource   string
+	LastWinMoveNetPnL   float64
+	LastWinMoveEntry    float64
+	LastWinMoveExit     float64
+	LastWinMoveUpdated  time.Time
 	// Runtime counters/health for observability.
 	RuntimeCounters RuntimeCounters
 	RuntimeHealth   RuntimeHealth
 	RuntimeFeatures RuntimeFeatures
+
+	// Internal P5 aggregates used to compute running averages in RuntimeCounters.
+	tradeCount       uint64
+	winTradeCount    uint64
+	lossTradeCount   uint64
+	tradeDurationSum float64
+	winDurationSum   float64
+	lossDurationSum  float64
+	netAfterFeeSum   float64
 
 	// Volume tracking
 	RecentVolumes []float64 // Store recent volumes for calculating average/surge detection
@@ -429,6 +494,56 @@ func (s *State) RecordBEIntentSkippedAlreadyBetter() {
 	s.Unlock()
 }
 
+// RecordLastWinMove stores the latest profitable move fraction used by SL policy.
+func (s *State) RecordLastWinMove(side string, movePct, netPnL, entry, exit float64, source string, ts time.Time) {
+	if s == nil {
+		return
+	}
+	if movePct <= 0 {
+		return
+	}
+	if ts.IsZero() {
+		ts = time.Now()
+	}
+	normSide := strings.ToUpper(strings.TrimSpace(side))
+	s.Lock()
+	s.LastWinMovePct = movePct
+	switch normSide {
+	case "LONG":
+		s.LastWinMovePctLong = movePct
+	case "SHORT":
+		s.LastWinMovePctShort = movePct
+	}
+	s.LastWinMoveSide = normSide
+	s.LastWinMoveSource = strings.TrimSpace(source)
+	s.LastWinMoveNetPnL = netPnL
+	s.LastWinMoveEntry = entry
+	s.LastWinMoveExit = exit
+	s.LastWinMoveUpdated = ts
+	s.Unlock()
+}
+
+// LastWinMovePctForSide returns side-specific last winning move when available, then falls back to global.
+func (s *State) LastWinMovePctForSide(side string) float64 {
+	if s == nil {
+		return 0
+	}
+	normSide := strings.ToUpper(strings.TrimSpace(side))
+	s.RLock()
+	defer s.RUnlock()
+	switch normSide {
+	case "LONG":
+		if s.LastWinMovePctLong > 0 {
+			return s.LastWinMovePctLong
+		}
+	case "SHORT":
+		if s.LastWinMovePctShort > 0 {
+			return s.LastWinMovePctShort
+		}
+	}
+	return s.LastWinMovePct
+}
+
 func (s *State) RecordBackfillCycle(fetched, processed, deduped, gaps uint64, ts time.Time) {
 	if s == nil {
 		return
@@ -462,6 +577,18 @@ func (s *State) RecordBackfillError(errMsg string, ts time.Time) {
 	s.Unlock()
 }
 
+func (s *State) RecordBackfillHeartbeat(ts time.Time) {
+	if s == nil {
+		return
+	}
+	if ts.IsZero() {
+		ts = time.Now()
+	}
+	s.Lock()
+	s.RuntimeHealth.LastBackfillCycleTS = ts
+	s.Unlock()
+}
+
 func (s *State) RecordWSExecution(ts time.Time) {
 	if s == nil {
 		return
@@ -484,6 +611,115 @@ func (s *State) RecordDryRunTick(ts time.Time) {
 	s.Lock()
 	s.RuntimeCounters.DryRunTicks++
 	s.RuntimeHealth.LastDryRunTickTS = ts
+	s.Unlock()
+}
+
+func (s *State) RecordExecutionQuality(hasMaker bool, isMaker bool, execFeeAbs, grossRealisedDelta, netRealisedDelta float64) {
+	if s == nil {
+		return
+	}
+	s.Lock()
+	if hasMaker {
+		if isMaker {
+			s.RuntimeCounters.MakerFills++
+		} else {
+			s.RuntimeCounters.TakerFills++
+		}
+	}
+	knownFills := s.RuntimeCounters.MakerFills + s.RuntimeCounters.TakerFills
+	if knownFills > 0 {
+		s.RuntimeCounters.MakerRatio = float64(s.RuntimeCounters.MakerFills) / float64(knownFills)
+	} else {
+		s.RuntimeCounters.MakerRatio = 0
+	}
+	if execFeeAbs < 0 {
+		execFeeAbs = -execFeeAbs
+	}
+	s.RuntimeCounters.TotalExecFee += execFeeAbs
+	s.RuntimeCounters.TotalGrossRealised += grossRealisedDelta
+	s.RuntimeCounters.TotalNetRealised += netRealisedDelta
+	denom := s.RuntimeCounters.TotalGrossRealised
+	if denom < 0 {
+		denom = -denom
+	}
+	if denom > 1e-9 {
+		s.RuntimeCounters.FeeToGrossRatio = s.RuntimeCounters.TotalExecFee / denom
+	} else {
+		s.RuntimeCounters.FeeToGrossRatio = 0
+	}
+	s.Unlock()
+}
+
+func (s *State) RecordTradeOutcome(durationSec, netAfterFee float64) {
+	if s == nil {
+		return
+	}
+	if durationSec < 0 {
+		durationSec = 0
+	}
+	s.Lock()
+	s.tradeCount++
+	s.tradeDurationSum += durationSec
+	if s.tradeCount > 0 {
+		s.RuntimeCounters.AvgTradeDuration = s.tradeDurationSum / float64(s.tradeCount)
+	}
+
+	if netAfterFee >= 0 {
+		s.winTradeCount++
+		s.winDurationSum += durationSec
+		if s.winTradeCount > 0 {
+			s.RuntimeCounters.AvgWinDuration = s.winDurationSum / float64(s.winTradeCount)
+		}
+	} else {
+		s.lossTradeCount++
+		s.lossDurationSum += durationSec
+		if s.lossTradeCount > 0 {
+			s.RuntimeCounters.AvgLossDuration = s.lossDurationSum / float64(s.lossTradeCount)
+		}
+	}
+
+	s.netAfterFeeSum += netAfterFee
+	if s.tradeCount > 0 {
+		s.RuntimeCounters.NetAfterFeePerTrade = s.netAfterFeeSum / float64(s.tradeCount)
+		s.RuntimeCounters.AvgNetPerTrade = s.RuntimeCounters.NetAfterFeePerTrade
+	}
+	s.Unlock()
+}
+
+func (s *State) RecordMakerTimeout() {
+	if s == nil {
+		return
+	}
+	s.Lock()
+	s.RuntimeCounters.MakerTimeoutCount++
+	s.Unlock()
+}
+
+func (s *State) RecordMakerFallback() {
+	if s == nil {
+		return
+	}
+	s.Lock()
+	s.RuntimeCounters.MakerFallbackCount++
+	s.Unlock()
+}
+
+func (s *State) RecordSLPolicyDecision(policy, reason string) {
+	if s == nil {
+		return
+	}
+	s.Lock()
+	switch strings.ToLower(strings.TrimSpace(policy)) {
+	case "half_last_win":
+		s.RuntimeCounters.SLPolicyHalfLastWinCount++
+	default:
+		switch strings.ToLower(strings.TrimSpace(reason)) {
+		case "small_last_win":
+			s.RuntimeCounters.SLPolicyFallbackSmallWinCount++
+		case "clamp_violation":
+			s.RuntimeCounters.SLPolicyClampViolationCount++
+		}
+	}
 	s.Unlock()
 }
 

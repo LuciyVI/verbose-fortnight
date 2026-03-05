@@ -188,27 +188,48 @@ func processExecutionRecord(trader executionEventProcessor, symbol, source strin
 			source, exec.OrderID, exec.OrderLinkID, exec.ExecID, tradeID)
 	}
 	if cfg != nil && cfg.EnableFillJSONLog {
-		logExecutionFillJSON(map[string]interface{}{
-			"symbol":      symbol,
-			"orderId":     exec.OrderID,
-			"orderLinkId": exec.OrderLinkID,
-			"execId":      exec.ExecID,
-			"side":        exec.Side,
-			"execQty":     exec.ExecQty,
-			"execPrice":   exec.ExecPrice,
-			"execTime":    exec.ExecTime,
-			"createdTime": exec.CreatedTime,
-		}, symbol, source, tradeID, lifecycleInferred)
+		item := map[string]interface{}{
+			"symbol":           symbol,
+			"orderId":          exec.OrderID,
+			"orderLinkId":      exec.OrderLinkID,
+			"execId":           exec.ExecID,
+			"tradeId":          exec.TradeID,
+			"side":             exec.Side,
+			"execQty":          exec.ExecQty,
+			"execPrice":        exec.ExecPrice,
+			"execFee":          exec.ExecFee,
+			"execPnl":          exec.ExecPnl,
+			"lastLiquidityInd": exec.LastLiquidity,
+			"closedSize":       exec.ClosedSize,
+			"reduceOnly":       exec.ReduceOnly,
+			"createType":       exec.CreateType,
+			"stopOrderType":    exec.StopOrderType,
+			"execTime":         exec.ExecTime,
+			"createdTime":      exec.CreatedTime,
+		}
+		if exec.HasIsMaker {
+			item["isMaker"] = exec.IsMaker
+		}
+		logExecutionFillJSON(item, symbol, source, tradeID, lifecycleInferred)
 	}
 	processed = trader.ProcessExecutionEvent(models.ExecutionEvent{
-		TradeID:      tradeID,
-		ExecID:       exec.ExecID,
-		OrderID:      exec.OrderID,
-		OrderLinkID:  exec.OrderLinkID,
-		ExecSide:     normalizeSide(exec.Side),
-		PositionSide: normalizeSide(exec.Side),
-		Qty:          exec.ExecQty,
-		Price:        exec.ExecPrice,
+		TradeID:          tradeID,
+		ExecID:           exec.ExecID,
+		OrderID:          exec.OrderID,
+		OrderLinkID:      exec.OrderLinkID,
+		ExecSide:         normalizeSide(exec.Side),
+		PositionSide:     normalizeSide(exec.Side),
+		HasIsMaker:       exec.HasIsMaker,
+		IsMaker:          exec.IsMaker,
+		LastLiquidityInd: exec.LastLiquidity,
+		ReduceOnly:       exec.ReduceOnly,
+		Qty:              exec.ExecQty,
+		Price:            exec.ExecPrice,
+		ExecFee:          exec.ExecFee,
+		ExecPnl:          exec.ExecPnl,
+		ClosedSize:       exec.ClosedSize,
+		CreateType:       exec.CreateType,
+		StopOrderType:    exec.StopOrderType,
 	}, source)
 	return processed, wsSeen
 }

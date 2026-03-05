@@ -16,6 +16,7 @@ import (
 	"verbose-fortnight/logging"
 	"verbose-fortnight/models"
 	"verbose-fortnight/order"
+	"verbose-fortnight/pnl"
 	"verbose-fortnight/position"
 )
 
@@ -29,6 +30,8 @@ type Trader struct {
 	Logger          logging.LoggerInterface
 	lifecycle       *lifecycleMapper
 	edgeObs         edgeObservability
+	summaryMu       sync.Mutex
+	summaries       map[string]*tradeSummaryState
 }
 
 type edgeObservability struct {
@@ -69,6 +72,10 @@ type orderManagerWithTPSLLink interface {
 	PlaceTakeProfitOrderWithLink(side string, qty, price float64, orderLinkID string) error
 }
 
+type orderManagerWithPostOnlyLink interface {
+	PlaceOrderLimitPostOnlyWithLinkID(side string, qty, price float64, reduceOnly bool, orderLinkID string) (string, error)
+}
+
 // PositionManager is the strategy-facing position interface.
 type PositionManager interface {
 	HasOpenPosition() (bool, string, float64, float64, float64)
@@ -81,11 +88,20 @@ type PositionManager interface {
 }
 
 type tradeEventLog struct {
+	Symbol            string  `json:"symbol,omitempty"`
+	TraceKey          string  `json:"trace_key,omitempty"`
+	LifecycleID       string  `json:"lifecycle_id,omitempty"`
+	OrderID           string  `json:"order_id,omitempty"`
+	OrderLinkID       string  `json:"order_link_id,omitempty"`
+	ExecID            string  `json:"exec_id,omitempty"`
+	Source            string  `json:"source,omitempty"`
+	Reason            string  `json:"reason,omitempty"`
 	Event             string  `json:"event"`
 	TradeID           string  `json:"trade_id"`
 	Side              string  `json:"side"`
 	Qty               float64 `json:"qty"`
 	Entry             float64 `json:"entry"`
+	Exit              float64 `json:"exit,omitempty"`
 	TP                float64 `json:"tp"`
 	SL                float64 `json:"sl"`
 	TPDist            float64 `json:"tp_dist"`
@@ -93,7 +109,17 @@ type tradeEventLog struct {
 	FeeOpenEst        float64 `json:"fee_open_est"`
 	FeeCloseEst       float64 `json:"fee_close_est"`
 	FundingEst        float64 `json:"funding_est"`
+	NetPnL            float64 `json:"net_pnl,omitempty"`
+	MovePct           float64 `json:"move_pct,omitempty"`
 	BreakevenMove     float64 `json:"breakeven_move"`
+	RRAfterFee        float64 `json:"rr_after_fee,omitempty"`
+	SLPolicy          string  `json:"sl_policy,omitempty"`
+	LastWinMovePct    float64 `json:"last_win_move_pct,omitempty"`
+	DesiredSLPct      float64 `json:"desired_sl_pct,omitempty"`
+	SLPctFinal        float64 `json:"sl_pct_final,omitempty"`
+	SLPriceFinal      float64 `json:"sl_price_final,omitempty"`
+	MinSLPct          float64 `json:"min_sl_pct,omitempty"`
+	MaxSLPct          float64 `json:"max_sl_pct,omitempty"`
 	TickSize          float64 `json:"tick_size"`
 	StepSize          float64 `json:"step_size"`
 	TPOrderType       string  `json:"tp_order_type"`
@@ -108,6 +134,15 @@ func (t *Trader) logTradeEvent(event string, payload tradeEventLog) {
 	payload.Event = event
 	if payload.TradeID == "" {
 		payload.TradeID = fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	if payload.Symbol == "" && t.Config != nil {
+		payload.Symbol = t.Config.Symbol
+	}
+	if payload.LifecycleID == "" && t.Config != nil && t.Config.EnableLifecycleID {
+		payload.LifecycleID = payload.TradeID
+	}
+	if payload.TraceKey == "" {
+		payload.TraceKey = t.resolveTraceKey(payload.LifecycleID, payload.TradeID, payload.OrderID, payload.OrderLinkID, payload.ExecID)
 	}
 	if payload.TickSize == 0 {
 		payload.TickSize = t.State.Instr.TickSize
@@ -135,6 +170,59 @@ func (t *Trader) logTradeEvent(event string, payload tradeEventLog) {
 	t.Logger.Info("trade_event %s", string(bytes))
 }
 
+func (t *Trader) resolveTraceKey(lifecycleID, tradeID, orderID, orderLinkID, execID string) string {
+	lifecycleID = strings.TrimSpace(lifecycleID)
+	if lifecycleID != "" {
+		return lifecycleID
+	}
+	tradeID = strings.TrimSpace(tradeID)
+	if tradeID != "" {
+		return tradeID
+	}
+	orderID = strings.TrimSpace(orderID)
+	if orderID != "" {
+		return orderID
+	}
+	orderLinkID = strings.TrimSpace(orderLinkID)
+	if orderLinkID != "" {
+		return orderLinkID
+	}
+	return strings.TrimSpace(execID)
+}
+
+type tradeSummaryState struct {
+	Symbol       string
+	TraceKey     string
+	LifecycleID  string
+	TradeID      string
+	PositionSide string
+
+	QtyOpened     float64
+	EntryNotional float64
+	QtyClosed     float64
+	ExitNotional  float64
+
+	FeeOpenTotal  float64
+	FeeCloseTotal float64
+	FeeTotal      float64
+	FundingSigned float64
+	RealisedDelta float64
+
+	Legs []pnl.Leg
+	// CloseExecCount is the number of close executions seen for this lifecycle.
+	CloseExecCount int
+
+	LastOrderID     string
+	LastOrderLinkID string
+	LastExecID      string
+	CloseReason     string
+	StartedAt       time.Time
+	LastUpdateAt    time.Time
+
+	HasExchangeNet bool
+	ExchangeNet    float64
+}
+
 type tpslCalcDetails struct {
 	entry            float64
 	side             string
@@ -151,6 +239,15 @@ type tpslCalcDetails struct {
 
 	tpDistBase float64
 	tpDist     float64
+
+	slPolicy       string
+	slPolicyReason string
+	lastWinMovePct float64
+	desiredSLPct   float64
+	slPctFinal     float64
+	slPriceFinal   float64
+	minSLPct       float64
+	maxSLPct       float64
 }
 
 type dynamicTPDetails struct {
@@ -165,6 +262,7 @@ type dynamicTPDetails struct {
 }
 
 const fixedStopLossFraction = 0.0025 // 0.25%
+const maxStopLossFraction = 0.03     // 3.00%
 
 func (t *Trader) dynamicTP(entry, atr float64, regime string) dynamicTPDetails {
 	k := t.Config.DynamicTPK
@@ -223,6 +321,7 @@ func NewTrader(apiClient *api.RESTClient, cfg *config.Config, state *models.Stat
 		OrderManager:    orderManager,
 		PositionManager: positionManager,
 		Logger:          logger,
+		summaries:       make(map[string]*tradeSummaryState),
 	}
 	if cfg != nil && cfg.EnableLifecycleID {
 		tr.lifecycle = newLifecycleMapper(defaultLifecycleMapPath(), logger)
@@ -280,6 +379,27 @@ func (t *Trader) estimateRoundTripFee(entry, exit, qty float64) float64 {
 		price = (entry + exit) / 2
 	}
 	return math.Abs(price*qty) * feePerc
+}
+
+func calcRRAfterFee(tpDist, slDist, feeBuffer float64) float64 {
+	if slDist <= 0 {
+		return 0
+	}
+	netTP := tpDist - feeBuffer
+	netSL := slDist + feeBuffer
+	if netSL <= 0 {
+		return 0
+	}
+	return netTP / netSL
+}
+
+func (t *Trader) rrAfterFeeFromLevels(entry, tp, sl float64) float64 {
+	if entry <= 0 || tp <= 0 || sl <= 0 {
+		return 0
+	}
+	tpDist := math.Abs(tp - entry)
+	slDist := math.Abs(entry - sl)
+	return calcRRAfterFee(tpDist, slDist, t.feeBuffer(entry))
 }
 
 func (t *Trader) higherTimeframeBias(atr float64) string {
@@ -579,6 +699,18 @@ type edgeScoreResult struct {
 	LevelsUsed int
 }
 
+type edgeGuardMetrics struct {
+	SpreadPct   float64
+	Impact      float64
+	SumBid      float64
+	SumAsk      float64
+	LevelsUsed  int
+	WouldBlock  bool
+	Reason      string
+	ThresholdSP float64
+	ThresholdIM float64
+}
+
 func calcEdgeScore(side string, bidsMap, asksMap map[string]float64, levels int, minDepth float64) (score float64, ok bool, reason string) {
 	res := calcEdgeScoreDetailed(side, bidsMap, asksMap, levels, minDepth)
 	return res.Score, res.OK, res.Reason
@@ -721,6 +853,145 @@ func calcEdgeScoreDetailed(side string, bidsMap, asksMap map[string]float64, lev
 		SumAsk:     sumAsk,
 		LevelsUsed: levelsUsed,
 	}
+}
+
+func calcEntryEdgeGuardMetrics(side string, qty float64, bidsMap, asksMap map[string]float64, levels int, spreadThreshold, impactThreshold float64) edgeGuardMetrics {
+	res := edgeGuardMetrics{
+		ThresholdSP: spreadThreshold,
+		ThresholdIM: impactThreshold,
+	}
+	if levels <= 0 {
+		levels = 1
+	}
+	type level struct {
+		price float64
+		size  float64
+	}
+	bids := make([]level, 0, len(bidsMap))
+	for ps, sz := range bidsMap {
+		if sz <= 0 {
+			continue
+		}
+		p, err := strconv.ParseFloat(ps, 64)
+		if err != nil || p <= 0 {
+			continue
+		}
+		bids = append(bids, level{price: p, size: sz})
+	}
+	asks := make([]level, 0, len(asksMap))
+	for ps, sz := range asksMap {
+		if sz <= 0 {
+			continue
+		}
+		p, err := strconv.ParseFloat(ps, 64)
+		if err != nil || p <= 0 {
+			continue
+		}
+		asks = append(asks, level{price: p, size: sz})
+	}
+	sort.Slice(bids, func(i, j int) bool { return bids[i].price > bids[j].price })
+	sort.Slice(asks, func(i, j int) bool { return asks[i].price < asks[j].price })
+	levelsUsed := levels
+	if len(bids) < levelsUsed {
+		levelsUsed = len(bids)
+	}
+	if len(asks) < levelsUsed {
+		levelsUsed = len(asks)
+	}
+	res.LevelsUsed = levelsUsed
+	if levelsUsed <= 0 {
+		res.Reason = "min_depth"
+		return res
+	}
+	for i := 0; i < levelsUsed; i++ {
+		res.SumBid += bids[i].size
+		res.SumAsk += asks[i].size
+	}
+	bestBid := bids[0].price
+	bestAsk := asks[0].price
+	if bestBid > 0 && bestAsk > bestBid {
+		mid := (bestAsk + bestBid) / 2
+		if mid > 0 {
+			res.SpreadPct = (bestAsk - bestBid) / mid
+		}
+	}
+	side = strings.ToUpper(strings.TrimSpace(side))
+	availableDepth := 0.0
+	switch side {
+	case "LONG":
+		availableDepth = res.SumAsk
+	case "SHORT":
+		availableDepth = res.SumBid
+	}
+	if qty > 0 && availableDepth > 0 {
+		res.Impact = qty / availableDepth
+	}
+
+	reasons := make([]string, 0, 2)
+	if spreadThreshold > 0 && res.SpreadPct > spreadThreshold {
+		reasons = append(reasons, "wide_spread")
+	}
+	if impactThreshold > 0 && availableDepth > 0 && res.Impact > impactThreshold {
+		reasons = append(reasons, "high_impact")
+	}
+	if availableDepth <= 0 {
+		reasons = append(reasons, "min_depth")
+	}
+	if len(reasons) > 0 {
+		res.WouldBlock = true
+		res.Reason = strings.Join(reasons, ",")
+	} else {
+		res.Reason = "ok"
+	}
+	return res
+}
+
+func (t *Trader) logEntryEdgeGuardMetrics(side string, qty float64) {
+	if t == nil || t.State == nil || t.Config == nil {
+		return
+	}
+	t.State.ObLock.Lock()
+	bidsCopy := make(map[string]float64, len(t.State.BidsMap))
+	asksCopy := make(map[string]float64, len(t.State.AsksMap))
+	for k, v := range t.State.BidsMap {
+		bidsCopy[k] = v
+	}
+	for k, v := range t.State.AsksMap {
+		asksCopy[k] = v
+	}
+	t.State.ObLock.Unlock()
+
+	res := calcEntryEdgeGuardMetrics(
+		side,
+		qty,
+		bidsCopy,
+		asksCopy,
+		t.Config.OrderbookLevels,
+		t.Config.EdgeGuardSpreadThreshold,
+		t.Config.EdgeGuardImpactThreshold,
+	)
+	payload := map[string]interface{}{
+		"ts":              time.Now().UTC().Format(time.RFC3339Nano),
+		"symbol":          t.Config.Symbol,
+		"side":            side,
+		"qty":             qty,
+		"spread_pct":      res.SpreadPct,
+		"impact":          res.Impact,
+		"sumBid":          res.SumBid,
+		"sumAsk":          res.SumAsk,
+		"levelsUsed":      res.LevelsUsed,
+		"spreadThreshold": res.ThresholdSP,
+		"impactThreshold": res.ThresholdIM,
+		"would_block":     res.WouldBlock,
+		"reason":          res.Reason,
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Logger.Info("entry_edge_guard side=%s qty=%.4f spread_pct=%.6f impact=%.6f would_block=%t reason=%s",
+			side, qty, res.SpreadPct, res.Impact, res.WouldBlock, res.Reason)
+		return
+	}
+	t.Logger.Info("entry_edge_guard %s", string(raw))
 }
 
 func (t *Trader) edgeFilterCheck(side string) (pass bool, score float64, reason string, res edgeScoreResult) {
@@ -1120,6 +1391,212 @@ func (t *Trader) placeMarketOrderWithLifecycle(side string, qty float64, reduceO
 	return orderID, "", err
 }
 
+func (t *Trader) makerFirstTimeout() time.Duration {
+	if t == nil || t.Config == nil {
+		return 800 * time.Millisecond
+	}
+	ms := t.Config.MakerTimeoutMs
+	if ms <= 0 {
+		ms = 800
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+func (t *Trader) makerFirstLimitPrice(orderSide string) float64 {
+	if t == nil || t.PositionManager == nil {
+		return 0
+	}
+	switch strings.ToUpper(strings.TrimSpace(orderSide)) {
+	case "BUY":
+		return t.PositionManager.GetLastBidPrice()
+	case "SELL":
+		return t.PositionManager.GetLastAskPrice()
+	default:
+		return 0
+	}
+}
+
+func (t *Trader) calcMakerFallbackSlippagePct(orderSide string, makerLimitPrice float64) float64 {
+	if t == nil || t.PositionManager == nil || makerLimitPrice <= 0 {
+		return 0
+	}
+	side := strings.ToUpper(strings.TrimSpace(orderSide))
+	marketRef := 0.0
+	switch side {
+	case "BUY":
+		marketRef = t.PositionManager.GetLastAskPrice()
+	case "SELL":
+		marketRef = t.PositionManager.GetLastBidPrice()
+	}
+	if marketRef <= 0 {
+		return 0
+	}
+	return math.Abs(marketRef-makerLimitPrice) / makerLimitPrice * 100
+}
+
+func (t *Trader) logMakerFirstEvent(event string, payload map[string]interface{}) {
+	if t == nil || t.Logger == nil {
+		return
+	}
+	if payload == nil {
+		payload = map[string]interface{}{}
+	}
+	if _, ok := payload["ts"]; !ok {
+		payload["ts"] = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+	if t.Config != nil {
+		if _, ok := payload["symbol"]; !ok {
+			payload["symbol"] = t.Config.Symbol
+		}
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Logger.Info("%s marshal_error=%v", event, err)
+		return
+	}
+	t.Logger.Info("%s %s", event, string(raw))
+}
+
+func (t *Trader) makerFirstFillProgress(reduceOnly bool, beforeExists bool, beforeQty, requestedQty float64) (bool, float64) {
+	const eps = 1e-9
+	exists, _, nowQty, _, _ := t.PositionManager.HasOpenPosition()
+	if !reduceOnly {
+		if !beforeExists {
+			if exists && nowQty > eps {
+				return true, 0
+			}
+			return false, requestedQty
+		}
+		if nowQty > beforeQty+eps {
+			return true, 0
+		}
+		return false, requestedQty
+	}
+
+	if !beforeExists {
+		return false, requestedQty
+	}
+	if !exists || nowQty <= eps {
+		return true, 0
+	}
+	closedQty := beforeQty - nowQty
+	if closedQty <= eps {
+		return false, requestedQty
+	}
+	remaining := requestedQty - closedQty
+	if remaining <= eps {
+		return true, 0
+	}
+	return false, remaining
+}
+
+func (t *Trader) placeMakerFirstOrderWithFallback(side string, qty float64, reduceOnly bool, lifecycleID, leg string) (orderID, orderLinkID string, err error) {
+	if t == nil || t.Config == nil {
+		return t.placeMarketOrderWithLifecycle(side, qty, reduceOnly, lifecycleID, leg)
+	}
+	om, ok := t.OrderManager.(orderManagerWithPostOnlyLink)
+	if !ok {
+		t.Logger.Warning("Maker-first enabled but order manager has no post-only support; fallback to market")
+		return t.placeMarketOrderWithLifecycle(side, qty, reduceOnly, lifecycleID, leg)
+	}
+	beforeExists, _, beforeQty, _, _ := t.PositionManager.HasOpenPosition()
+	limitPrice := t.makerFirstLimitPrice(side)
+	if limitPrice <= 0 {
+		t.Logger.Warning("Maker-first skipped due to missing best bid/ask; fallback to market")
+		return t.placeMarketOrderWithLifecycle(side, qty, reduceOnly, lifecycleID, leg)
+	}
+	bestBid := t.PositionManager.GetLastBidPrice()
+	bestAsk := t.PositionManager.GetLastAskPrice()
+	if t.Config.EdgeGuardSpreadThreshold > 0 && bestBid > 0 && bestAsk > bestBid {
+		mid := (bestAsk + bestBid) / 2
+		if mid > 0 {
+			spreadPct := (bestAsk - bestBid) / mid
+			if spreadPct > t.Config.EdgeGuardSpreadThreshold {
+				t.Logger.Warning("maker_first_wide_spread side=%s spread_pct=%.6f threshold=%.6f best_bid=%.2f best_ask=%.2f",
+					side, spreadPct, t.Config.EdgeGuardSpreadThreshold, bestBid, bestAsk)
+			}
+		}
+	}
+	makerLeg := leg + "l"
+	orderLinkID = lifecycleOrderLinkID(lifecycleID, makerLeg)
+	t.logMakerFirstEvent("maker_first_attempt", map[string]interface{}{
+		"side":       side,
+		"qty":        qty,
+		"reduceOnly": reduceOnly,
+		"price":      limitPrice,
+		"timeout_ms": t.makerFirstTimeout().Milliseconds(),
+		"lifecycle":  lifecycleID,
+		"leg":        leg,
+	})
+	orderID, err = om.PlaceOrderLimitPostOnlyWithLinkID(side, qty, limitPrice, reduceOnly, orderLinkID)
+	if err != nil {
+		t.Logger.Warning("Maker-first post-only place failed: side=%s qty=%.6f reduceOnly=%t err=%v; fallback to market",
+			side, qty, reduceOnly, err)
+		return t.placeMarketOrderWithLifecycle(side, qty, reduceOnly, lifecycleID, leg)
+	}
+	timeout := t.makerFirstTimeout()
+	t.Logger.Info("Maker-first order placed: side=%s qty=%.6f price=%.2f reduceOnly=%t orderId=%s timeout=%s",
+		side, qty, limitPrice, reduceOnly, orderID, timeout)
+
+	deadline := time.Now().Add(timeout)
+	remainingQty := qty
+	filled, remaining := t.makerFirstFillProgress(reduceOnly, beforeExists, beforeQty, qty)
+	remainingQty = remaining
+	if filled {
+		return orderID, orderLinkID, nil
+	}
+
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for time.Now().Before(deadline) {
+		<-ticker.C
+		filled, remaining := t.makerFirstFillProgress(reduceOnly, beforeExists, beforeQty, qty)
+		if filled {
+			return orderID, orderLinkID, nil
+		}
+		remainingQty = remaining
+	}
+
+	t.State.RecordMakerTimeout()
+	t.logMakerFirstEvent("maker_first_timeout", map[string]interface{}{
+		"side":             side,
+		"qty":              qty,
+		"reduceOnly":       reduceOnly,
+		"order_id":         orderID,
+		"partial_fill_qty": math.Max(qty-remainingQty, 0),
+		"remaining_qty":    remainingQty,
+		"timeout_ms":       timeout.Milliseconds(),
+	})
+	t.Logger.Warning("Maker-first timeout: side=%s qty=%.6f reduceOnly=%t orderId=%s remaining=%.6f; fallback market",
+		side, qty, reduceOnly, orderID, remainingQty)
+	if t.PositionManager != nil && t.Config != nil {
+		t.PositionManager.CancelAllOrders(t.Config.Symbol)
+	}
+	if reduceOnly && remainingQty > 0 && remainingQty < qty {
+		qty = remainingQty
+	}
+	marketLeg := leg + "m"
+	fallbackOrderID, fallbackOrderLinkID, fallbackErr := t.placeMarketOrderWithLifecycle(side, qty, reduceOnly, lifecycleID, marketLeg)
+	if fallbackErr == nil {
+		t.State.RecordMakerFallback()
+		slippagePct := t.calcMakerFallbackSlippagePct(side, limitPrice)
+		if t.Config.MakerMaxSlippagePct > 0 && slippagePct > t.Config.MakerMaxSlippagePct {
+			t.Logger.Warning("maker_first_slippage_warn side=%s slippage_pct=%.6f threshold=%.6f order_id=%s",
+				side, slippagePct, t.Config.MakerMaxSlippagePct, fallbackOrderID)
+		}
+		t.logMakerFirstEvent("maker_first_fallback_market", map[string]interface{}{
+			"side":             side,
+			"qty":              qty,
+			"reduceOnly":       reduceOnly,
+			"partial_fill_qty": math.Max(qty-remainingQty, 0),
+			"remaining_qty":    remainingQty,
+			"slippage_pct":     slippagePct,
+			"order_id":         fallbackOrderID,
+		})
+	}
+	return fallbackOrderID, fallbackOrderLinkID, fallbackErr
+}
+
 func (t *Trader) placeTakeProfitOrderWithLifecycle(side string, qty, price float64, lifecycleID string) error {
 	if t.Config != nil && t.Config.EnableLifecycleID && lifecycleID != "" {
 		orderLinkID := lifecycleOrderLinkID(lifecycleID, "tp")
@@ -1184,6 +1661,7 @@ func (t *Trader) openPosition(newSide string, price float64, tradeID string) err
 		t.Logger.Error("Insufficient balance: %.2f USDT", bal)
 		return fmt.Errorf("insufficient balance")
 	}
+	t.logEntryEdgeGuardMetrics(newSide, qty)
 
 	// Place market order
 	orderSide := "Buy"
@@ -1201,7 +1679,7 @@ func (t *Trader) openPosition(newSide string, price float64, tradeID string) err
 		BreakevenProgress: t.Config.BreakevenProgress,
 	})
 	t.Logger.Info("Placing market order: %s %.4f", orderSide, qty)
-	orderID, orderLinkID, err := t.placeMarketOrderWithLifecycle(orderSide, qty, false, tradeID, "entry")
+	orderID, orderLinkID, err := t.placeOrderWithExecutionPolicy(orderSide, qty, false, tradeID, "entry")
 	if err != nil {
 		t.Logger.Error("Error opening position %s: %v", newSide, err)
 		return err
@@ -1221,8 +1699,8 @@ func (t *Trader) openPosition(newSide string, price float64, tradeID string) err
 	t.State.LastEntryDir = t.PositionManager.NormalizeSide(newSide)
 	t.State.Unlock()
 
-	// Calculate TP/SL with 2:1 ratio based on 15-minute projection
-	tp, sl := t.calculateInitialTPSL(entry, newSide)
+	// Calculate TP/SL with active policy (half_last_win when reference exists).
+	tp, sl, calcDetails := t.calculateInitialTPSLWithDetails(entry, newSide)
 	feeBuf := t.feeBuffer(entry)
 	tpDist := math.Abs(tp - entry)
 	slDist := math.Abs(entry - sl)
@@ -1239,6 +1717,14 @@ func (t *Trader) openPosition(newSide string, price float64, tradeID string) err
 		FeeCloseEst:       feeBuf / 2,
 		FundingEst:        0,
 		BreakevenMove:     feeBuf,
+		RRAfterFee:        t.rrAfterFeeFromLevels(entry, tp, sl),
+		SLPolicy:          calcDetails.slPolicy,
+		LastWinMovePct:    calcDetails.lastWinMovePct,
+		DesiredSLPct:      calcDetails.desiredSLPct,
+		SLPctFinal:        calcDetails.slPctFinal,
+		SLPriceFinal:      calcDetails.slPriceFinal,
+		MinSLPct:          calcDetails.minSLPct,
+		MaxSLPct:          calcDetails.maxSLPct,
 		ReduceOnlyTP:      false,
 		ReduceOnlySL:      false,
 		TrailActivation:   t.Config.TrailActivation,
@@ -1252,20 +1738,32 @@ func (t *Trader) openPosition(newSide string, price float64, tradeID string) err
 		newSide, qty, entry, tp, sl, delay.String(), minPocket)
 
 	t.enqueueDelayedStopIntent(models.StopIntent{
-		TradeID: tradeID,
-		Side:    newSide,
-		Entry:   entry,
-		TP:      tp,
-		SL:      sl,
-		Reason:  "entry_initial",
+		TradeID:        tradeID,
+		Side:           newSide,
+		Entry:          entry,
+		TP:             tp,
+		SL:             sl,
+		Reason:         "entry_initial",
+		SLPolicy:       calcDetails.slPolicy,
+		LastWinMovePct: calcDetails.lastWinMovePct,
+		DesiredSLPct:   calcDetails.desiredSLPct,
+		SLPctFinal:     calcDetails.slPctFinal,
+		SLPriceFinal:   calcDetails.slPriceFinal,
+		MinSLPct:       calcDetails.minSLPct,
+		MaxSLPct:       calcDetails.maxSLPct,
 	}, delay)
 	return nil
 }
 
 func (t *Trader) calculateInitialTPSL(entry float64, positionSide string) (float64, float64) {
+	tp, sl, _ := t.calculateInitialTPSLWithDetails(entry, positionSide)
+	return tp, sl
+}
+
+func (t *Trader) calculateInitialTPSLWithDetails(entry float64, positionSide string) (float64, float64, tpslCalcDetails) {
 	details := t.calcTPSLDetails(entry, positionSide)
 	if details.side == "" {
-		return 0, 0
+		return 0, 0, details
 	}
 
 	minPocket := t.minPocketDistance(entry)
@@ -1311,8 +1809,14 @@ func (t *Trader) calculateInitialTPSL(entry float64, positionSide string) (float
 		tpDistFinal = math.Abs(tp - entry)
 	}
 
-	// 2) Set SL to a fixed 0.25% distance from entry.
-	slRaw, sl := t.fixedStopLoss(entry, details.side, tick)
+	// 2) Set SL via active policy:
+	// - half_last_win: 0.5 * last profitable move.
+	// - atr_default: fallback to legacy fixed floor when no profitable reference exists.
+	slRaw := slPriceFromPct(details.side, entry, details.slPctFinal)
+	if slRaw <= 0 {
+		slRaw, _ = t.fixedStopLoss(entry, details.side, tick)
+	}
+	sl := t.roundSL(entry, slRaw, tick, details.side)
 
 	roundingApplied := tp != tpPreRound || sl != slRaw
 	roundingMode := "long_tp_floor_sl_floor"
@@ -1327,9 +1831,13 @@ func (t *Trader) calculateInitialTPSL(entry float64, positionSide string) (float
 	if slDistFinal > 0 {
 		actualRR = tpDistFinal / slDistFinal
 	}
+	rrAfterFee := calcRRAfterFee(tpDistFinal, slDistFinal, feeBuf)
+	netTPAfterFee := tpDistFinal - feeBuf
+	netSLAfterFee := slDistFinal + feeBuf
+	details.slPriceFinal = sl
 
 	t.Logger.Debug(
-		"TP/SL calc entry %.2f side %s tick %.4f atr %.4f atrPerc %.4f%% k %.2f volF %.2f regime %s regF %.2f tpPerc raw %.4f%% clamp %.4f%% [%.4f..%.4f] tpDistBase %.4f required %.4f rr %.2f pocket %.4f tp %.2f sl %.2f tpTicks %.1f slTicks %.1f flags ratioAdj=%t rounding=%t mode=%s invariant=%t",
+		"TP/SL calc entry %.2f side %s tick %.4f atr %.4f atrPerc %.4f%% k %.2f volF %.2f regime %s regF %.2f tpPerc raw %.4f%% clamp %.4f%% [%.4f..%.4f] tpDistBase %.4f required %.4f rr %.2f rr_after_fee %.2f net_tp_after_fee %.4f net_sl_after_fee %.4f pocket %.4f tp %.2f sl %.2f tpTicks %.1f slTicks %.1f sl_policy %s sl_policy_reason %s last_win_move_pct %.6f desired_sl_pct %.6f sl_pct_final %.6f sl_bounds=[%.6f..%.6f] flags ratioAdj=%t rounding=%t mode=%s invariant=%t",
 		entry,
 		details.side,
 		tick,
@@ -1346,18 +1854,28 @@ func (t *Trader) calculateInitialTPSL(entry float64, positionSide string) (float
 		details.tpDistBase,
 		requiredTPDist,
 		actualRR,
+		rrAfterFee,
+		netTPAfterFee,
+		netSLAfterFee,
 		minPocket,
 		tp,
 		sl,
 		tpTicks,
 		slTicks,
+		details.slPolicy,
+		details.slPolicyReason,
+		details.lastWinMovePct,
+		details.desiredSLPct,
+		details.slPctFinal,
+		details.minSLPct,
+		details.maxSLPct,
 		ratioAdjusted,
 		roundingApplied,
 		roundingMode,
 		false,
 	)
 
-	return tp, sl
+	return tp, sl, details
 }
 
 func (t *Trader) calculateTPSLLegacy(entryPrice float64, positionSide string) (float64, float64) {
@@ -1436,6 +1954,97 @@ func (t *Trader) minPocketDistance(entry float64) float64 {
 		feeFloor = feeBuf * t.Config.PocketFeeMult
 	}
 	return math.Max(pocketFloor, feeFloor)
+}
+
+// calcWinMovePct returns signed-direction move for a completed winning trade as fraction of entry.
+// It is used as a stable anchor for SL sizing after a profitable close.
+func calcWinMovePct(positionSide string, entry, exit float64) (float64, bool) {
+	if entry <= 0 || exit <= 0 || math.IsNaN(entry) || math.IsNaN(exit) {
+		return 0, false
+	}
+	switch strings.ToUpper(strings.TrimSpace(positionSide)) {
+	case "LONG":
+		move := (exit - entry) / entry
+		if move <= 0 {
+			return 0, false
+		}
+		return move, true
+	case "SHORT":
+		move := (entry - exit) / entry
+		if move <= 0 {
+			return 0, false
+		}
+		return move, true
+	default:
+		return 0, false
+	}
+}
+
+func clampSLPct(value, minPct, maxPct float64) float64 {
+	if minPct < 0 {
+		minPct = 0
+	}
+	if maxPct <= 0 || maxPct < minPct {
+		maxPct = minPct
+	}
+	if value < minPct {
+		return minPct
+	}
+	if value > maxPct {
+		return maxPct
+	}
+	return value
+}
+
+func slPriceFromPct(positionSide string, entry, slPct float64) float64 {
+	if entry <= 0 || slPct < 0 {
+		return 0
+	}
+	switch strings.ToUpper(strings.TrimSpace(positionSide)) {
+	case "SHORT":
+		return entry * (1 + slPct)
+	case "LONG":
+		return entry * (1 - slPct)
+	default:
+		return 0
+	}
+}
+
+func resolveHalfLastWinSL(lastWinMovePct, minPct, maxPct, multiplier float64) (desiredPct, finalPct float64, reason string, applied bool) {
+	if lastWinMovePct <= 0 {
+		return minPct, minPct, "no_last_win", false
+	}
+	if multiplier <= 0 {
+		multiplier = 0.5
+	}
+	desiredPct = lastWinMovePct * multiplier
+	if lastWinMovePct <= minPct {
+		return desiredPct, minPct, "small_last_win", false
+	}
+	finalPct = clampSLPct(desiredPct, minPct, maxPct)
+	if finalPct >= lastWinMovePct {
+		return desiredPct, finalPct, "clamp_violation", false
+	}
+	return desiredPct, finalPct, "", true
+}
+
+func (t *Trader) slPctFromLastWin(positionSide string) (lastWinMovePct, desiredPct, minPct, maxPct, finalPct float64, policy, reason string, applied bool) {
+	minPct = fixedStopLossFraction
+	maxPct = maxStopLossFraction
+	if maxPct < minPct {
+		maxPct = minPct
+	}
+	if t != nil && t.State != nil {
+		lastWinMovePct = t.State.LastWinMovePctForSide(positionSide)
+	}
+	desiredPct, finalPct, reason, applied = resolveHalfLastWinSL(lastWinMovePct, minPct, maxPct, 0.5)
+	if !applied {
+		if reason == "no_last_win" {
+			return 0, desiredPct, minPct, maxPct, finalPct, "atr_default", reason, false
+		}
+		return lastWinMovePct, desiredPct, minPct, maxPct, finalPct, "atr_default_small_win_skip", reason, false
+	}
+	return lastWinMovePct, desiredPct, minPct, maxPct, finalPct, "half_last_win", "", true
 }
 
 func calcSLToBE(side string, entry, pocket float64) float64 {
@@ -1601,6 +2210,24 @@ func (t *Trader) calcTPSLDetails(entryPrice float64, positionSide string) tpslCa
 	if entryPrice > 0 {
 		tpDist = entryPrice * dyn.ClampedPercent / 100
 	}
+	lastWinMovePct, desiredSLPct, minSLPct, maxSLPct, slPctFinal, slPolicy, slPolicyReason, slPolicyApplied := t.slPctFromLastWin(side)
+	if t != nil && t.State != nil {
+		t.State.RecordSLPolicyDecision(slPolicy, slPolicyReason)
+	}
+	if !slPolicyApplied && (slPolicyReason == "small_last_win" || slPolicyReason == "clamp_violation") {
+		t.logTradeEvent("sl_policy_invariant_violation", tradeEventLog{
+			TradeID:        t.activeTradeID(),
+			Side:           side,
+			Entry:          entryPrice,
+			Reason:         slPolicyReason,
+			SLPolicy:       slPolicy,
+			LastWinMovePct: lastWinMovePct,
+			DesiredSLPct:   desiredSLPct,
+			SLPctFinal:     slPctFinal,
+			MinSLPct:       minSLPct,
+			MaxSLPct:       maxSLPct,
+		})
+	}
 
 	return tpslCalcDetails{
 		entry:            entryPrice,
@@ -1617,6 +2244,13 @@ func (t *Trader) calcTPSLDetails(entryPrice float64, positionSide string) tpslCa
 		regimeFactor:     dyn.RegimeFactor,
 		tpDistBase:       tpDist,
 		tpDist:           tpDist,
+		slPolicy:         slPolicy,
+		slPolicyReason:   slPolicyReason,
+		lastWinMovePct:   lastWinMovePct,
+		desiredSLPct:     desiredSLPct,
+		slPctFinal:       slPctFinal,
+		minSLPct:         minSLPct,
+		maxSLPct:         maxSLPct,
 	}
 }
 
@@ -1739,18 +2373,25 @@ func (t *Trader) adjustTPSL(closePrice float64) {
 		return
 	}
 
-	newTP, newSL := t.calculateTPSLWithRatio(entry, "LONG")
+	newTP, newSL, calcDetails := t.calculateInitialTPSLWithDetails(entry, "LONG")
 	if math.Abs(newTP-curTP) < t.State.Instr.TickSize && newSL == 0 {
 		return
 	}
 
 	t.enqueueStopIntent(models.StopIntent{
-		TradeID: t.activeTradeID(),
-		Side:    "LONG",
-		Entry:   entry,
-		TP:      newTP,
-		SL:      newSL,
-		Reason:  "adjust_long_signal",
+		TradeID:        t.activeTradeID(),
+		Side:           "LONG",
+		Entry:          entry,
+		TP:             newTP,
+		SL:             newSL,
+		Reason:         "adjust_long_signal",
+		SLPolicy:       calcDetails.slPolicy,
+		LastWinMovePct: calcDetails.lastWinMovePct,
+		DesiredSLPct:   calcDetails.desiredSLPct,
+		SLPctFinal:     calcDetails.slPctFinal,
+		SLPriceFinal:   newSL,
+		MinSLPct:       calcDetails.minSLPct,
+		MaxSLPct:       calcDetails.maxSLPct,
 	})
 }
 
@@ -1769,18 +2410,25 @@ func (t *Trader) adjustTPSLForShort(closePrice float64) {
 		return
 	}
 
-	newTP, newSL := t.calculateTPSLWithRatio(entry, "SHORT")
+	newTP, newSL, calcDetails := t.calculateInitialTPSLWithDetails(entry, "SHORT")
 	if math.Abs(newTP-curTP) < t.State.Instr.TickSize && newSL == 0 {
 		return
 	}
 
 	t.enqueueStopIntent(models.StopIntent{
-		TradeID: t.activeTradeID(),
-		Side:    "SHORT",
-		Entry:   entry,
-		TP:      newTP,
-		SL:      newSL,
-		Reason:  "adjust_short_signal",
+		TradeID:        t.activeTradeID(),
+		Side:           "SHORT",
+		Entry:          entry,
+		TP:             newTP,
+		SL:             newSL,
+		Reason:         "adjust_short_signal",
+		SLPolicy:       calcDetails.slPolicy,
+		LastWinMovePct: calcDetails.lastWinMovePct,
+		DesiredSLPct:   calcDetails.desiredSLPct,
+		SLPctFinal:     calcDetails.slPctFinal,
+		SLPriceFinal:   newSL,
+		MinSLPct:       calcDetails.minSLPct,
+		MaxSLPct:       calcDetails.maxSLPct,
 	})
 }
 
@@ -2018,7 +2666,7 @@ func (t *Trader) closeCurrentPosition(posSide string, qty float64, tradeID, reas
 	if posSide == "SHORT" {
 		reduceSide = "Buy"
 	}
-	orderID, orderLinkID, err := t.placeMarketOrderWithLifecycle(reduceSide, qty, true, tradeID, "clos")
+	orderID, orderLinkID, err := t.placeOrderWithExecutionPolicy(reduceSide, qty, true, tradeID, "clos")
 	if err != nil {
 		t.Logger.Error("Error closing position %s: %v", posSide, err)
 		if t.currentFSMState() == models.PositionStateClosing {
@@ -2028,10 +2676,13 @@ func (t *Trader) closeCurrentPosition(posSide string, qty float64, tradeID, reas
 	}
 	t.bindOrderLifecycle(orderID, orderLinkID, tradeID)
 	t.logTradeEvent("close_order", tradeEventLog{
-		TradeID: tradeID,
-		Side:    posSide,
-		Qty:     qty,
-		Entry:   t.PositionManager.GetLastEntryPrice(),
+		TradeID:     tradeID,
+		LifecycleID: t.summaryLifecycleID(models.ExecutionEvent{TradeID: tradeID}),
+		OrderID:     orderID,
+		OrderLinkID: orderLinkID,
+		Side:        posSide,
+		Qty:         qty,
+		Entry:       t.PositionManager.GetLastEntryPrice(),
 	})
 	t.Logger.Info("Close order placed: trade_id=%s reason=%s side=%s qty=%.4f orderId=%s", tradeID, reason, posSide, qty, orderID)
 }
@@ -2065,6 +2716,8 @@ func (t *Trader) HandleExecutionFill(evt models.ExecutionEvent) {
 	if tradeID == "" {
 		tradeID = t.ResolveExecutionTradeID(evt.OrderID, evt.ExecID)
 	}
+	evt.TradeID = tradeID
+	t.recordTradeSummaryFill(evt)
 
 	fsm := t.currentFSMState()
 	if fsm == models.PositionStateOpening && evt.ReduceOnly {
@@ -2093,7 +2746,11 @@ func (t *Trader) HandleExecutionFill(evt models.ExecutionEvent) {
 		if t.currentFSMState() == models.PositionStateClosing {
 			t.forceFSM(models.PositionStateFlat, "execution_confirmed_flat", tradeID)
 		}
+		t.emitTradeCloseSummaryIfClosed(evt, false)
 		return
+	}
+	if evt.ReduceOnly && evt.PositionSizeAfter <= 0 {
+		t.emitTradeCloseSummaryIfClosed(evt, false)
 	}
 
 	entry := t.PositionManager.GetLastEntryPrice()
@@ -2120,26 +2777,36 @@ func (t *Trader) HandleExecutionFill(evt models.ExecutionEvent) {
 		}
 		tpCurrent := curTP
 		if tpCurrent <= 0 {
-			tpCurrent, _ = t.calculateInitialTPSL(entry, posSide)
+			tpCurrent, _, _ = t.calculateInitialTPSLWithDetails(entry, posSide)
 		}
 		if tpCurrent > 0 {
 			now := time.Now().UTC()
+			desiredPct := 0.0
+			if entry > 0 {
+				desiredPct = math.Abs(targetSL-entry) / math.Abs(entry)
+			}
 			t.State.Lock()
 			t.State.PartialTPDone = true
 			t.State.Unlock()
 			t.enqueueStopIntent(models.StopIntent{
-				Kind:        "MoveSLToBE",
-				TradeID:     tradeID,
-				LifecycleID: tradeID,
-				Side:        posSide,
-				Entry:       entry,
-				QtyLeft:     posQty,
-				FeeEstimate: pocket,
-				TP:          tpCurrent,
-				SL:          targetSL,
-				Breakeven:   true,
-				Reason:      "partial_tp",
-				TS:          now,
+				Kind:         "MoveSLToBE",
+				TradeID:      tradeID,
+				LifecycleID:  tradeID,
+				Side:         posSide,
+				Entry:        entry,
+				QtyLeft:      posQty,
+				FeeEstimate:  pocket,
+				TP:           tpCurrent,
+				SL:           targetSL,
+				SLPolicy:     "move_sl_to_be",
+				DesiredSLPct: desiredPct,
+				SLPctFinal:   desiredPct,
+				SLPriceFinal: targetSL,
+				MinSLPct:     fixedStopLossFraction,
+				MaxSLPct:     maxStopLossFraction,
+				Breakeven:    true,
+				Reason:       "partial_tp",
+				TS:           now,
 			})
 			t.State.RecordBEIntentSent(tradeID, targetSL, now)
 			return
@@ -2147,13 +2814,17 @@ func (t *Trader) HandleExecutionFill(evt models.ExecutionEvent) {
 		t.Logger.Warning("Partial BE intent skipped: missing TP snapshot trade_id=%s side=%s entry=%.2f", tradeID, posSide, entry)
 	}
 
-	tpNew, slNew := t.calculateInitialTPSL(entry, posSide)
+	tpNew, slNew, calcDetails := t.calculateInitialTPSLWithDetails(entry, posSide)
 	tpNew = t.roundTP(entry, tpNew, tick, posSide)
 	slNew = t.roundSL(entry, slNew, tick, posSide)
 
 	feeBuf := t.feeBuffer(entry)
 	t.logTradeEvent("fill_sync", tradeEventLog{
 		TradeID:           tradeID,
+		LifecycleID:       t.summaryLifecycleID(evt),
+		OrderID:           evt.OrderID,
+		OrderLinkID:       evt.OrderLinkID,
+		ExecID:            evt.ExecID,
 		Side:              posSide,
 		Qty:               posQty,
 		Entry:             entry,
@@ -2164,6 +2835,14 @@ func (t *Trader) HandleExecutionFill(evt models.ExecutionEvent) {
 		FeeOpenEst:        feeBuf / 2,
 		FeeCloseEst:       feeBuf / 2,
 		BreakevenMove:     feeBuf,
+		RRAfterFee:        t.rrAfterFeeFromLevels(entry, tpNew, slNew),
+		SLPolicy:          calcDetails.slPolicy,
+		LastWinMovePct:    calcDetails.lastWinMovePct,
+		DesiredSLPct:      calcDetails.desiredSLPct,
+		SLPctFinal:        calcDetails.slPctFinal,
+		SLPriceFinal:      slNew,
+		MinSLPct:          calcDetails.minSLPct,
+		MaxSLPct:          calcDetails.maxSLPct,
 		ReduceOnlyTP:      false,
 		ReduceOnlySL:      false,
 		TrailActivation:   t.Config.TrailActivation,
@@ -2174,12 +2853,19 @@ func (t *Trader) HandleExecutionFill(evt models.ExecutionEvent) {
 		return
 	}
 	t.enqueueStopIntent(models.StopIntent{
-		TradeID: tradeID,
-		Side:    posSide,
-		Entry:   entry,
-		TP:      tpNew,
-		SL:      slNew,
-		Reason:  "execution_fill_sync",
+		TradeID:        tradeID,
+		Side:           posSide,
+		Entry:          entry,
+		TP:             tpNew,
+		SL:             slNew,
+		Reason:         "execution_fill_sync",
+		SLPolicy:       calcDetails.slPolicy,
+		LastWinMovePct: calcDetails.lastWinMovePct,
+		DesiredSLPct:   calcDetails.desiredSLPct,
+		SLPctFinal:     calcDetails.slPctFinal,
+		SLPriceFinal:   slNew,
+		MinSLPct:       calcDetails.minSLPct,
+		MaxSLPct:       calcDetails.maxSLPct,
 	})
 }
 
@@ -2363,7 +3049,7 @@ func (t *Trader) resetSignalStrength(m *map[string]int) {
 }
 
 // SyncPositionRealTime keeps TP/SL in sync for open positions.
-// SL is always fixed at 0.25% from entry; TP remains dynamic.
+// SL follows active SL policy and is repaired through StopIntent/StopController only.
 func (t *Trader) SyncPositionRealTime() {
 	t.Logger.Info("Starting position sync logic...")
 	ticker := time.NewTicker(1 * time.Second)
@@ -2408,7 +3094,7 @@ func (t *Trader) SyncPositionRealTime() {
 				continue
 			}
 			lastTPSLAttempt = time.Now()
-			tpNew, slNew := t.calculateInitialTPSL(entry, side)
+			tpNew, slNew, calcDetails := t.calculateInitialTPSLWithDetails(entry, side)
 			t.Logger.Info("Missing TP/SL detected for %s position, setting TP %.2f SL %.2f", side, tpNew, slNew)
 			feeBuf := t.feeBuffer(entry)
 			t.logTradeEvent("missing_tpsl", tradeEventLog{
@@ -2423,18 +3109,33 @@ func (t *Trader) SyncPositionRealTime() {
 				FeeOpenEst:        feeBuf / 2,
 				FeeCloseEst:       feeBuf / 2,
 				BreakevenMove:     feeBuf,
+				RRAfterFee:        t.rrAfterFeeFromLevels(entry, tpNew, slNew),
+				SLPolicy:          calcDetails.slPolicy,
+				LastWinMovePct:    calcDetails.lastWinMovePct,
+				DesiredSLPct:      calcDetails.desiredSLPct,
+				SLPctFinal:        calcDetails.slPctFinal,
+				SLPriceFinal:      slNew,
+				MinSLPct:          calcDetails.minSLPct,
+				MaxSLPct:          calcDetails.maxSLPct,
 				ReduceOnlyTP:      false,
 				ReduceOnlySL:      false,
 				TrailActivation:   t.Config.TrailActivation,
 				BreakevenProgress: t.Config.BreakevenProgress,
 			})
 			t.enqueueStopIntent(models.StopIntent{
-				TradeID: t.activeTradeID(),
-				Side:    side,
-				Entry:   entry,
-				TP:      tpNew,
-				SL:      slNew,
-				Reason:  "missing_tpsl_repair",
+				TradeID:        t.activeTradeID(),
+				Side:           side,
+				Entry:          entry,
+				TP:             tpNew,
+				SL:             slNew,
+				Reason:         "missing_tpsl_repair",
+				SLPolicy:       calcDetails.slPolicy,
+				LastWinMovePct: calcDetails.lastWinMovePct,
+				DesiredSLPct:   calcDetails.desiredSLPct,
+				SLPctFinal:     calcDetails.slPctFinal,
+				SLPriceFinal:   slNew,
+				MinSLPct:       calcDetails.minSLPct,
+				MaxSLPct:       calcDetails.maxSLPct,
 			})
 			continue
 		}
@@ -2444,18 +3145,25 @@ func (t *Trader) SyncPositionRealTime() {
 			tick = 0.1
 		}
 
-		_, fixedSL := t.fixedStopLoss(entry, side, tick)
-		if fixedSL > 0 && math.Abs(sl-fixedSL) >= tick/2 {
-			t.Logger.Info("Fixed SL policy: resetting SL for %s from %.2f to %.2f", side, sl, fixedSL)
+		_, policySL, calcDetails := t.calculateInitialTPSLWithDetails(entry, side)
+		if policySL > 0 && math.Abs(sl-policySL) >= tick/2 {
+			t.Logger.Info("SL policy sync: resetting SL for %s from %.2f to %.2f (policy=%s)", side, sl, policySL, calcDetails.slPolicy)
 			t.enqueueStopIntent(models.StopIntent{
-				TradeID: t.activeTradeID(),
-				Side:    side,
-				Entry:   entry,
-				TP:      tp,
-				SL:      fixedSL,
-				Reason:  "fixed_sl_sync",
+				TradeID:        t.activeTradeID(),
+				Side:           side,
+				Entry:          entry,
+				TP:             tp,
+				SL:             policySL,
+				Reason:         "sl_policy_sync",
+				SLPolicy:       calcDetails.slPolicy,
+				LastWinMovePct: calcDetails.lastWinMovePct,
+				DesiredSLPct:   calcDetails.desiredSLPct,
+				SLPctFinal:     calcDetails.slPctFinal,
+				SLPriceFinal:   policySL,
+				MinSLPct:       calcDetails.minSLPct,
+				MaxSLPct:       calcDetails.maxSLPct,
 			})
-			sl = fixedSL
+			sl = policySL
 		}
 
 		var price float64
@@ -2491,7 +3199,7 @@ func (t *Trader) SyncPositionRealTime() {
 					reduceSide = "Buy"
 				}
 				tradeID := t.activeTradeID()
-				orderID, orderLinkID, err := t.placeMarketOrderWithLifecycle(reduceSide, partialQty, true, tradeID, "ptp")
+				orderID, orderLinkID, err := t.placeOrderWithExecutionPolicy(reduceSide, partialQty, true, tradeID, "ptp")
 				if err != nil {
 					t.Logger.Error("Partial TP order failed: %v", err)
 				} else {
@@ -2501,14 +3209,21 @@ func (t *Trader) SyncPositionRealTime() {
 					t.State.Unlock()
 					t.Logger.Info("Partial TP executed: %.2f (%s), progress=%.0f%%", partialQty, reduceSide, prog*100)
 					if remainingQty > 0 {
-						tpNew, slNew := t.calculateInitialTPSL(entry, side)
+						tpNew, slNew, calcDetails := t.calculateInitialTPSLWithDetails(entry, side)
 						t.enqueueStopIntent(models.StopIntent{
-							TradeID: t.activeTradeID(),
-							Side:    side,
-							Entry:   entry,
-							TP:      tpNew,
-							SL:      slNew,
-							Reason:  "partial_tp_remainder",
+							TradeID:        t.activeTradeID(),
+							Side:           side,
+							Entry:          entry,
+							TP:             tpNew,
+							SL:             slNew,
+							Reason:         "partial_tp_remainder",
+							SLPolicy:       calcDetails.slPolicy,
+							LastWinMovePct: calcDetails.lastWinMovePct,
+							DesiredSLPct:   calcDetails.desiredSLPct,
+							SLPctFinal:     calcDetails.slPctFinal,
+							SLPriceFinal:   slNew,
+							MinSLPct:       calcDetails.minSLPct,
+							MaxSLPct:       calcDetails.maxSLPct,
 						})
 					}
 				}

@@ -5,37 +5,31 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
 	"verbose-fortnight/config"
 	"verbose-fortnight/models"
+	"verbose-fortnight/status"
 )
-
-func statusServerConfigured(cfg *config.Config) bool {
-	if cfg == nil || !cfg.EnableStatusServer {
-		return false
-	}
-	addr := strings.TrimSpace(cfg.StatusAddr)
-	if addr == "" || strings.EqualFold(addr, "off") || strings.EqualFold(addr, "disabled") {
-		return false
-	}
-	return true
-}
 
 func applyRuntimeFeatures(state *models.State, cfg *config.Config) {
 	if state == nil || cfg == nil {
 		return
 	}
 	state.SetRuntimeFeatures(models.RuntimeFeatures{
-		FillJSONLog:       cfg.EnableFillJSONLog,
-		LifecycleID:       cfg.EnableLifecycleID,
-		ExecutionBackfill: cfg.EnableExecutionBackfill,
-		PartialBERule:     cfg.EnablePartialBERule,
-		EdgeFilter:        cfg.EnableEdgeFilter,
-		StatusServer:      statusServerConfigured(cfg),
-		DryRun:            cfg.EnableDryRun,
+		FillJSONLog:          cfg.EnableFillJSONLog,
+		ExecutionResponseLog: cfg.EnableExecutionResponseLog,
+		LifecycleID:          cfg.EnableLifecycleID,
+		ExecutionBackfill:    cfg.EnableExecutionBackfill,
+		PartialBERule:        cfg.EnablePartialBERule,
+		EdgeFilter:           cfg.EnableEdgeFilter,
+		MakerFirst:           cfg.EnableMakerFirst,
+		TradeSummaryLog:      cfg.EnableTradeSummaryLog,
+		KPIMonitoring:        cfg.EnableKPIMonitoring,
+		StatusServer:         status.ShouldStartServer(cfg),
+		ConfigEndpoint:       cfg.EnableConfigEndpoint,
+		DryRun:               cfg.EnableDryRun,
 	})
 }
 
@@ -45,7 +39,7 @@ func runDryRunTick(state *models.State, withBackfill bool, ts time.Time) {
 	}
 	state.RecordDryRunTick(ts)
 	if withBackfill {
-		state.RecordBackfillCycle(0, 0, 0, 0, ts)
+		state.RecordBackfillHeartbeat(ts)
 	}
 }
 
@@ -89,6 +83,13 @@ func runDryRunMode(state *models.State, statusServer *http.Server) {
 
 	runtimeCancel()
 	shutdownStatusServer(statusServer)
+	syncLoggerSafely()
+}
+
+func syncLoggerSafely() {
+	if logger == nil {
+		return
+	}
 	if err := logger.Sync(); err != nil {
 		logError("Error syncing logger: %v", err)
 	}

@@ -45,6 +45,30 @@ func Validate(cfg *Config) error {
 	if cfg.ReentryCooldownSec < 0 {
 		addErr("reentryCooldownSec must be >= 0, got %d", cfg.ReentryCooldownSec)
 	}
+	if cfg.MakerTimeoutMs < 0 {
+		addErr("makerTimeoutMs must be >= 0, got %d", cfg.MakerTimeoutMs)
+	}
+	if cfg.EdgeGuardSpreadThreshold < 0 {
+		addErr("edgeGuardSpreadThreshold must be >= 0, got %.6f", cfg.EdgeGuardSpreadThreshold)
+	}
+	if cfg.EdgeGuardImpactThreshold < 0 {
+		addErr("edgeGuardImpactThreshold must be >= 0, got %.6f", cfg.EdgeGuardImpactThreshold)
+	}
+	if cfg.MakerMaxSlippagePct < 0 {
+		addErr("makerMaxSlippagePct must be >= 0, got %.6f", cfg.MakerMaxSlippagePct)
+	}
+	if cfg.KPISummaryIntervalSec < 0 {
+		addErr("kpiSummaryIntervalSec must be >= 0, got %d", cfg.KPISummaryIntervalSec)
+	}
+	if cfg.KPIMinMakerRatio < 0 {
+		addErr("kpiMinMakerRatio must be >= 0, got %.6f", cfg.KPIMinMakerRatio)
+	}
+	if cfg.KPIMaxFeeToGross < 0 {
+		addErr("kpiMaxFeeToGross must be >= 0, got %.6f", cfg.KPIMaxFeeToGross)
+	}
+	if cfg.KPIMaxEdgeBlockRate < 0 {
+		addErr("kpiMaxEdgeBlockRate must be >= 0, got %.6f", cfg.KPIMaxEdgeBlockRate)
+	}
 
 	if cfg.EnableStatusServer {
 		addr := strings.TrimSpace(cfg.StatusAddr)

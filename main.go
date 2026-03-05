@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"os/signal"
 	"strconv"
@@ -368,6 +369,69 @@ func getFloatField(m map[string]interface{}, keys ...string) float64 {
 	return 0
 }
 
+func getOptionalFloatField(m map[string]interface{}, keys ...string) (float64, bool) {
+	for _, k := range keys {
+		if v, ok := m[k]; ok && v != nil {
+			switch val := v.(type) {
+			case float64:
+				return val, true
+			case string:
+				if strings.TrimSpace(val) == "" {
+					continue
+				}
+				f, err := strconv.ParseFloat(val, 64)
+				if err == nil {
+					return f, true
+				}
+			case json.Number:
+				f, err := val.Float64()
+				if err == nil {
+					return f, true
+				}
+			}
+		}
+	}
+	return 0, false
+}
+
+func getInt64Field(m map[string]interface{}, keys ...string) int64 {
+	for _, k := range keys {
+		if v, ok := m[k]; ok && v != nil {
+			switch val := v.(type) {
+			case int64:
+				return val
+			case int:
+				return int64(val)
+			case float64:
+				return int64(val)
+			case json.Number:
+				i, err := val.Int64()
+				if err == nil {
+					return i
+				}
+				f, ferr := val.Float64()
+				if ferr == nil {
+					return int64(f)
+				}
+			case string:
+				s := strings.TrimSpace(val)
+				if s == "" {
+					continue
+				}
+				i, err := strconv.ParseInt(s, 10, 64)
+				if err == nil {
+					return i
+				}
+				f, ferr := strconv.ParseFloat(s, 64)
+				if ferr == nil {
+					return int64(f)
+				}
+			}
+		}
+	}
+	return 0
+}
+
 func getBoolField(m map[string]interface{}, keys ...string) bool {
 	for _, k := range keys {
 		if v, ok := m[k]; ok && v != nil {
@@ -390,6 +454,50 @@ func getBoolField(m map[string]interface{}, keys ...string) bool {
 	return false
 }
 
+func getOptionalBoolField(m map[string]interface{}, keys ...string) (bool, bool) {
+	for _, k := range keys {
+		if v, ok := m[k]; ok && v != nil {
+			switch val := v.(type) {
+			case bool:
+				return val, true
+			case string:
+				switch strings.ToLower(strings.TrimSpace(val)) {
+				case "1", "true", "yes":
+					return true, true
+				case "0", "false", "no":
+					return false, true
+				}
+			case float64:
+				return val != 0, true
+			case json.Number:
+				i, _ := val.Int64()
+				return i != 0, true
+			}
+		}
+	}
+	return false, false
+}
+
+func resolveTraceKey(lifecycleID, tradeID, orderID, orderLinkID, execID string) string {
+	lifecycleID = strings.TrimSpace(lifecycleID)
+	if lifecycleID != "" {
+		return lifecycleID
+	}
+	tradeID = strings.TrimSpace(tradeID)
+	if tradeID != "" {
+		return tradeID
+	}
+	orderID = strings.TrimSpace(orderID)
+	if orderID != "" {
+		return orderID
+	}
+	orderLinkID = strings.TrimSpace(orderLinkID)
+	if orderLinkID != "" {
+		return orderLinkID
+	}
+	return strings.TrimSpace(execID)
+}
+
 func buildExecutionFillLogPayload(item map[string]interface{}, symbol, source, lifecycleID string, lifecycleInferred bool) map[string]interface{} {
 	fillSymbol := getStringField(item, "symbol")
 	if fillSymbol == "" {
@@ -400,24 +508,50 @@ func buildExecutionFillLogPayload(item map[string]interface{}, symbol, source, l
 	if positionSide == "" {
 		positionSide = execSide
 	}
+	orderID := getStringField(item, "orderId", "orderID")
+	orderLinkID := getStringField(item, "orderLinkId", "orderLinkID")
+	execID := getStringField(item, "execId", "execID")
+	rawTradeID := getStringField(item, "tradeId", "tradeID")
+	lastLiquidityInd := getStringField(item, "lastLiquidityInd")
+	isMaker, hasIsMaker := getOptionalBoolField(item, "isMaker")
+	if !hasIsMaker {
+		lq := strings.ToLower(strings.TrimSpace(lastLiquidityInd))
+		switch {
+		case strings.Contains(lq, "maker"), strings.Contains(lq, "add"):
+			isMaker = true
+			hasIsMaker = true
+		case strings.Contains(lq, "taker"), strings.Contains(lq, "remove"):
+			isMaker = false
+			hasIsMaker = true
+		}
+	}
+	traceKey := resolveTraceKey(lifecycleID, rawTradeID, orderID, orderLinkID, execID)
+	var isMakerValue interface{}
+	if hasIsMaker {
+		isMakerValue = isMaker
+	}
 	return map[string]interface{}{
 		"ts":                time.Now().UTC().Format(time.RFC3339Nano),
+		"ts_epoch_ms":       time.Now().UTC().UnixMilli(),
 		"symbol":            fillSymbol,
 		"source":            source,
+		"traceKey":          traceKey,
 		"lifecycleId":       lifecycleID,
 		"lifecycleInferred": lifecycleInferred,
-		"orderId":           getStringField(item, "orderId", "orderID"),
-		"orderLinkId":       getStringField(item, "orderLinkId", "orderLinkID"),
-		"execId":            getStringField(item, "execId", "execID"),
-		"tradeId":           getStringField(item, "tradeId", "tradeID"),
+		"orderId":           orderID,
+		"orderLinkId":       orderLinkID,
+		"execId":            execID,
+		"tradeId":           rawTradeID,
 		"side":              execSide,
 		"positionSide":      positionSide,
 		"execQty":           getFloatField(item, "execQty", "qty"),
 		"execPrice":         getFloatField(item, "execPrice", "price"),
 		"execFee":           getFloatField(item, "execFee"),
 		"feeRate":           getFloatField(item, "feeRate"),
-		"isMaker":           getBoolField(item, "isMaker"),
+		"isMaker":           isMakerValue,
+		"isMakerKnown":      hasIsMaker,
 		"execPnl":           getFloatField(item, "execPnl", "closedPnl"),
+		"execTime":          getInt64Field(item, "execTime", "execTimestamp", "createdTime"),
 		"createType":        getStringField(item, "createType"),
 		"stopOrderType":     getStringField(item, "stopOrderType"),
 		"reduceOnly":        getBoolField(item, "reduceOnly"),
@@ -427,12 +561,43 @@ func buildExecutionFillLogPayload(item map[string]interface{}, symbol, source, l
 		"indexPrice":        getFloatField(item, "indexPrice"),
 		"orderType":         getStringField(item, "orderType"),
 		"timeInForce":       getStringField(item, "timeInForce"),
-		"lastLiquidityInd":  getStringField(item, "lastLiquidityInd"),
+		"lastLiquidityInd":  lastLiquidityInd,
 	}
+}
+
+func requiredExecutionFillFields(payload map[string]interface{}) []string {
+	missing := make([]string, 0, 8)
+	requiredString := []string{"execId", "orderId", "lifecycleId", "tradeId"}
+	for _, key := range requiredString {
+		if strings.TrimSpace(fmt.Sprint(payload[key])) == "" {
+			missing = append(missing, key)
+		}
+	}
+	requiredFloat := []string{"execQty", "execPrice"}
+	for _, key := range requiredFloat {
+		if math.Abs(getFloatField(payload, key)) <= 0 {
+			missing = append(missing, key)
+		}
+	}
+	if getInt64Field(payload, "execTime") <= 0 {
+		missing = append(missing, "execTime")
+	}
+	if !getBoolField(payload, "isMakerKnown") {
+		missing = append(missing, "isMaker")
+	}
+	return missing
 }
 
 func logExecutionFillJSON(item map[string]interface{}, symbol, source, lifecycleID string, lifecycleInferred bool) {
 	payload := buildExecutionFillLogPayload(item, symbol, source, lifecycleID, lifecycleInferred)
+	if strings.TrimSpace(fmt.Sprint(payload["traceKey"])) == "" {
+		logWarning("trace_key_missing source=%s lifecycleId=%v tradeId=%v orderId=%v orderLinkId=%v execId=%v",
+			source, payload["lifecycleId"], payload["tradeId"], payload["orderId"], payload["orderLinkId"], payload["execId"])
+	}
+	if missing := requiredExecutionFillFields(payload); len(missing) > 0 {
+		logWarning("execution_fill_anomaly type=missing_required_fields missing=%s traceKey=%v lifecycleId=%v orderId=%v execId=%v",
+			strings.Join(missing, ","), payload["traceKey"], payload["lifecycleId"], payload["orderId"], payload["execId"])
+	}
 	b, err := json.Marshal(payload)
 	if err != nil {
 		logError("failed to marshal execution fill JSON log: %v", err)
@@ -460,9 +625,27 @@ func handleExecutionMessage(raw []byte, trader *strategy.Trader, symbol, source 
 		}
 		execQty := getFloatField(item, "execQty", "qty")
 		execPrice := getFloatField(item, "execPrice", "price")
+		execFee := getFloatField(item, "execFee")
+		execPnl := getFloatField(item, "execPnl")
+		exchangeNet, hasExchangeNet := getOptionalFloatField(item, "closedPnl")
+		createType := getStringField(item, "createType")
+		stopOrderType := getStringField(item, "stopOrderType")
 		execID := getStringField(item, "execId", "execID")
 		orderID := getStringField(item, "orderId", "orderID")
 		orderLinkID := getStringField(item, "orderLinkId", "orderLinkID")
+		lastLiquidityInd := getStringField(item, "lastLiquidityInd")
+		isMaker, hasIsMaker := getOptionalBoolField(item, "isMaker")
+		if !hasIsMaker {
+			lq := strings.ToLower(strings.TrimSpace(lastLiquidityInd))
+			switch {
+			case strings.Contains(lq, "maker"), strings.Contains(lq, "add"):
+				isMaker = true
+				hasIsMaker = true
+			case strings.Contains(lq, "taker"), strings.Contains(lq, "remove"):
+				isMaker = false
+				hasIsMaker = true
+			}
+		}
 		if source == "ws" {
 			markExecutionSeenFromWS(execID)
 			if trader != nil && trader.State != nil {
@@ -487,8 +670,9 @@ func handleExecutionMessage(raw []byte, trader *strategy.Trader, symbol, source 
 		if cfg != nil && cfg.EnableFillJSONLog {
 			logExecutionFillJSON(item, symbol, source, tradeID, lifecycleInferred)
 		} else {
-			logInfo("Execution fill: tradeID=%s execSide=%s positionSide=%s reduceOnly=%t closedSize=%.4f leavesQty=%.4f positionSizeAfter=%.4f execQty=%.4f execPrice=%.2f execId=%s orderId=%s",
-				tradeID, execSide, positionSide, reduceOnly, closedSize, leavesQty, positionSizeAfter, execQty, execPrice, execID, orderID)
+			traceKey := resolveTraceKey(tradeID, "", orderID, orderLinkID, execID)
+			logInfo("Execution fill: traceKey=%s tradeID=%s execSide=%s positionSide=%s reduceOnly=%t closedSize=%.4f leavesQty=%.4f positionSizeAfter=%.4f execQty=%.4f execPrice=%.2f execFee=%.6f execPnl=%.6f createType=%s stopOrderType=%s execId=%s orderId=%s orderLinkId=%s",
+				traceKey, tradeID, execSide, positionSide, reduceOnly, closedSize, leavesQty, positionSizeAfter, execQty, execPrice, execFee, execPnl, createType, stopOrderType, execID, orderID, orderLinkID)
 		}
 		trader.ProcessExecutionEvent(models.ExecutionEvent{
 			TradeID:           tradeID,
@@ -497,9 +681,18 @@ func handleExecutionMessage(raw []byte, trader *strategy.Trader, symbol, source 
 			OrderLinkID:       orderLinkID,
 			ExecSide:          execSide,
 			PositionSide:      positionSide,
+			HasIsMaker:        hasIsMaker,
+			IsMaker:           isMaker,
+			LastLiquidityInd:  lastLiquidityInd,
 			ReduceOnly:        reduceOnly,
 			Qty:               execQty,
 			Price:             execPrice,
+			ExecFee:           execFee,
+			ExecPnl:           execPnl,
+			HasExchangeNet:    hasExchangeNet,
+			ExchangeNet:       exchangeNet,
+			CreateType:        createType,
+			StopOrderType:     stopOrderType,
 			ClosedSize:        closedSize,
 			LeavesQty:         leavesQty,
 			PositionSizeAfter: positionSizeAfter,
@@ -718,6 +911,7 @@ func main() {
 	daemonStart := flag.Bool("start-daemon", false, "Start the application as a daemon")
 	daemonStop := flag.Bool("stop-daemon", false, "Stop the daemon process")
 	daemonRestart := flag.Bool("restart-daemon", false, "Restart the daemon process")
+	versionFlag := flag.Bool("version", false, "Print build/version info and exit")
 
 	debugLevel := flag.Int("debug", cfg.LogLevel, "set log level (0=DEBUG, 1=INFO, 2=WARNING, 3=ERROR)")
 	flag.Parse()
@@ -725,6 +919,11 @@ func main() {
 	// Update logging settings based on flag
 	cfg.LogLevel = *debugLevel
 	cfg.Debug = cfg.LogLevel == 0
+
+	if *versionFlag {
+		printVersion(os.Stdout)
+		return
+	}
 
 	// Handle daemon commands
 	if *daemonStart || *daemonStop || *daemonRestart {
@@ -768,6 +967,9 @@ func main() {
 	}
 
 	logInfo("Application starting...")
+	version := currentVersionInfo()
+	status.SetBuildInfo(status.BuildInfo{Commit: version.GitCommit, BuildTime: version.BuildTime})
+	logInfo("%s", formatVersionInfo(version))
 	logInfo("Daemon mode: %t", cfg.DaemonMode)
 
 	// Initialize state early so status endpoint is available even when startup network checks fail.
@@ -910,6 +1112,7 @@ func main() {
 	go walletListener(privConn, walletChan, walletDone, state, cfg.Symbol)
 	runtimeCtx, runtimeCancel := context.WithCancel(context.Background())
 	defer runtimeCancel()
+	startKPIMonitorWorker(runtimeCtx, state, cfg)
 
 	// Start indicator and trading goroutines
 	go trader.StartStopController()

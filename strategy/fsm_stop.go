@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"verbose-fortnight/models"
+	"verbose-fortnight/pnl"
 )
 
 func newTradeID() string {
@@ -398,6 +399,9 @@ func (t *Trader) enqueueStopIntent(intent models.StopIntent) {
 	if intent.TradeID == "" {
 		intent.TradeID = newTradeID()
 	}
+	if intent.LifecycleID == "" && t.Config != nil && t.Config.EnableLifecycleID {
+		intent.LifecycleID = intent.TradeID
+	}
 	select {
 	case t.State.StopIntentChan <- intent:
 	default:
@@ -464,11 +468,19 @@ func (t *Trader) StartStopController() {
 		t.State.Unlock()
 
 		t.logTradeEvent("tpsl_intent", tradeEventLog{
-			TradeID: intent.TradeID,
-			Side:    side,
-			Entry:   entry,
-			TP:      intent.TP,
-			SL:      intent.SL,
+			TradeID:        intent.TradeID,
+			LifecycleID:    intent.LifecycleID,
+			Side:           side,
+			Entry:          entry,
+			TP:             intent.TP,
+			SL:             intent.SL,
+			SLPolicy:       intent.SLPolicy,
+			LastWinMovePct: intent.LastWinMovePct,
+			DesiredSLPct:   intent.DesiredSLPct,
+			SLPctFinal:     intent.SLPctFinal,
+			SLPriceFinal:   intent.SLPriceFinal,
+			MinSLPct:       intent.MinSLPct,
+			MaxSLPct:       intent.MaxSLPct,
 		})
 
 		t.State.RLock()
@@ -505,11 +517,19 @@ func (t *Trader) StartStopController() {
 		t.State.Unlock()
 
 		t.logTradeEvent("tpsl_applied", tradeEventLog{
-			TradeID: intent.TradeID,
-			Side:    side,
-			Entry:   entry,
-			TP:      intent.TP,
-			SL:      intent.SL,
+			TradeID:        intent.TradeID,
+			LifecycleID:    intent.LifecycleID,
+			Side:           side,
+			Entry:          entry,
+			TP:             intent.TP,
+			SL:             intent.SL,
+			SLPolicy:       intent.SLPolicy,
+			LastWinMovePct: intent.LastWinMovePct,
+			DesiredSLPct:   intent.DesiredSLPct,
+			SLPctFinal:     intent.SLPctFinal,
+			SLPriceFinal:   intent.SLPriceFinal,
+			MinSLPct:       intent.MinSLPct,
+			MaxSLPct:       intent.MaxSLPct,
 		})
 	}
 }
@@ -585,6 +605,19 @@ func (t *Trader) ProcessExecutionEvent(evt models.ExecutionEvent, source string)
 		}
 		t.State.Unlock()
 	}
+	grossRealisedDelta := 0.0
+	if evt.ReduceOnly || evt.ClosedSize > 0 {
+		grossRealisedDelta = evt.ExecPnl
+	}
+	breakdown := pnl.BuildNetBreakdown(
+		grossRealisedDelta,
+		0,
+		math.Abs(evt.ExecFee),
+		0,
+		0,
+		nil,
+	)
+	t.State.RecordExecutionQuality(evt.HasIsMaker, evt.IsMaker, math.Abs(evt.ExecFee), grossRealisedDelta, breakdown.NetCalculated)
 	t.HandleExecutionFill(evt)
 	return true
 }

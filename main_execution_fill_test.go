@@ -17,6 +17,7 @@ func TestBuildExecutionFillLogPayload(t *testing.T) {
 		"feeRate":          "0.00055",
 		"isMaker":          "1",
 		"execPnl":          "-2.1255",
+		"execTime":         "1700000001000",
 		"createType":       "CreateByTakeProfit",
 		"stopOrderType":    "Stop",
 		"reduceOnly":       true,
@@ -55,8 +56,14 @@ func TestBuildExecutionFillLogPayload(t *testing.T) {
 	if payload["lastLiquidityInd"] != "Taker" {
 		t.Fatalf("lastLiquidityInd got %v", payload["lastLiquidityInd"])
 	}
+	if payload["execTime"] != int64(1700000001000) {
+		t.Fatalf("execTime got %v", payload["execTime"])
+	}
 	if payload["ts"] == "" {
 		t.Fatalf("expected non-empty ts")
+	}
+	if missing := requiredExecutionFillFields(payload); len(missing) != 0 {
+		t.Fatalf("expected no required-field misses, got %v", missing)
 	}
 }
 
@@ -75,5 +82,11 @@ func TestBuildExecutionFillLogPayloadPositionFallback(t *testing.T) {
 	}
 	if payload["lifecycleInferred"] != true {
 		t.Fatalf("lifecycleInferred fallback got %v want true", payload["lifecycleInferred"])
+	}
+	if payload["tradeId"] != "" {
+		t.Fatalf("tradeId fallback got %v want empty raw tradeId", payload["tradeId"])
+	}
+	if missing := requiredExecutionFillFields(payload); len(missing) == 0 {
+		t.Fatalf("expected missing required fields for sparse payload")
 	}
 }

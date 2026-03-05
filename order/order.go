@@ -128,6 +128,76 @@ func (om *OrderManager) PlaceOrderMarketWithLinkID(side string, qty float64, red
 	return r.Result.OrderID, nil
 }
 
+// PlaceOrderLimitPostOnlyWithLinkID places a post-only limit order and optionally sets orderLinkId.
+func (om *OrderManager) PlaceOrderLimitPostOnlyWithLinkID(side string, qty, price float64, reduceOnly bool, orderLinkID string) (string, error) {
+	if side == "" {
+		return "", fmt.Errorf("invalid side: empty")
+	}
+	if price <= 0 {
+		return "", fmt.Errorf("invalid price: %.8f", price)
+	}
+	const path = "/v5/order/create"
+	body := map[string]interface{}{
+		"category":    "linear",
+		"symbol":      om.Config.Symbol,
+		"side":        side,
+		"orderType":   "Limit",
+		"price":       fmt.Sprintf("%.2f", price),
+		"qty":         om.FormatQty(qty, om.State.Instr.QtyStep),
+		"timeInForce": "PostOnly",
+		"positionIdx": 0,
+	}
+	if reduceOnly {
+		body["reduceOnly"] = true
+	}
+	if strings.TrimSpace(orderLinkID) != "" {
+		body["orderLinkId"] = strings.TrimSpace(orderLinkID)
+	}
+
+	raw, _ := json.Marshal(body)
+	ts := fmt.Sprintf("%d", time.Now().UnixMilli())
+
+	om.Logger.Info("Sending POST request to exchange: %s, Body: %s", path, string(raw))
+
+	req, _ := http.NewRequest("POST", om.Config.DemoRESTHost+path, bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-BAPI-API-KEY", om.Config.APIKey)
+	req.Header.Set("X-BAPI-TIMESTAMP", ts)
+	req.Header.Set("X-BAPI-RECV-WINDOW", om.Config.RecvWindow)
+	req.Header.Set("X-BAPI-SIGN-TYPE", "2")
+	req.Header.Set("X-BAPI-SIGN", om.APIClient.SignREST(om.Config.APISecret, ts, om.Config.APIKey, om.Config.RecvWindow, string(raw)))
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		om.Logger.Error("Failed to send POST request to exchange: %v", err)
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	reply, _ := io.ReadAll(resp.Body)
+	om.Logger.Info("Received response from exchange for %s: Status %d, Body: %s", path, resp.StatusCode, string(reply))
+
+	var r struct {
+		RetCode int    `json:"retCode"`
+		RetMsg  string `json:"retMsg"`
+		Result  struct {
+			OrderID string `json:"orderId"`
+		} `json:"result"`
+	}
+	if json.Unmarshal(reply, &r) != nil || r.RetCode != 0 {
+		om.Logger.Error("Error in post-only limit order response: %d: %s", r.RetCode, r.RetMsg)
+		return "", fmt.Errorf("error placing post-only order: %d: %s", r.RetCode, r.RetMsg)
+	}
+	if r.Result.OrderID != "" {
+		om.State.Lock()
+		om.State.LastOrderID = r.Result.OrderID
+		om.State.Unlock()
+		om.Logger.Info("Post-only order id: %s", r.Result.OrderID)
+	}
+	om.Logger.Info("Post-only %s %.4f @ %.2f OK", side, qty, price)
+	return r.Result.OrderID, nil
+}
+
 // PlaceTakeProfitOrder places a take profit order
 func (om *OrderManager) PlaceTakeProfitOrder(side string, qty, price float64) error {
 	return om.PlaceTakeProfitOrderWithLink(side, qty, price, "")

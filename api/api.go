@@ -315,14 +315,24 @@ type OpenOrder struct {
 
 // ExecutionRecord represents a single execution row from REST.
 type ExecutionRecord struct {
-	ExecID      string
-	OrderID     string
-	OrderLinkID string
-	Side        string
-	ExecQty     float64
-	ExecPrice   float64
-	ExecTime    int64
-	CreatedTime int64
+	ExecID        string
+	OrderID       string
+	OrderLinkID   string
+	TradeID       string
+	Side          string
+	ExecQty       float64
+	ExecPrice     float64
+	ExecFee       float64
+	ExecPnl       float64
+	IsMaker       bool
+	HasIsMaker    bool
+	LastLiquidity string
+	ClosedSize    float64
+	ReduceOnly    bool
+	CreateType    string
+	StopOrderType string
+	ExecTime      int64
+	CreatedTime   int64
 }
 
 func parseExecutionTimestamp(raw string) int64 {
@@ -335,6 +345,31 @@ func parseExecutionTimestamp(raw string) int64 {
 		return 0
 	}
 	return n
+}
+
+func (c *RESTClient) logExecutionListResponse(retCode int, page []ExecutionRecord, nextCursor string) {
+	if c == nil || c.Logger == nil || c.Config == nil || !c.Config.EnableExecutionResponseLog {
+		return
+	}
+	firstExecID := ""
+	lastExecID := ""
+	if len(page) > 0 {
+		firstExecID = strings.TrimSpace(page[0].ExecID)
+		lastExecID = strings.TrimSpace(page[len(page)-1].ExecID)
+	}
+	payload := map[string]any{
+		"retCode":     retCode,
+		"list_len":    len(page),
+		"firstExecId": firstExecID,
+		"lastExecId":  lastExecID,
+		"nextCursor":  strings.TrimSpace(nextCursor),
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		c.Logger.Warning("execution_list_response marshal_failed: %v", err)
+		return
+	}
+	c.Logger.Info("execution_list_response %s", string(raw))
 }
 
 // GetOpenOrders fetches open orders for resync.
@@ -457,9 +492,19 @@ func (c *RESTClient) GetExecutionsPage(symbol, cursor string, limit int) ([]Exec
 				OrderID        string `json:"orderId"`
 				OrderLinkID    string `json:"orderLinkId"`
 				OrderLinkIDAlt string `json:"orderLinkID"`
+				TradeID        string `json:"tradeId"`
+				TradeIDAlt     string `json:"tradeID"`
 				Side           string `json:"side"`
 				ExecQty        string `json:"execQty"`
 				ExecPrice      string `json:"execPrice"`
+				ExecFee        string `json:"execFee"`
+				ExecPnl        string `json:"execPnl"`
+				IsMaker        *bool  `json:"isMaker"`
+				LastLiquidity  string `json:"lastLiquidityInd"`
+				ClosedSize     string `json:"closedSize"`
+				ReduceOnly     bool   `json:"reduceOnly"`
+				CreateType     string `json:"createType"`
+				StopOrderType  string `json:"stopOrderType"`
 				ExecTime       string `json:"execTime"`
 				CreatedTime    string `json:"createdTime"`
 			} `json:"list"`
@@ -476,23 +521,46 @@ func (c *RESTClient) GetExecutionsPage(symbol, cursor string, limit int) ([]Exec
 		}
 		qty, _ := strconv.ParseFloat(it.ExecQty, 64)
 		price, _ := strconv.ParseFloat(it.ExecPrice, 64)
+		execFee, _ := strconv.ParseFloat(it.ExecFee, 64)
+		execPnl, _ := strconv.ParseFloat(it.ExecPnl, 64)
+		closedSize, _ := strconv.ParseFloat(it.ClosedSize, 64)
 		orderLinkID := strings.TrimSpace(it.OrderLinkID)
 		if orderLinkID == "" {
 			orderLinkID = strings.TrimSpace(it.OrderLinkIDAlt)
 		}
+		tradeID := strings.TrimSpace(it.TradeID)
+		if tradeID == "" {
+			tradeID = strings.TrimSpace(it.TradeIDAlt)
+		}
+		hasIsMaker := it.IsMaker != nil
+		isMaker := false
+		if it.IsMaker != nil {
+			isMaker = *it.IsMaker
+		}
 		out = append(out, ExecutionRecord{
-			ExecID:      it.ExecID,
-			OrderID:     it.OrderID,
-			OrderLinkID: orderLinkID,
-			Side:        it.Side,
-			ExecQty:     qty,
-			ExecPrice:   price,
-			ExecTime:    parseExecutionTimestamp(it.ExecTime),
-			CreatedTime: parseExecutionTimestamp(it.CreatedTime),
+			ExecID:        it.ExecID,
+			OrderID:       it.OrderID,
+			OrderLinkID:   orderLinkID,
+			TradeID:       tradeID,
+			Side:          it.Side,
+			ExecQty:       qty,
+			ExecPrice:     price,
+			ExecFee:       execFee,
+			ExecPnl:       execPnl,
+			IsMaker:       isMaker,
+			HasIsMaker:    hasIsMaker,
+			LastLiquidity: strings.TrimSpace(it.LastLiquidity),
+			ClosedSize:    closedSize,
+			ReduceOnly:    it.ReduceOnly,
+			CreateType:    strings.TrimSpace(it.CreateType),
+			StopOrderType: strings.TrimSpace(it.StopOrderType),
+			ExecTime:      parseExecutionTimestamp(it.ExecTime),
+			CreatedTime:   parseExecutionTimestamp(it.CreatedTime),
 		})
 	}
 	nextCursor := strings.TrimSpace(r.Result.NextPageCursor)
 	hasMore := nextCursor != ""
+	c.logExecutionListResponse(r.RetCode, out, nextCursor)
 	return out, nextCursor, hasMore, nil
 }
 

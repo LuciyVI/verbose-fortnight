@@ -410,6 +410,115 @@ func TestCalcSLToBE_Short(t *testing.T) {
 	}
 }
 
+func TestCalcWinMovePct_LongShort(t *testing.T) {
+	if got, ok := calcWinMovePct("LONG", 100, 101.5); !ok || math.Abs(got-0.015) > 1e-9 {
+		t.Fatalf("long move pct got=%v ok=%v want=0.015,true", got, ok)
+	}
+	if got, ok := calcWinMovePct("SHORT", 100, 98.5); !ok || math.Abs(got-0.015) > 1e-9 {
+		t.Fatalf("short move pct got=%v ok=%v want=0.015,true", got, ok)
+	}
+	if got, ok := calcWinMovePct("LONG", 100, 99.5); ok || got != 0 {
+		t.Fatalf("loss move must not be accepted, got=%v ok=%v", got, ok)
+	}
+}
+
+func TestClampSLPct(t *testing.T) {
+	if got := clampSLPct(0.001, 0.0025, 0.03); math.Abs(got-0.0025) > 1e-12 {
+		t.Fatalf("expected min clamp 0.0025, got %.8f", got)
+	}
+	if got := clampSLPct(0.04, 0.0025, 0.03); math.Abs(got-0.03) > 1e-12 {
+		t.Fatalf("expected max clamp 0.03, got %.8f", got)
+	}
+	if got := clampSLPct(0.01, 0.0025, 0.03); math.Abs(got-0.01) > 1e-12 {
+		t.Fatalf("expected passthrough 0.01, got %.8f", got)
+	}
+}
+
+func TestSLPriceFromPct(t *testing.T) {
+	if got := slPriceFromPct("LONG", 100, 0.005); math.Abs(got-99.5) > 1e-9 {
+		t.Fatalf("long sl price got %.8f want 99.5", got)
+	}
+	if got := slPriceFromPct("SHORT", 100, 0.005); math.Abs(got-100.5) > 1e-9 {
+		t.Fatalf("short sl price got %.8f want 100.5", got)
+	}
+}
+
+func TestCalculateInitialTPSLUsesHalfLastWinSL(t *testing.T) {
+	tr := newTestTrader()
+	tr.State.Instr.TickSize = 0.1
+	tr.State.MarketRegime = "range"
+	tr.State.RecordLastWinMove("LONG", 0.01, 1, 100, 101, "test", time.Now())
+
+	entry := 100.0
+	_, sl, details := tr.calculateInitialTPSLWithDetails(entry, "LONG")
+	if details.slPolicy != "half_last_win" {
+		t.Fatalf("expected sl policy half_last_win, got %q", details.slPolicy)
+	}
+	if math.Abs(details.desiredSLPct-0.005) > 1e-12 {
+		t.Fatalf("desired sl pct got %.8f want 0.005", details.desiredSLPct)
+	}
+	if math.Abs(sl-99.5) > 1e-9 {
+		t.Fatalf("sl got %.8f want 99.5", sl)
+	}
+	if math.Abs(entry-sl) <= entry*fixedStopLossFraction {
+		t.Fatalf("expected wider-than-floor SL, got dist %.6f floor %.6f", math.Abs(entry-sl), entry*fixedStopLossFraction)
+	}
+}
+
+func TestHalfLastWinSkippedWhenLastWinBelowMin(t *testing.T) {
+	tr := newTestTrader()
+	tr.State.Instr.TickSize = 0.1
+	tr.State.MarketRegime = "range"
+	tr.State.RecordLastWinMove("LONG", 0.002, 1, 100, 100.2, "test", time.Now())
+
+	_, sl, details := tr.calculateInitialTPSLWithDetails(100, "LONG")
+	if details.slPolicy == "half_last_win" {
+		t.Fatalf("expected fallback policy for small last win, got %q", details.slPolicy)
+	}
+	if details.slPolicy != "atr_default_small_win_skip" {
+		t.Fatalf("expected atr_default_small_win_skip, got %q", details.slPolicy)
+	}
+	if details.slPolicyReason != "small_last_win" {
+		t.Fatalf("expected reason small_last_win, got %q", details.slPolicyReason)
+	}
+	if details.slPctFinal+1e-12 < fixedStopLossFraction {
+		t.Fatalf("expected final sl pct >= fixed floor, got %.8f", details.slPctFinal)
+	}
+	if math.Abs(sl-99.7) > 1e-9 {
+		t.Fatalf("expected floor-based sl=99.7, got %.8f", sl)
+	}
+}
+
+func TestHalfLastWinSkippedWhenClampViolatesInvariant(t *testing.T) {
+	desired, final, reason, applied := resolveHalfLastWinSL(0.003, 0.0025, 0.03, 1.0)
+	if applied {
+		t.Fatalf("expected fallback when final>=last win")
+	}
+	if reason != "clamp_violation" {
+		t.Fatalf("expected clamp_violation, got %q", reason)
+	}
+	if desired != 0.003 || final != 0.003 {
+		t.Fatalf("unexpected desired/final: desired=%.8f final=%.8f", desired, final)
+	}
+}
+
+func TestCalculateInitialTPSLFallbackWithoutLastWin(t *testing.T) {
+	tr := newTestTrader()
+	tr.State.Instr.TickSize = 0.1
+	tr.State.MarketRegime = "range"
+
+	entry := 100.0
+	_, sl, details := tr.calculateInitialTPSLWithDetails(entry, "LONG")
+	if details.slPolicy != "atr_default" {
+		t.Fatalf("expected fallback sl policy atr_default, got %q", details.slPolicy)
+	}
+	wantSLRaw := entry - entry*fixedStopLossFraction
+	wantSL := tr.roundSL(entry, wantSLRaw, tr.State.Instr.TickSize, "LONG")
+	if sl != wantSL {
+		t.Fatalf("fallback sl mismatch: got %.4f want %.4f", sl, wantSL)
+	}
+}
+
 func TestCalcEdgeScore_MinDepth(t *testing.T) {
 	bids := map[string]float64{"100.0": 1}
 	asks := map[string]float64{"100.1": 1}

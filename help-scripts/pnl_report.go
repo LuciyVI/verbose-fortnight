@@ -20,6 +20,7 @@ import (
 
 	"verbose-fortnight/api"
 	"verbose-fortnight/config"
+	"verbose-fortnight/pnl"
 )
 
 type closedPnlItem struct {
@@ -148,14 +149,7 @@ func logSideFromPositionSide(positionSide string) string {
 }
 
 func CalcPnLByPositionSide(positionSide string, entry, exit, qty float64) float64 {
-	switch normalizeOrderSide(positionSide) {
-	case "Buy":
-		return (exit - entry) * qty
-	case "Sell":
-		return (entry - exit) * qty
-	default:
-		return (exit - entry) * qty
-	}
+	return pnl.Gross(positionSide, entry, exit, qty)
 }
 
 func parseFunding(item closedPnlItem) (float64, bool) {
@@ -170,7 +164,7 @@ func parseFunding(item closedPnlItem) (float64, bool) {
 // Bybit funding values are treated as signed cashflow:
 // negative => paid (cost), positive => received (credit).
 func calcNetWithFundingSigned(gross, feeTotal, fundingSigned float64) float64 {
-	return gross - feeTotal + fundingSigned
+	return pnl.NetFromComponents(gross, feeTotal, fundingSigned)
 }
 
 func calcFees(item closedPnlItem, fallbackFeePerc, entry, exit, qty float64) (entryFee, exitFee, totalFee float64) {
@@ -203,10 +197,18 @@ func calcFees(item closedPnlItem, fallbackFeePerc, entry, exit, qty float64) (en
 
 // fundingCost is positive when funding reduces PnL and negative when it adds PnL.
 func resolveNetPnL(item closedPnlItem, gross, fee, fundingCost float64) (float64, bool) {
-	if net, ok := parseOptionalFloat(item.CurPnl); ok {
-		return net, true
+	summary := pnl.Summary{
+		Gross:         gross,
+		FeeTotal:      math.Abs(fee),
+		FundingSigned: -fundingCost,
 	}
-	return gross - fee - fundingCost, false
+	summary.NetCalculated = pnl.NetFromComponents(summary.Gross, summary.FeeTotal, summary.FundingSigned)
+	if net, ok := parseOptionalFloat(item.CurPnl); ok {
+		result := pnl.ResolveNet(&net, summary)
+		return result.Net, result.Source == pnl.NetSourceExchange
+	}
+	result := pnl.ResolveNet(nil, summary)
+	return result.Net, result.Source == pnl.NetSourceExchange
 }
 
 func collectLogFiles(path string) ([]string, error) {
@@ -860,12 +862,12 @@ func main() {
 
 	fmt.Printf("Closed PnL %s for %s\n", windowLabel, cfg.Symbol)
 	fmt.Println("Sign convention: close side Buy=>position Sell (SHORT), Sell=>position Buy (LONG); gross from position side; NetPnL from exchange closedPnl (fallback: gross-fee-funding)")
-	fmt.Printf("%-19s %-5s %-6s %-10s %-10s %-10s %-10s %-10s %-10s %-10s %-10s %-8s %-8s %-8s %-8s %-8s %-12s\n",
-		"Time", "Close", "Pos", "Qty", "Entry", "Exit", "GrossPnL", "FeeIn", "FeeOut", "Fee", "NetPnL", "ExitReason", "SLinit", "SLfinal", "TPinit", "TPfinal", "Trail")
+	fmt.Printf("%-19s %-5s %-6s %-10s %-10s %-10s %-10s %-12s %-10s %-10s %-10s %-10s %-10s %-10s %-8s %-8s %-8s %-8s %-8s %-12s\n",
+		"Time", "Close", "Pos", "Qty", "Entry", "Exit", "GrossPnL", "GrossSource", "FeeOpen", "FeeClose", "Fee", "Funding", "NetPnL", "NetSource", "ExitReason", "SLinit", "SLfinal", "TPinit", "TPfinal", "Trail")
 
 	var csvBuilder strings.Builder
 	if *outCSV != "" {
-		csvBuilder.WriteString("Time,CloseSide,PositionSide,Qty,Entry,Exit,GrossPnL,FeeIn,FeeOut,Fee,Funding,NetPnL,ExitReason,SLinit,SLfinal,TPinit,TPfinal,TrailActive,TrailDistance\n")
+		csvBuilder.WriteString("Time,CloseSide,PositionSide,Qty,Entry,Exit,GrossPnL,GrossSource,FeeOpenAlloc,FeeClose,Fee,FundingSigned,NetPnL,NetSource,ExitReason,SLinit,SLfinal,TPinit,TPfinal,TrailActive,TrailDistance\n")
 	}
 
 	var totalNet, totalGross, totalFee, wins, losses float64
@@ -894,6 +896,12 @@ func main() {
 		if netFromExchange {
 			netSource = "exchange"
 		}
+		grossSource := string(pnl.GrossSourcePositionSide)
+		if positionSide == "" {
+			grossSource = "unknown"
+		}
+		feeOpenAlloc := feeEntry
+		feeClose := feeExit
 		exitReason := "n/a"
 		slInit := ""
 		slFinal := ""
@@ -958,7 +966,7 @@ func main() {
 			losses += net
 		}
 
-		fmt.Printf("%-19s %-5s %-6s %-10s %-10s %-10s %-10s %-10s %-10s %-10s %-10s %-8s %-8s %-8s %-8s %-8s %-12s\n",
+		fmt.Printf("%-19s %-5s %-6s %-10s %-10s %-10s %-10s %-12s %-10s %-10s %-10s %-10s %-10s %-10s %-8s %-8s %-8s %-8s %-8s %-12s\n",
 			t,
 			closeSide,
 			positionSideOut,
@@ -966,10 +974,13 @@ func main() {
 			formatFloat(entry, 2),
 			formatFloat(exit, 2),
 			formatFloat(gross, 4),
-			formatFloat(feeEntry, 4),
-			formatFloat(feeExit, 4),
+			grossSource,
+			formatFloat(feeOpenAlloc, 4),
+			formatFloat(feeClose, 4),
 			formatFloat(feeTotal, 4),
+			formatFloat(fundingSigned, 4),
 			formatFloat(net, 4),
+			netSource,
 			exitReason,
 			slInit,
 			slFinal,
@@ -979,7 +990,7 @@ func main() {
 		)
 
 		if *outCSV != "" {
-			fmt.Fprintf(&csvBuilder, "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
+			fmt.Fprintf(&csvBuilder, "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
 				t,
 				closeSide,
 				positionSideOut,
@@ -987,11 +998,13 @@ func main() {
 				formatFloat(entry, 2),
 				formatFloat(exit, 2),
 				formatFloat(gross, 4),
-				formatFloat(feeEntry, 4),
-				formatFloat(feeExit, 4),
+				grossSource,
+				formatFloat(feeOpenAlloc, 4),
+				formatFloat(feeClose, 4),
 				formatFloat(feeTotal, 4),
 				formatFloat(fundingSigned, 4),
 				formatFloat(net, 4),
+				netSource,
 				exitReason,
 				slInit,
 				slFinal,
@@ -1003,7 +1016,7 @@ func main() {
 		}
 	}
 	for _, op := range openPositions {
-		fmt.Printf("%-19s %-5s %-6s %-10s %-10s %-10s %-10s %-10s %-10s %-10s %-10s %-8s %-8s %-8s %-8s %-8s %-12s\n",
+		fmt.Printf("%-19s %-5s %-6s %-10s %-10s %-10s %-10s %-12s %-10s %-10s %-10s %-10s %-10s %-10s %-8s %-8s %-8s %-8s %-8s %-12s\n",
 			"OPEN",
 			"-",
 			normalizeSide(op.Side),
@@ -1021,14 +1034,19 @@ func main() {
 			"",
 			"",
 			"",
+			"",
+			"",
+			"",
 		)
 		if *outCSV != "" {
-			fmt.Fprintf(&csvBuilder, "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
+			fmt.Fprintf(&csvBuilder, "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
 				"OPEN",
 				"-",
 				normalizeSide(op.Side),
 				formatFloat(op.Size, 4),
 				formatFloat(op.AvgPrice, 2),
+				"",
+				"",
 				"",
 				"",
 				"",
