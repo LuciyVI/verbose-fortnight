@@ -161,20 +161,6 @@ Run tests with coverage:
 go test -cover ./...
 ```
 
-### AFL++ CI Watchdog
-
-Long AFL++ fuzzing jobs can be stopped automatically when no new path is found for the configured idle window. Defaults are prefilled for CI/CD and can be overridden by pipeline env vars:
-
-```bash
-export AFL_STATS_DIR="${AFL_STATS_DIR:-fuzz/out}"
-export AFL_IDLE_TIMEOUT="${AFL_IDLE_TIMEOUT:-2h}"
-export AFL_WATCHDOG_POLL_INTERVAL="${AFL_WATCHDOG_POLL_INTERVAL:-60s}"
-
-scripts/afl-ci-watchdog.sh afl-fuzz -i fuzz/in -o "$AFL_STATS_DIR" -- ./target @@
-```
-
-See `docs/afl_idle_watchdog.md` for monitor-only usage and termination behavior.
-
 ## Trading Strategy
 
 The bot implements a multi-indicator approach:
