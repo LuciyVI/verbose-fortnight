@@ -1,97 +1,65 @@
-# Signal Generation Algorithm Flow (with Bollinger Bands)
+# Signal Generation Flow With Bollinger Bands
+
+This file is kept for links that used to point to the old "with Bollinger Bands" flow. The current implementation does not have a separate Bollinger fallback stage. Bollinger Bands are part of the normal `ScoreSignal` stage described in [signal_generation_flow.md](signal_generation_flow.md).
+
+## Current Bollinger Role
+
+Bollinger Bands are calculated in `buildIndicatorSnapshot` with window `20` and multiplier `2.0`. They are then used only as scoring inputs:
+
+- in `trend` regime:
+  - LONG `+1` for `bb-breakout` when `close >= BBUpper + deadband`;
+  - SHORT `+1` for `bb-breakout` when `close <= BBLower - deadband`;
+- in `range` regime:
+  - LONG `+1` for `bb-revert` when `close <= BBLower - deadband`;
+  - SHORT `+1` for `bb-revert` when `close >= BBUpper + deadband`.
+
+Bollinger Bands do not bypass RSI, HTF, orderbook, cooldown, grace-period, or minimum-strength filters.
+
+## Pipeline
 
 ```mermaid
 flowchart TD
-    A[Start - SMA Worker Cycle] --> B[Calculate technical indicators]
-    B --> C[Get Close and SMA]
-    C --> D[Determine market regime and hysteresis h]
-    D --> E[RSI for logging only]
-    E --> F[Compute MACD line, signal, histogram]
-    F --> G[Compute ATR and Bollinger Bands]
-    G --> H[Set hysteresis by regime]
-    H --> I[Compute thresholds low/high from SMA and h\nCompute BB upper/middle/lower]
-
-    I --> J{Close < low?}
-    J -->|Yes| K[longSignal=true\nlog: primary LONG]
-    J -->|No| L{Close > high?}
-    L -->|Yes| M[shortSignal=true\nlog: primary SHORT]
-    L -->|No| N[no primary signal]
-
-    K --> O{Secondary: MACD confirm\nonly if no signal}
-    M --> O
-    N --> O
-
-    O -->|hist>0 and line>signal| Q[longSignal=true\nlog: secondary LONG]
-    O -->|hist<0 and line<signal| S[shortSignal=true\nlog: secondary SHORT]
-    O -->|otherwise| T{Tertiary: Golden Cross?\nonly if no signal}
-
-    Q --> T
-    S --> T
-    T -->|Yes| U[longSignal=true\nlog: tertiary LONG]
-    T -->|No| V{Quaternary: Bollinger check\nonly if no signal}
-
-    U --> V
-    V -->|Yes| W{Close <= BB lower?}
-    W -->|Yes| X[longSignal=true\nlog: quaternary LONG]
-    W -->|No| Y{Close >= BB upper?}
-    Y -->|Yes| Z[shortSignal=true\nlog: quaternary SHORT]
-    Y -->|No| AA[no additional signals]
-
-    X --> AB{Send signal?}
-    Z --> AB
-    AA --> AB
-
-    AB -->|longSignal=true| AC[Send LONG · Kind=SMA_LONG]
-    AB -->|shortSignal=true| AD[Send SHORT · Kind=SMA_SHORT]
-    AB -->|none| AE[No signal sent]
-
-    AC --> AF[End cycle - wait 1s]
-    AD --> AF
-    AE --> AF
-    AF --> A
-
-    %% Styles
-    style A fill:#e1f5fe
-    style AF fill:#e1f5fe
-    style K fill:#c8e6c9
-    style M fill:#ffcdd2
-    style Q fill:#c8e6c9
-    style S fill:#ffcdd2
-    style U fill:#c8e6c9
-    style X fill:#c8e6c9
-    style Z fill:#ffcdd2
-    style AC fill:#a5d6a7
-    style AD fill:#ef9a9a
-    style AE fill:#b0bec5
+    A[Get copied OHLCV snapshot] --> B[IndicatorSnapshot]
+    B --> C[ScoreSignal includes SMA, MACD, Bollinger, optional RSI score]
+    C --> D[FilterSignal applies RSI filter, HTF filter, orderbook confirmation]
+    D -->|accepted| E[EmitSignal]
+    D -->|rejected| F[Store Signal.Debug with rejectedBy]
+    E --> G[Trader runtime filters]
+    G -->|confirmed| H[Open or flip position]
+    G -->|rejected| I[Store runtime rejectedBy]
 ```
 
-## Signal Generation Algorithm Summary
+## Examples
 
-### 1. Primary Signals (SMA Crossing)
-- LONG: When current close price < SMA * (1 - hysteresis)
-- SHORT: When current close price > SMA * (1 + hysteresis)
+### Bollinger LONG Contribution
 
-### 2. Secondary Signals (MACD Confirmation)
-- LONG: When MACD histogram > 0 AND MACD line > Signal line
-- SHORT: When MACD histogram < 0 AND MACD line < Signal line
-- Only evaluated if no primary signal exists
+In `trend` regime, if `close >= BBUpper + deadband`, `ScoreSignal` adds:
 
-### 3. Tertiary Signals (Golden Cross)
-- LONG: When golden cross detected
-- Only evaluated if no primary or secondary signal exists
+```text
+LONG +1 reason=bb-breakout
+```
 
-### 4. Quaternary Signals (Bollinger Bands)
-- LONG: When current close price <= Bollinger Lower Band (potential reversal to the upside)
-- SHORT: When current close price >= Bollinger Upper Band (potential reversal to the downside)
-- Only evaluated if no primary, secondary, or tertiary signal exists
+This can help LONG win direction selection, but the signal still needs to pass hard filters such as RSI filter mode and orderbook confirmation.
 
-### 5. Hysteresis
-- Default: 0.5%
-- In trending regime: 1.0% (wider hysteresis)
+### Bollinger SHORT Contribution
 
-### 6. Signal Priority
-- Only one signal type is sent per cycle
-- Priority order: Primary > Secondary > Tertiary > Quaternary
-- No signal is sent if conditions are not met
+In `range` regime, if `close >= BBUpper + deadband`, `ScoreSignal` adds:
 
-> Note: RSI has been temporarily disabled from signal generation but is still calculated for logging purposes.
+```text
+SHORT +1 reason=bb-revert
+```
+
+This is a scoring reason, not an immediate order instruction.
+
+### Rejected Despite Bollinger Score
+
+If a LONG candidate has `bb-breakout` and other LONG score reasons but orderbook ratio is below `OrderbookStrengthThreshold`, the final debug context looks like:
+
+```text
+chosenDirection=LONG
+appliedFilters=[orderbook_confirmation]
+rejectedBy=[orderbook_confirmation]
+reasons=[... LONG:orderbook_rejected reason=ratio 0.80 below 1.20]
+```
+
+No signal is emitted to `Trader()`.

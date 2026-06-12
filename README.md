@@ -165,8 +165,8 @@ go test -cover ./...
 
 The bot implements a multi-indicator approach:
 
-1. **Signal Generation**: Uses SMA and MACD for signal generation
-2. **Confirmation**: Validates signals with orderbook strength analysis
+1. **Signal Generation**: Builds an indicator snapshot, scores SMA/MACD/Bollinger and optional RSI factors, then applies explicit filters
+2. **Confirmation**: Uses RSI/HTF/orderbook filters before emit and runtime filters before opening positions
 3. **Position Sizing**: Dynamic position sizing based on balance
 4. **Take Profit**: Multiple TP calculation methods (ATR, BB, volume-based)
 5. **Stop Loss**: Fixed SL percentage or dynamic trailing stops

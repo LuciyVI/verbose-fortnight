@@ -5,6 +5,79 @@ import (
 	"strconv"
 )
 
+const (
+	RSIModeOff    = "off"
+	RSIModeLog    = "log"
+	RSIModeFilter = "filter"
+	RSIModeScore  = "score"
+)
+
+// ReversalLongConfig is a disabled-by-default skeleton for a future V-rebound mode.
+type ReversalLongConfig struct {
+	Enabled      bool
+	TradeEnabled bool
+
+	MinVolumeRatio float64
+	OversoldRSI    float64
+	MaxEntryRSI    float64
+	MinRSIDelta    float64
+
+	RequireLowerBBReclaim bool
+	NoNewLowBars          int
+
+	RequireMACDHistRecovery bool
+	MinMACDHistDelta        float64
+
+	AllowHTFBearish          bool
+	BlockExtremeHTFDowntrend bool
+	UseSoftOrderbookCheck    bool
+	MaxSpreadBps             float64
+	MaxAskWallRatio          float64
+	MinBidStabilityRatio     float64
+
+	ScoreThreshold                float64
+	PositionSizeMultiplier        float64
+	StopBelowLocalLowBps          float64
+	TimeoutBars                   int
+	MinRuntimeStrength            int
+	RequireStop                   bool
+	RequireSoftOrderbookAtRuntime bool
+}
+
+// DefaultReversalLongConfig returns conservative defaults without enabling the mode.
+func DefaultReversalLongConfig() ReversalLongConfig {
+	return ReversalLongConfig{
+		Enabled:      false,
+		TradeEnabled: false,
+
+		MinVolumeRatio: 2.0,
+		OversoldRSI:    30,
+		MaxEntryRSI:    45,
+		MinRSIDelta:    5,
+
+		RequireLowerBBReclaim: true,
+		NoNewLowBars:          3,
+
+		RequireMACDHistRecovery: true,
+		MinMACDHistDelta:        0,
+
+		AllowHTFBearish:          true,
+		BlockExtremeHTFDowntrend: true,
+		UseSoftOrderbookCheck:    true,
+		MaxSpreadBps:             20,
+		MaxAskWallRatio:          3,
+		MinBidStabilityRatio:     0.4,
+
+		ScoreThreshold:                0.8,
+		PositionSizeMultiplier:        0.3,
+		StopBelowLocalLowBps:          30,
+		TimeoutBars:                   3,
+		MinRuntimeStrength:            3,
+		RequireStop:                   true,
+		RequireSoftOrderbookAtRuntime: true,
+	}
+}
+
 // Config holds application configuration
 type Config struct {
 	APIKey           string
@@ -29,6 +102,7 @@ type Config struct {
 	SmaLen           int
 	// Adaptive thresholds
 	AtrDeadbandMult    float64
+	RSIMode            string // off=ignore, log=log only, filter=hard gate, score=strength contribution
 	RSILow             float64
 	RSIHigh            float64
 	HTFWindow          int
@@ -54,12 +128,17 @@ type Config struct {
 	MinVolume          float64
 	Debug              bool
 	DynamicTP          bool
+	ReversalLong       ReversalLongConfig
 	// Dynamic TP configuration (percent units, e.g. 0.4 = 0.4%)
 	DynamicTPK                float64
 	DynamicTPVolatilityFactor float64
 	DynamicTPMinPerc          float64
 	DynamicTPMaxPerc          float64
-	// Signal confirmation thresholds
+	// Signal confirmation thresholds.
+	// OrderbookStrengthThreshold is compared with sideDepth/oppositeDepth:
+	// LONG uses top bid depth / top ask depth; SHORT uses top ask depth / top bid depth.
+	// A ratio of 1.0 means balanced top-book depth, and values above 1.0 mean the requested side dominates.
+	// Set this threshold above 1.0 to require that dominance before confirming a signal.
 	OrderbookStrengthThreshold float64
 	OrderbookLevels            int
 	OrderbookMinDepth          float64
@@ -86,6 +165,9 @@ type Config struct {
 	LogLevel      int // 0=DEBUG, 1=INFO, 2=WARNING, 3=ERROR
 	// Status server configuration
 	StatusAddr string
+	// Optional diagnostic JSONL output for live orderbook snapshots.
+	OrderbookSnapshotJSONLPath  string
+	OrderbookSnapshotIntervalMS int
 	// Daemon configuration
 	DaemonMode bool
 	// Trailing configuration
@@ -118,7 +200,8 @@ func LoadConfig() *Config {
 		SlThresholdQty:  500.0,
 		SmaLen:          20,
 		AtrDeadbandMult: 0.25,
-		// Enable RSI gating by default to avoid over-trading noise
+		// Keep historical RSI gating behavior explicit by default.
+		RSIMode:                    getEnv("RSI_MODE", RSIModeFilter),
 		RSILow:                     45,
 		RSIHigh:                    55,
 		HTFWindow:                  60,
@@ -144,11 +227,12 @@ func LoadConfig() *Config {
 		MinVolume:                  0,
 		Debug:                      false,
 		DynamicTP:                  false,
+		ReversalLong:               DefaultReversalLongConfig(),
 		DynamicTPK:                 getEnvAsFloat("DYNAMIC_TP_K", 1.0),
 		DynamicTPVolatilityFactor:  getEnvAsFloat("DYNAMIC_TP_VOLATILITY_FACTOR", 6.0),
 		DynamicTPMinPerc:           getEnvAsFloat("DYNAMIC_TP_MIN_PERC", 0.4),
 		DynamicTPMaxPerc:           getEnvAsFloat("DYNAMIC_TP_MAX_PERC", 1.8),
-		OrderbookStrengthThreshold: 0.5,
+		OrderbookStrengthThreshold: 1.2,
 		OrderbookLevels:            5,
 		OrderbookMinDepth:          0,
 		// Trim orderbook imbalance history to avoid perpetual instability filtering
@@ -174,7 +258,9 @@ func LoadConfig() *Config {
 		LogCompress:   true,
 		LogLevel:      1, // INFO level
 		// Status server defaults
-		StatusAddr: getEnv("STATUS_ADDR", "127.0.0.1:6061"),
+		StatusAddr:                  getEnv("STATUS_ADDR", "127.0.0.1:6061"),
+		OrderbookSnapshotJSONLPath:  getEnv("ORDERBOOK_SNAPSHOT_JSONL", ""),
+		OrderbookSnapshotIntervalMS: getEnvAsInt("ORDERBOOK_SNAPSHOT_INTERVAL_MS", 1000),
 		// Daemon defaults
 		DaemonMode: getEnvAsBool("DAEMON_MODE", false),
 		// Trailing defaults
@@ -203,6 +289,18 @@ func getEnvAsFloat(key string, defaultValue float64) float64 {
 		return defaultValue
 	}
 	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return defaultValue
+	}
+	return parsed
+}
+
+func getEnvAsInt(key string, defaultValue int) int {
+	value := getEnv(key, "")
+	if value == "" {
+		return defaultValue
+	}
+	parsed, err := strconv.Atoi(value)
 	if err != nil {
 		return defaultValue
 	}

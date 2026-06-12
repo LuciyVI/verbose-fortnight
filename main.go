@@ -489,18 +489,17 @@ func main() {
 
 	// Initialize state
 	state := &models.State{
-		Debug:           cfg.Debug,
-		DynamicTP:       cfg.DynamicTP,
-		SlPerc:          cfg.SlPerc,
-		TrailPerc:       cfg.TrailPerc,
-		SmaLen:          cfg.SmaLen,
-		BidsMap:         make(map[string]float64),
-		AsksMap:         make(map[string]float64),
-		TPChan:          make(chan models.TPJob, 8),
-		SigChan:         make(chan models.Signal, 128),
-		MarketRegime:    "range", // default
-		RegimeCandidate: "range",
+		Debug:     cfg.Debug,
+		DynamicTP: cfg.DynamicTP,
+		SlPerc:    cfg.SlPerc,
+		TrailPerc: cfg.TrailPerc,
+		SmaLen:    cfg.SmaLen,
+		BidsMap:   make(map[string]float64),
+		AsksMap:   make(map[string]float64),
+		TPChan:    make(chan models.TPJob, 8),
+		SigChan:   make(chan models.Signal, 128),
 	}
+	state.SetMarketRegime("range", "range", 0)
 
 	// Initialize instrument info
 	var err error
@@ -591,6 +590,11 @@ func main() {
 
 	// Create trader
 	trader := strategy.NewTrader(apiClient, cfg, state, logger)
+	orderbookSnapshotCtx, stopOrderbookSnapshotRecorder := context.WithCancel(context.Background())
+	defer stopOrderbookSnapshotRecorder()
+	if trader.StartOrderbookSnapshotRecorder(orderbookSnapshotCtx) {
+		logInfo("Orderbook snapshot recorder enabled: path=%s interval_ms=%d", cfg.OrderbookSnapshotJSONLPath, cfg.OrderbookSnapshotIntervalMS)
+	}
 	statusServer := status.StartServer(cfg, state, logger)
 
 	// Start indicator and trading goroutines

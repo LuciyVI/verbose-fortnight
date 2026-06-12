@@ -13,14 +13,15 @@ import (
 )
 
 type statusResponse struct {
-	Time         time.Time                 `json:"time"`
-	Symbol       string                    `json:"symbol"`
-	Trend        string                    `json:"trend"`
-	RegimeStreak int                       `json:"regimeStreak,omitempty"`
-	CandleSeq    uint64                    `json:"candleSeq,omitempty"`
-	Signal       *models.SignalSnapshot    `json:"signal,omitempty"`
-	Indicators   *models.IndicatorSnapshot `json:"indicators,omitempty"`
-	Position     *models.PositionSnapshot  `json:"position,omitempty"`
+	Time         time.Time `json:"time"`
+	Symbol       string    `json:"symbol"`
+	Trend        string    `json:"trend"`
+	RegimeStreak int       `json:"regimeStreak,omitempty"`
+	CandleSeq    uint64    `json:"candleSeq,omitempty"`
+	models.OrderbookSnapshotHealth
+	Signal     *models.SignalSnapshot    `json:"signal,omitempty"`
+	Indicators *models.IndicatorSnapshot `json:"indicators,omitempty"`
+	Position   *models.PositionSnapshot  `json:"position,omitempty"`
 }
 
 // StartServer starts a local HTTP status server for diagnostics.
@@ -33,6 +34,8 @@ func StartServer(cfg *config.Config, state *models.State, logger logging.LoggerI
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		ohlcvSnapshot := state.GetOhlcvSnapshot()
+		regimeSnapshot := state.GetMarketRegimeSnapshot()
 		state.StatusLock.RLock()
 		lastSignal := state.LastSignal
 		lastIndicators := state.LastIndicators
@@ -44,6 +47,15 @@ func StartServer(cfg *config.Config, state *models.State, logger logging.LoggerI
 			sigCopy := lastSignal
 			if len(sigCopy.Contribs) > 0 {
 				sigCopy.Contribs = append([]string(nil), sigCopy.Contribs...)
+			}
+			if len(sigCopy.Debug.AppliedFilters) > 0 {
+				sigCopy.Debug.AppliedFilters = append([]string(nil), sigCopy.Debug.AppliedFilters...)
+			}
+			if len(sigCopy.Debug.RejectedBy) > 0 {
+				sigCopy.Debug.RejectedBy = append([]string(nil), sigCopy.Debug.RejectedBy...)
+			}
+			if len(sigCopy.Debug.Reasons) > 0 {
+				sigCopy.Debug.Reasons = append([]string(nil), sigCopy.Debug.Reasons...)
 			}
 			signal = &sigCopy
 		}
@@ -61,14 +73,15 @@ func StartServer(cfg *config.Config, state *models.State, logger logging.LoggerI
 		}
 
 		resp := statusResponse{
-			Time:         time.Now(),
-			Symbol:       cfg.Symbol,
-			Trend:        state.MarketRegime,
-			RegimeStreak: state.RegimeStreak,
-			CandleSeq:    state.CandleSeq.Load(),
-			Signal:       signal,
-			Indicators:   indicators,
-			Position:     position,
+			Time:                    time.Now(),
+			Symbol:                  cfg.Symbol,
+			Trend:                   regimeSnapshot.MarketRegime,
+			RegimeStreak:            regimeSnapshot.RegimeStreak,
+			CandleSeq:               ohlcvSnapshot.CandleSeq,
+			OrderbookSnapshotHealth: state.GetOrderbookSnapshotHealth(),
+			Signal:                  signal,
+			Indicators:              indicators,
+			Position:                position,
 		}
 
 		w.Header().Set("Content-Type", "application/json")

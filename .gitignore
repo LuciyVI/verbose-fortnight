@@ -1,0 +1,20 @@
+# Local environment
+.env
+.env.*
+!.env.example
+
+# Build outputs
+/go-trade
+*.test
+coverage.out
+
+# Runtime logs
+/logs/
+/trading_bot*.log
+/trading_bot*.log.gz
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp

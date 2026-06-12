@@ -117,7 +117,7 @@ func (pm *PositionManager) GetLastEntryPrice() float64 {
 
 // UpdatePositionTPSL updates the TP/SL for a position
 func (pm *PositionManager) UpdatePositionTPSL(symbol string, tp, sl float64) error {
-	exists, _, _, _, _ := pm.HasOpenPosition()
+	exists, side, qty, _, _ := pm.HasOpenPosition()
 	if !exists {
 		return fmt.Errorf("no open position to update TP/SL")
 	}
@@ -134,8 +134,11 @@ func (pm *PositionManager) UpdatePositionTPSL(symbol string, tp, sl float64) err
 
 	raw, _ := json.Marshal(body)
 	ts := fmt.Sprintf("%d", time.Now().UnixMilli())
+	logTS := time.Now().UTC().Format(time.RFC3339Nano)
 
 	// Log outgoing request
+	pm.Logger.Info("[TP_SL_SEND] timestamp=%s action=trading_stop symbol=%s side=%s qty=%.8f finalTP=%.8f finalSL=%.8f formattedTP=%s formattedSL=%s positionIdx=%d tpslMode=%s triggerBy=%s requestPayload=%s",
+		logTS, symbol, side, qty, tp, sl, body["takeProfit"], body["stopLoss"], body["positionIdx"], body["tpslMode"], "exchange_default", string(raw))
 	pm.Logger.Info("Sending POST request to exchange: %s, Body: %s", path, string(raw))
 
 	req, _ := http.NewRequest("POST", pm.Config.DemoRESTHost+path, bytes.NewReader(raw))
@@ -148,6 +151,8 @@ func (pm *PositionManager) UpdatePositionTPSL(symbol string, tp, sl float64) err
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
+		pm.Logger.Error("[TP_SL_RESULT] timestamp=%s action=trading_stop success=false symbol=%s side=%s qty=%.8f finalTP=%.8f finalSL=%.8f err=%q requestPayload=%s",
+			time.Now().UTC().Format(time.RFC3339Nano), symbol, side, qty, tp, sl, err.Error(), string(raw))
 		pm.Logger.Error("Failed to send POST request to exchange: %v", err)
 		return err
 	}
@@ -163,10 +168,14 @@ func (pm *PositionManager) UpdatePositionTPSL(symbol string, tp, sl float64) err
 		RetMsg  string `json:"retMsg"`
 	}
 	if json.Unmarshal(reply, &r) != nil || r.RetCode != 0 {
+		pm.Logger.Error("[TP_SL_RESULT] timestamp=%s action=trading_stop success=false symbol=%s side=%s qty=%.8f finalTP=%.8f finalSL=%.8f httpStatus=%d retCode=%d retMsg=%q response=%s requestPayload=%s",
+			time.Now().UTC().Format(time.RFC3339Nano), symbol, side, qty, tp, sl, resp.StatusCode, r.RetCode, r.RetMsg, string(reply), string(raw))
 		pm.Logger.Error("Error in TP/SL update response: %d: %s", r.RetCode, r.RetMsg)
 		return fmt.Errorf("error updating TP/SL: %d: %s", r.RetCode, r.RetMsg)
 	}
 
+	pm.Logger.Info("[TP_SL_RESULT] timestamp=%s action=trading_stop success=true symbol=%s side=%s qty=%.8f finalTP=%.8f finalSL=%.8f httpStatus=%d retCode=%d retMsg=%q response=%s requestPayload=%s",
+		time.Now().UTC().Format(time.RFC3339Nano), symbol, side, qty, tp, sl, resp.StatusCode, r.RetCode, r.RetMsg, string(reply), string(raw))
 	return nil
 }
 

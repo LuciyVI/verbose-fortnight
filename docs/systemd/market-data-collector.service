@@ -1,0 +1,17 @@
+[Unit]
+Description=verbose-fortnight market data collector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nix
+WorkingDirectory=/home/nix/verbose-fortnight
+ExecStart=/usr/bin/env go run ./cmd/market-data-collector --source bybit --symbols BTCUSDT,ETHUSDT,SOLUSDT --snapshot-interval 1s --out-root artifacts/marketdata --index artifacts/marketdata/index.sqlite --compress=true --depth 5
+Restart=always
+RestartSec=5s
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+
+[Install]
+WantedBy=multi-user.target

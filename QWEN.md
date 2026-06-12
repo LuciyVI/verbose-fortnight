@@ -57,7 +57,7 @@ The application is organized into multiple packages with specific responsibiliti
 
 ### Core Features
 1. **WebSocket Integration**: Connects to both public (kline/orderbook) and private (position/wallet) streams
-2. **Signal Generation**: Uses SMA, MACD, and other indicators to generate trading signals
+2. **Signal Generation**: Builds indicator snapshots, scores SMA/MACD/Bollinger and optional RSI factors, then applies explicit filters
 3. **Position Management**: Opens, closes, and adjusts positions automatically
 4. **Take Profit/Stop Loss**: Implements dynamic TP/SL with multiple calculation methods (BB, ATR, volume-based)
 5. **Market Regime Detection**: Adapts strategy based on whether market is trending or range-bound
@@ -74,9 +74,9 @@ The application is organized into multiple packages with specific responsibiliti
 - `calcTakeProfitBB()`: Calculate TP based on Bollinger Bands
 - `calcTakeProfitVolume()`: Calculate TP based on volume/liquidity walls
 - `hasOpenPosition()`: Check for existing positions
-- `smaWorker()`: Runs SMA-based signal generation in a goroutine
-- `trader()`: Executes trades based on signals
-- `isGoldenCross()`: Checks for MACD golden cross signal
+- `SMAMovingAverageWorker()`: Runs snapshot -> score -> filter -> emit signal generation in a goroutine
+- `Trader()`: Applies runtime filters and executes accepted signals
+- `ScoreSignal()` / `FilterSignal()` / `EmitSignal()`: Separate scoring, hard filtering, and signal emission
 
 ### Indicators Implemented
 - SMA (Simple Moving Average)

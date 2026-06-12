@@ -68,10 +68,10 @@ func (om *OrderManager) PlaceOrderMarket(side string, qty float64, reduceOnly bo
 
 	raw, _ := json.Marshal(body)
 	ts := fmt.Sprintf("%d", time.Now().UnixMilli())
-	
+
 	// Log outgoing request
 	om.Logger.Info("Sending POST request to exchange: %s, Body: %s", path, string(raw))
-	
+
 	req, _ := http.NewRequest("POST", om.Config.DemoRESTHost+path, bytes.NewReader(raw))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-BAPI-API-KEY", om.Config.APIKey)
@@ -79,16 +79,16 @@ func (om *OrderManager) PlaceOrderMarket(side string, qty float64, reduceOnly bo
 	req.Header.Set("X-BAPI-RECV-WINDOW", om.Config.RecvWindow)
 	req.Header.Set("X-BAPI-SIGN-TYPE", "2")
 	req.Header.Set("X-BAPI-SIGN", om.APIClient.SignREST(om.Config.APISecret, ts, om.Config.APIKey, om.Config.RecvWindow, string(raw)))
-	
+
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		om.Logger.Error("Failed to send POST request to exchange: %v", err)
 		return err
 	}
 	defer resp.Body.Close()
-	
+
 	reply, _ := io.ReadAll(resp.Body)
-	
+
 	// Log incoming response
 	om.Logger.Info("Received response from exchange for %s: Status %d, Body: %s", path, resp.StatusCode, string(reply))
 
@@ -121,10 +121,10 @@ func (om *OrderManager) PlaceTakeProfitOrder(side string, qty, price float64) er
 
 	raw, _ := json.Marshal(body)
 	ts := fmt.Sprintf("%d", time.Now().UnixMilli())
-	
+
 	// Log outgoing request
 	om.Logger.Info("Sending POST request to exchange: %s, Body: %s", path, string(raw))
-	
+
 	req, _ := http.NewRequest("POST", om.Config.DemoRESTHost+path, bytes.NewReader(raw))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-BAPI-API-KEY", om.Config.APIKey)
@@ -139,9 +139,9 @@ func (om *OrderManager) PlaceTakeProfitOrder(side string, qty, price float64) er
 		return err
 	}
 	defer resp.Body.Close()
-	
+
 	reply, _ := io.ReadAll(resp.Body)
-	
+
 	// Log incoming response
 	om.Logger.Info("Received response from exchange for %s: Status %d, Body: %s", path, resp.StatusCode, string(reply))
 
@@ -166,10 +166,10 @@ func (om *OrderManager) PlaceStopLossOrder(side string, qty, price float64) erro
 
 	raw, _ := json.Marshal(body)
 	ts := fmt.Sprintf("%d", time.Now().UnixMilli())
-	
+
 	// Log outgoing request
 	om.Logger.Info("Sending POST request to exchange: %s, Body: %s", path, string(raw))
-	
+
 	req, _ := http.NewRequest("POST", om.Config.DemoRESTHost+path, bytes.NewReader(raw))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-BAPI-API-KEY", om.Config.APIKey)
@@ -184,9 +184,9 @@ func (om *OrderManager) PlaceStopLossOrder(side string, qty, price float64) erro
 		return err
 	}
 	defer resp.Body.Close()
-	
+
 	reply, _ := io.ReadAll(resp.Body)
-	
+
 	// Log incoming response
 	om.Logger.Info("Received response from exchange for %s: Status %d, Body: %s", path, resp.StatusCode, string(reply))
 
@@ -211,10 +211,10 @@ func (om *OrderManager) PlaceStopLoss(side string, qty, price float64) error {
 
 	raw, _ := json.Marshal(body)
 	ts := fmt.Sprintf("%d", time.Now().UnixMilli())
-	
+
 	// Log outgoing request
 	om.Logger.Info("Sending POST request to exchange: %s, Body: %s", path, string(raw))
-	
+
 	req, _ := http.NewRequest("POST", om.Config.DemoRESTHost+path, bytes.NewReader(raw))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-BAPI-API-KEY", om.Config.APIKey)
@@ -229,9 +229,9 @@ func (om *OrderManager) PlaceStopLoss(side string, qty, price float64) error {
 		return err
 	}
 	defer resp.Body.Close()
-	
+
 	reply, _ := io.ReadAll(resp.Body)
-	
+
 	// Log incoming response
 	om.Logger.Info("Received response from exchange for %s: Status %d, Body: %s", path, resp.StatusCode, string(reply))
 
@@ -241,7 +241,8 @@ func (om *OrderManager) PlaceStopLoss(side string, qty, price float64) error {
 
 // CalculateTakeProfitATR calculates take profit based on ATR
 func (om *OrderManager) CalculateTakeProfitATR(side string) float64 {
-	atr := indicators.CalculateATR(om.State.Highs, om.State.Lows, om.State.Closes, 14)
+	ohlcvSnapshot := om.State.GetOhlcvSnapshot()
+	atr := indicators.CalculateATR(ohlcvSnapshot.Highs, ohlcvSnapshot.Lows, ohlcvSnapshot.Closes, 14)
 	if atr == 0 {
 		atr = 90 // Default value
 	}
@@ -267,15 +268,16 @@ func (om *OrderManager) CalculateTakeProfitATR(side string) float64 {
 
 // CalculateTakeProfitBB calculates take profit based on Bollinger Bands
 func (om *OrderManager) CalculateTakeProfitBB(side string) float64 {
-	if len(om.State.Closes) < om.Config.WindowSize {
-		om.Logger.Debug("Not enough closes for BB calculation: need %d, have %d", om.Config.WindowSize, len(om.State.Closes))
+	ohlcvSnapshot := om.State.GetOhlcvSnapshot()
+	if len(ohlcvSnapshot.Closes) < om.Config.WindowSize {
+		om.Logger.Debug("Not enough closes for BB calculation: need %d, have %d", om.Config.WindowSize, len(ohlcvSnapshot.Closes))
 		return 0
 	}
 
-	smaVal := indicators.SMA(om.State.Closes)
-	stdVal := indicators.StdDev(om.State.Closes)
+	smaVal := indicators.SMA(ohlcvSnapshot.Closes)
+	stdVal := indicators.StdDev(ohlcvSnapshot.Closes)
 	om.Logger.Debug("BB calculation - SMA: %.2f, StdDev: %.4f", smaVal, stdVal)
-	
+
 	var tp float64
 	if side == "LONG" {
 		tp = smaVal + om.Config.BbMult*stdVal
@@ -284,7 +286,7 @@ func (om *OrderManager) CalculateTakeProfitBB(side string) float64 {
 		tp = smaVal - om.Config.BbMult*stdVal
 		om.Logger.Debug("BB TP calculation for SHORT: %.2f - %.2f*%.4f = %.2f", smaVal, om.Config.BbMult, stdVal, tp)
 	}
-	
+
 	if om.State.Instr.TickSize > 0 {
 		tp = math.Round(tp/om.State.Instr.TickSize) * om.State.Instr.TickSize
 		om.Logger.Debug("Rounded TP to tick size: %.2f", tp)
@@ -296,7 +298,7 @@ func (om *OrderManager) CalculateTakeProfitBB(side string) float64 {
 func (om *OrderManager) CalculateTakeProfitVolume(side string, thresholdQty float64) float64 {
 	om.State.ObLock.Lock()
 	defer om.State.ObLock.Unlock()
-	
+
 	var arr []struct{ p, sz float64 }
 
 	if side == "LONG" && len(om.State.AsksMap) > 0 {
@@ -387,7 +389,7 @@ func (om *OrderManager) CalculateTakeProfitVoting(side string) float64 {
 func (om *OrderManager) getLastAskPrice() float64 {
 	om.State.ObLock.Lock()
 	defer om.State.ObLock.Unlock()
-	
+
 	var max float64
 	for ps := range om.State.AsksMap {
 		p, _ := strconv.ParseFloat(ps, 64)
@@ -402,7 +404,7 @@ func (om *OrderManager) getLastAskPrice() float64 {
 func (om *OrderManager) getLastBidPrice() float64 {
 	om.State.ObLock.Lock()
 	defer om.State.ObLock.Unlock()
-	
+
 	var min float64
 	for ps := range om.State.BidsMap {
 		p, _ := strconv.ParseFloat(ps, 64)

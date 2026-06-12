@@ -21,7 +21,7 @@ func TestVolumeWeightedPrice(t *testing.T) {
 
 	// Test LONG side (asks) - looking for lowest price that meets threshold
 	price := VolumeWeightedPrice(orderbook, false, 900) // false = sell/ask (looking for lowest price first)
-	expected := 50000.0  // The first price level is 50000 with size 100, cumulative = 100 < 900
+	expected := 50000.0                                 // The first price level is 50000 with size 100, cumulative = 100 < 900
 	// Then 50100 with size 400, cumulative = 500 < 900
 	// Then 50200 with size 800, cumulative = 1300 >= 900, so it should return 50200
 	expected = 50200.0

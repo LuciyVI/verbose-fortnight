@@ -48,12 +48,12 @@ func (c *RESTClient) GetInstrumentInfo(symbol string) (models.InstrumentInfo, er
 	q.Set("category", "linear")
 	q.Set("symbol", symbol)
 	ts := fmt.Sprintf("%d", time.Now().UnixMilli())
-	
+
 	// Log outgoing request
 	if c.Logger != nil {
 		c.Logger.Info("Sending GET request to exchange: %s?%s", path, q.Encode())
 	}
-	
+
 	req, _ := http.NewRequest("GET", c.Config.DemoRESTHost+path+"?"+q.Encode(), nil)
 	req.Header.Set("X-BAPI-API-KEY", c.Config.APIKey)
 	req.Header.Set("X-BAPI-TIMESTAMP", ts)
@@ -70,7 +70,7 @@ func (c *RESTClient) GetInstrumentInfo(symbol string) (models.InstrumentInfo, er
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
-	
+
 	// Log incoming response
 	if c.Logger != nil {
 		c.Logger.Info("Received response from exchange for %s: Status %d, Body: %s", path, resp.StatusCode, string(body))
@@ -123,12 +123,12 @@ func (c *RESTClient) GetInstrumentInfo(symbol string) (models.InstrumentInfo, er
 func (c *RESTClient) GetBalance(coin string) (float64, error) {
 	q := "accountType=" + c.Config.AccountType + "&coin=" + coin
 	ts := fmt.Sprintf("%d", time.Now().UnixMilli())
-	
+
 	// Log outgoing request
 	if c.Logger != nil {
 		c.Logger.Info("Sending GET request to exchange: /v5/account/wallet-balance?%s", q)
 	}
-	
+
 	req, _ := http.NewRequest("GET", c.Config.DemoRESTHost+"/v5/account/wallet-balance?"+q, nil)
 	req.Header.Set("X-BAPI-API-KEY", c.Config.APIKey)
 	req.Header.Set("X-BAPI-TIMESTAMP", ts)
@@ -145,7 +145,7 @@ func (c *RESTClient) GetBalance(coin string) (float64, error) {
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
-	
+
 	// Log incoming response
 	if c.Logger != nil {
 		c.Logger.Info("Received response from exchange for /v5/account/wallet-balance: Status %d, Body: %s", resp.StatusCode, string(body))
@@ -187,12 +187,15 @@ func (c *RESTClient) UpdatePositionTradingStop(symbol string, side string, takeP
 
 	raw, _ := json.Marshal(body)
 	ts := fmt.Sprintf("%d", time.Now().UnixMilli())
-	
+	logTS := time.Now().UTC().Format(time.RFC3339Nano)
+
 	// Log outgoing request
 	if c.Logger != nil {
+		c.Logger.Info("[TP_SL_SEND] timestamp=%s action=trading_stop_api symbol=%s side=%s finalTP=%.8f finalSL=%.8f formattedTP=%v formattedSL=%v positionIdx=%d tpslMode=%s triggerBy=%s requestPayload=%s",
+			logTS, symbol, side, takeProfit, stopLoss, body["takeProfit"], body["stopLoss"], body["positionIdx"], "not_set", "exchange_default", string(raw))
 		c.Logger.Info("Sending POST request to exchange: %s, Body: %s", path, string(raw))
 	}
-	
+
 	req, _ := http.NewRequest("POST", c.Config.DemoRESTHost+path, bytes.NewReader(raw))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-BAPI-API-KEY", c.Config.APIKey)
@@ -203,13 +206,15 @@ func (c *RESTClient) UpdatePositionTradingStop(symbol string, side string, takeP
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		if c.Logger != nil {
+			c.Logger.Error("[TP_SL_RESULT] timestamp=%s action=trading_stop_api success=false symbol=%s side=%s finalTP=%.8f finalSL=%.8f err=%q requestPayload=%s",
+				time.Now().UTC().Format(time.RFC3339Nano), symbol, side, takeProfit, stopLoss, err.Error(), string(raw))
 			c.Logger.Error("Failed to send POST request to exchange: %v", err)
 		}
 		return err
 	}
 	defer resp.Body.Close()
 	reply, _ := io.ReadAll(resp.Body)
-	
+
 	// Log incoming response
 	if c.Logger != nil {
 		c.Logger.Info("Received response from exchange for %s: Status %d, Body: %s", path, resp.StatusCode, string(reply))
@@ -221,9 +226,15 @@ func (c *RESTClient) UpdatePositionTradingStop(symbol string, side string, takeP
 	}
 	if json.Unmarshal(reply, &r) != nil || r.RetCode != 0 {
 		if c.Logger != nil {
+			c.Logger.Error("[TP_SL_RESULT] timestamp=%s action=trading_stop_api success=false symbol=%s side=%s finalTP=%.8f finalSL=%.8f httpStatus=%d retCode=%d retMsg=%q response=%s requestPayload=%s",
+				time.Now().UTC().Format(time.RFC3339Nano), symbol, side, takeProfit, stopLoss, resp.StatusCode, r.RetCode, r.RetMsg, string(reply), string(raw))
 			c.Logger.Error("Error in TP/SL update response: %d: %s", r.RetCode, r.RetMsg)
 		}
 		return fmt.Errorf("error updating TP/SL: %d: %s", r.RetCode, r.RetMsg)
+	}
+	if c.Logger != nil {
+		c.Logger.Info("[TP_SL_RESULT] timestamp=%s action=trading_stop_api success=true symbol=%s side=%s finalTP=%.8f finalSL=%.8f httpStatus=%d retCode=%d retMsg=%q response=%s requestPayload=%s",
+			time.Now().UTC().Format(time.RFC3339Nano), symbol, side, takeProfit, stopLoss, resp.StatusCode, r.RetCode, r.RetMsg, string(reply), string(raw))
 	}
 	return nil
 }
@@ -263,7 +274,7 @@ func (c *RESTClient) GetPositionList(symbol string) ([]struct {
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
-	
+
 	// Log incoming response
 	if c.Logger != nil {
 		c.Logger.Info("Received response from exchange for %s: Status %d, Body: %s", path, resp.StatusCode, string(body))
@@ -273,8 +284,8 @@ func (c *RESTClient) GetPositionList(symbol string) ([]struct {
 		RetCode int `json:"retCode"`
 		Result  struct {
 			List []struct {
-				Side     string `json:"side"`
-				Size     string `json:"size"`
+				Side       string `json:"side"`
+				Size       string `json:"size"`
 				TakeProfit string `json:"takeProfit"`
 				StopLoss   string `json:"stopLoss"`
 				AvgPrice   string `json:"avgPrice"`
