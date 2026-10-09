@@ -7,26 +7,31 @@ import (
 
 // Config holds application configuration
 type Config struct {
-	APIKey           string
-	APISecret        string
-	DemoRESTHost     string
-	DemoWSPrivateURL string
-	DemoWSPublicURL  string
-	PongWait         int64
-	PingPeriod       int64
-	RecvWindow       string
-	AccountType      string
-	Symbol           string
-	Interval         string
-	WindowSize       int
-	BbMult           float64
-	ContractSize     float64
-	OrderBalancePct  float64 // 0 uses minimum order size
-	ObDepth          int
-	TpThresholdQty   float64
-	TpOffset         float64
-	SlThresholdQty   float64
-	SmaLen           int
+	APIKey                    string
+	APISecret                 string
+	DemoRESTHost              string
+	DemoWSPrivateURL          string
+	DemoWSPublicURL           string
+	PongWait                  int64
+	PingPeriod                int64
+	RecvWindow                string
+	RESTTimeoutMs             int
+	RESTMaxResponseBytes      int64
+	OrderReconcileTimeoutMs   int
+	OperationStatePath        string
+	StartupReconcileTimeoutMs int
+	AccountType               string
+	Symbol                    string
+	Interval                  string
+	WindowSize                int
+	BbMult                    float64
+	ContractSize              float64
+	OrderBalancePct           float64 // 0 uses minimum order size
+	ObDepth                   int
+	TpThresholdQty            float64
+	TpOffset                  float64
+	SlThresholdQty            float64
+	SmaLen                    int
 	// Adaptive thresholds
 	AtrDeadbandMult    float64
 	RSILow             float64
@@ -122,16 +127,21 @@ func LoadConfig() *Config {
 		DemoRESTHost:     getEnv("BYBIT_DEMO_REST_HOST", "https://api-demo.bybit.com"),
 		DemoWSPrivateURL: getEnv("BYBIT_DEMO_WS_PRIVATE", "wss://stream-demo.bybit.com/v5/private"),
 		// Use demo public stream by default to keep REST/WS environments consistent
-		DemoWSPublicURL: getEnv("BYBIT_DEMO_WS_PUBLIC", "wss://stream-demo.bybit.com/v5/public/linear"),
-		PongWait:        70,
-		PingPeriod:      30,
-		RecvWindow:      "5000",
-		AccountType:     "UNIFIED",
-		Symbol:          "BTCUSDT",
-		Interval:        "1",
-		WindowSize:      20,
-		BbMult:          2.0,
-		ContractSize:    0.001,
+		DemoWSPublicURL:           getEnv("BYBIT_DEMO_WS_PUBLIC", "wss://stream-demo.bybit.com/v5/public/linear"),
+		PongWait:                  70,
+		PingPeriod:                30,
+		RecvWindow:                "5000",
+		RESTTimeoutMs:             getEnvAsInt("REST_TIMEOUT_MS", 5000),
+		RESTMaxResponseBytes:      int64(getEnvAsInt("REST_MAX_RESPONSE_BYTES", 1048576)),
+		OrderReconcileTimeoutMs:   getEnvAsInt("ORDER_RECONCILE_TIMEOUT_MS", 3000),
+		OperationStatePath:        getEnv("OPERATION_STATE_PATH", "state/operations.json"),
+		StartupReconcileTimeoutMs: getEnvAsInt("STARTUP_RECONCILE_TIMEOUT_MS", 30000),
+		AccountType:               "UNIFIED",
+		Symbol:                    "BTCUSDT",
+		Interval:                  "1",
+		WindowSize:                20,
+		BbMult:                    2.0,
+		ContractSize:              0.001,
 		// OrderBalancePct is a balance fraction: 1.0 = 100% of balance.
 		OrderBalancePct: getEnvAsFloat("ORDER_BALANCE_PCT", 1.0),
 		ObDepth:         50,

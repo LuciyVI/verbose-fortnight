@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"verbose-fortnight/config"
+	"verbose-fortnight/internal/operations"
 	"verbose-fortnight/logging"
 	"verbose-fortnight/models"
 )
@@ -68,6 +69,10 @@ type statusResponse struct {
 	Health              models.RuntimeHealth      `json:"health"`
 	Features            models.RuntimeFeatures    `json:"features"`
 	BuildInfo           map[string]any            `json:"buildInfo"`
+	PendingOrders       []models.PendingOrder     `json:"pendingOrders,omitempty"`
+	Recovery            *operations.Diagnostic    `json:"recovery,omitempty"`
+	TradingBlocked      bool                      `json:"tradingBlocked"`
+	BlockMessage        string                    `json:"blockMessage,omitempty"`
 }
 
 type configResponse struct {
@@ -121,6 +126,27 @@ func buildStatusResponse(cfg *config.Config, state *models.State) statusResponse
 		Health:              health,
 		Features:            features,
 		BuildInfo:           currentBuildInfoMap(),
+		PendingOrders:       state.PendingOrdersSnapshot(),
+	}
+	state.RLock()
+	store, required, recoveryError := state.OperationStore, state.RecoveryRequired, state.RecoveryError
+	resp.TradingBlocked, resp.BlockMessage = state.TradingBlocked, state.BlockMessage
+	state.RUnlock()
+	if store != nil {
+		d := store.Diagnostic()
+		if required && recoveryError != "" {
+			d.Error = recoveryError
+			d.Ready = false
+		}
+		resp.Recovery = &d
+		if !d.Ready {
+			resp.TradingBlocked = true
+			resp.BlockMessage = d.Error
+		}
+	} else if required {
+		resp.Recovery = &operations.Diagnostic{Path: cfg.OperationStatePath, Error: recoveryError}
+		resp.TradingBlocked = true
+		resp.BlockMessage = recoveryError
 	}
 	return resp
 }

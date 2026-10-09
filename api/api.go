@@ -1,35 +1,42 @@
 package api
 
 import (
-	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
-	"time"
 
 	"verbose-fortnight/config"
+	"verbose-fortnight/internal/operations"
+	"verbose-fortnight/internal/prices"
 	"verbose-fortnight/logging"
 	"verbose-fortnight/models"
 )
 
 // RESTClient provides methods to interact with Bybit REST API
 type RESTClient struct {
-	Config *config.Config
-	Logger logging.LoggerInterface
+	Config         *config.Config
+	Logger         logging.LoggerInterface
+	HTTPClient     *http.Client
+	Context        context.Context
+	Operations     *operations.Store
+	OperationOwner func() operations.Owner
 }
 
 // NewRESTClient creates a new REST API client
 func NewRESTClient(cfg *config.Config, logger logging.LoggerInterface) *RESTClient {
 	return &RESTClient{
-		Config: cfg,
-		Logger: logger,
+		Config:     cfg,
+		Logger:     logger,
+		HTTPClient: &http.Client{Timeout: requestTimeout(cfg)},
+		Context:    context.Background(),
 	}
 }
 
@@ -47,33 +54,15 @@ func (c *RESTClient) GetInstrumentInfo(symbol string) (models.InstrumentInfo, er
 	q := url.Values{}
 	q.Set("category", "linear")
 	q.Set("symbol", symbol)
-	ts := fmt.Sprintf("%d", time.Now().UnixMilli())
 
 	// Log outgoing request
 	if c.Logger != nil {
 		c.Logger.Info("Sending GET request to exchange: %s?%s", path, q.Encode())
 	}
 
-	req, _ := http.NewRequest("GET", c.Config.DemoRESTHost+path+"?"+q.Encode(), nil)
-	req.Header.Set("X-BAPI-API-KEY", c.Config.APIKey)
-	req.Header.Set("X-BAPI-TIMESTAMP", ts)
-	req.Header.Set("X-BAPI-RECV-WINDOW", c.Config.RecvWindow)
-	req.Header.Set("X-BAPI-SIGN-TYPE", "2")
-	req.Header.Set("X-BAPI-SIGN", c.SignREST(c.Config.APISecret, ts, c.Config.APIKey, c.Config.RecvWindow, q.Encode()))
-
-	resp, err := http.DefaultClient.Do(req)
+	body, err := c.DoJSON(c.Context, "GET", path, q.Encode(), nil)
 	if err != nil {
-		if c.Logger != nil {
-			c.Logger.Error("Failed to send GET request to exchange: %v", err)
-		}
 		return models.InstrumentInfo{}, err
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-
-	// Log incoming response
-	if c.Logger != nil {
-		c.Logger.Info("Received response from exchange for %s: Status %d, Body: %s", path, resp.StatusCode, string(body))
 	}
 
 	var r struct {
@@ -100,55 +89,43 @@ func (c *RESTClient) GetInstrumentInfo(symbol string) (models.InstrumentInfo, er
 		return models.InstrumentInfo{}, fmt.Errorf("instrument info error %d: %s", r.RetCode, r.RetMsg)
 	}
 
-	parse := func(s string) float64 {
-		v, _ := strconv.ParseFloat(strings.TrimSpace(s), 64)
-		return v
-	}
-
 	it := r.Result.List[0]
-	tickSize := parse(it.PriceFilter.TickSize)
-	if tickSize <= 0 {
-		tickSize = 0.1
+	parse := func(name, raw string, positive bool) (float64, error) {
+		v, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+		if err != nil || math.IsNaN(v) || math.IsInf(v, 0) || v < 0 || (positive && v == 0) {
+			return 0, fmt.Errorf("invalid instrument %s: %q", name, raw)
+		}
+		return v, nil
 	}
-
-	return models.InstrumentInfo{
-		MinNotional: parse(it.LotSizeFilter.MinNotionalValue),
-		MinQty:      parse(it.LotSizeFilter.MinOrderQty),
-		QtyStep:     parse(it.LotSizeFilter.QtyStep),
-		TickSize:    tickSize,
-	}, nil
+	var info models.InstrumentInfo
+	// err comes from the request above.
+	if info.QtyStep, err = parse("qtyStep", it.LotSizeFilter.QtyStep, true); err != nil {
+		return info, err
+	}
+	if info.MinQty, err = parse("minOrderQty", it.LotSizeFilter.MinOrderQty, true); err != nil {
+		return info, err
+	}
+	if info.MinNotional, err = parse("minNotionalValue", it.LotSizeFilter.MinNotionalValue, false); err != nil {
+		return info, err
+	}
+	if info.TickSize, err = parse("tickSize", it.PriceFilter.TickSize, true); err != nil {
+		return info, err
+	}
+	return info, nil
 }
 
 // GetBalance fetches wallet balance
 func (c *RESTClient) GetBalance(coin string) (float64, error) {
 	q := "accountType=" + c.Config.AccountType + "&coin=" + coin
-	ts := fmt.Sprintf("%d", time.Now().UnixMilli())
 
 	// Log outgoing request
 	if c.Logger != nil {
 		c.Logger.Info("Sending GET request to exchange: /v5/account/wallet-balance?%s", q)
 	}
 
-	req, _ := http.NewRequest("GET", c.Config.DemoRESTHost+"/v5/account/wallet-balance?"+q, nil)
-	req.Header.Set("X-BAPI-API-KEY", c.Config.APIKey)
-	req.Header.Set("X-BAPI-TIMESTAMP", ts)
-	req.Header.Set("X-BAPI-RECV-WINDOW", c.Config.RecvWindow)
-	req.Header.Set("X-BAPI-SIGN-TYPE", "2")
-	req.Header.Set("X-BAPI-SIGN", c.SignREST(c.Config.APISecret, ts, c.Config.APIKey, c.Config.RecvWindow, q))
-
-	resp, err := http.DefaultClient.Do(req)
+	body, err := c.DoJSON(c.Context, "GET", "/v5/account/wallet-balance", q, nil)
 	if err != nil {
-		if c.Logger != nil {
-			c.Logger.Error("Failed to send GET request to exchange: %v", err)
-		}
 		return 0, err
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-
-	// Log incoming response
-	if c.Logger != nil {
-		c.Logger.Info("Received response from exchange for /v5/account/wallet-balance: Status %d, Body: %s", resp.StatusCode, string(body))
 	}
 
 	var result struct {
@@ -167,138 +144,127 @@ func (c *RESTClient) GetBalance(coin string) (float64, error) {
 		}
 		return 0, fmt.Errorf("wallet error %d: %s", result.RetCode, result.RetMsg)
 	}
-	return strconv.ParseFloat(result.Result.List[0].TotalAvailableBalance, 64)
+	balance, err := strconv.ParseFloat(result.Result.List[0].TotalAvailableBalance, 64)
+	if err != nil || balance < 0 || math.IsNaN(balance) || math.IsInf(balance, 0) {
+		return 0, fmt.Errorf("invalid wallet balance")
+	}
+	return balance, nil
 }
 
 // UpdatePositionTradingStop updates take profit and stop loss
 func (c *RESTClient) UpdatePositionTradingStop(symbol string, side string, takeProfit, stopLoss float64) error {
-	const path = "/v5/position/trading-stop"
-	body := map[string]interface{}{
-		"category":    "linear",
-		"symbol":      symbol,
-		"positionIdx": 0,
+	if prices.NormalizeSide(side) == "" || takeProfit < 0 || stopLoss < 0 || (takeProfit == 0 && stopLoss == 0) {
+		return fmt.Errorf("invalid stop side or levels")
 	}
-	if takeProfit > 0 {
-		body["takeProfit"] = fmt.Sprintf("%.2f", takeProfit)
-	}
-	if stopLoss > 0 {
-		body["stopLoss"] = fmt.Sprintf("%.2f", stopLoss)
-	}
-
-	raw, _ := json.Marshal(body)
-	ts := fmt.Sprintf("%d", time.Now().UnixMilli())
-
-	// Log outgoing request
-	if c.Logger != nil {
-		c.Logger.Info("Sending POST request to exchange: %s, Body: %s", path, string(raw))
-	}
-
-	req, _ := http.NewRequest("POST", c.Config.DemoRESTHost+path, bytes.NewReader(raw))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-BAPI-API-KEY", c.Config.APIKey)
-	req.Header.Set("X-BAPI-TIMESTAMP", ts)
-	req.Header.Set("X-BAPI-RECV-WINDOW", c.Config.RecvWindow)
-	req.Header.Set("X-BAPI-SIGN-TYPE", "2")
-	req.Header.Set("X-BAPI-SIGN", c.SignREST(c.Config.APISecret, ts, c.Config.APIKey, c.Config.RecvWindow, string(raw)))
-	resp, err := http.DefaultClient.Do(req)
+	instr, err := c.GetInstrumentInfo(symbol)
 	if err != nil {
-		if c.Logger != nil {
-			c.Logger.Error("Failed to send POST request to exchange: %v", err)
-		}
 		return err
 	}
-	defer resp.Body.Close()
-	reply, _ := io.ReadAll(resp.Body)
-
-	// Log incoming response
-	if c.Logger != nil {
-		c.Logger.Info("Received response from exchange for %s: Status %d, Body: %s", path, resp.StatusCode, string(reply))
+	row, err := c.ObservePosition(c.Context, symbol, 0, side)
+	if err != nil {
+		return err
 	}
-
-	var r struct {
-		RetCode int    `json:"retCode"`
-		RetMsg  string `json:"retMsg"`
+	entry, err := strconv.ParseFloat(row.AvgPrice, 64)
+	if err != nil {
+		return err
 	}
-	if json.Unmarshal(reply, &r) != nil {
-		if c.Logger != nil {
-			c.Logger.Error("Error decoding TP/SL update response")
+	body := map[string]any{"category": "linear", "symbol": row.Symbol, "positionIdx": row.PositionIdx, "tpslMode": "Full"}
+	if takeProfit != 0 && stopLoss != 0 {
+		levels, err := prices.Stops(side, entry, takeProfit, stopLoss, instr.TickSize, false)
+		if err != nil {
+			return err
 		}
-		return fmt.Errorf("error updating TP/SL: decode failed")
-	}
-	if r.RetCode == 34040 {
-		if c.Logger != nil {
-			c.Logger.Info("TP/SL update noop (retCode=34040): %s", r.RetMsg)
+		body["takeProfit"], body["stopLoss"] = levels.TPText, levels.SLText
+	} else {
+		value, tp := stopLoss, false
+		if takeProfit != 0 {
+			value, tp = takeProfit, true
 		}
-		return nil
-	}
-	if r.RetCode != 0 {
-		if c.Logger != nil {
-			c.Logger.Error("Error in TP/SL update response: %d: %s", r.RetCode, r.RetMsg)
+		text, _, err := prices.OneStop(side, entry, value, instr.TickSize, tp, false)
+		if err != nil {
+			return err
 		}
-		return fmt.Errorf("error updating TP/SL: %d: %s", r.RetCode, r.RetMsg)
+		if tp {
+			body["takeProfit"] = text
+		} else {
+			body["stopLoss"] = text
+		}
 	}
-	return nil
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	_, err = c.DoJSON(c.Context, "POST", "/v5/position/trading-stop", "", raw)
+	return err
 }
 
-// GetPositionList fetches the current position list
-func (c *RESTClient) GetPositionList(symbol string) ([]struct {
-	Side       string `json:"side"`
-	Size       string `json:"size"`
-	TakeProfit string `json:"takeProfit"`
-	StopLoss   string `json:"stopLoss"`
-	AvgPrice   string `json:"avgPrice"`
-}, error) {
+type Position struct {
+	Symbol      string `json:"symbol"`
+	PositionIdx int    `json:"positionIdx"`
+	Side        string `json:"side"`
+	Size        string `json:"size"`
+	TakeProfit  string `json:"takeProfit"`
+	StopLoss    string `json:"stopLoss"`
+	AvgPrice    string `json:"avgPrice"`
+}
+
+func (c *RESTClient) GetPositionList(symbol string) ([]Position, error) {
+	return c.GetPositionListContext(c.Context, symbol)
+}
+
+func (c *RESTClient) GetPositionListContext(ctx context.Context, symbol string) ([]Position, error) {
 	const path = "/v5/position/list"
 	q := url.Values{}
 	q.Set("category", "linear")
 	q.Set("symbol", symbol)
-	ts := fmt.Sprintf("%d", time.Now().UnixMilli())
 
 	// Log outgoing request
 	if c.Logger != nil {
 		c.Logger.Info("Sending GET request to exchange: %s?%s", path, q.Encode())
 	}
 
-	req, _ := http.NewRequest("GET", c.Config.DemoRESTHost+path+"?"+q.Encode(), nil)
-	req.Header.Set("X-BAPI-API-KEY", c.Config.APIKey)
-	req.Header.Set("X-BAPI-TIMESTAMP", ts)
-	req.Header.Set("X-BAPI-RECV-WINDOW", c.Config.RecvWindow)
-	req.Header.Set("X-BAPI-SIGN-TYPE", "2")
-	req.Header.Set("X-BAPI-SIGN", c.SignREST(c.Config.APISecret, ts, c.Config.APIKey, c.Config.RecvWindow, q.Encode()))
-
-	resp, err := http.DefaultClient.Do(req)
+	body, err := c.DoJSON(ctx, "GET", path, q.Encode(), nil)
 	if err != nil {
-		if c.Logger != nil {
-			c.Logger.Error("Failed to send GET request to exchange: %v", err)
-		}
 		return nil, err
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-
-	// Log incoming response
-	if c.Logger != nil {
-		c.Logger.Info("Received response from exchange for %s: Status %d, Body: %s", path, resp.StatusCode, string(body))
 	}
 
 	var r struct {
 		RetCode int `json:"retCode"`
 		Result  struct {
-			List []struct {
-				Side       string `json:"side"`
-				Size       string `json:"size"`
-				TakeProfit string `json:"takeProfit"`
-				StopLoss   string `json:"stopLoss"`
-				AvgPrice   string `json:"avgPrice"`
-			} `json:"list"`
+			List []Position `json:"list"`
 		} `json:"result"`
 	}
 
-	if json.Unmarshal(body, &r) != nil || r.RetCode != 0 {
+	if json.Unmarshal(body, &r) != nil || r.RetCode != 0 || r.Result.List == nil {
 		if c.Logger != nil {
 			c.Logger.Error("Error in position list response: %d", r.RetCode)
 		}
 		return nil, fmt.Errorf("error fetching position list: %d", r.RetCode)
+	}
+
+	for i := range r.Result.List {
+		p := &r.Result.List[i]
+		// The endpoint is queried with an exact symbol filter. Older adapters
+		// omit symbol and positionIdx=0; explicit mismatches must never be used.
+		if p.Symbol == "" {
+			p.Symbol = symbol
+		}
+		if p.Symbol != symbol || p.PositionIdx < 0 || p.PositionIdx > 2 {
+			return nil, fmt.Errorf("unexpected position target %s/%d", p.Symbol, p.PositionIdx)
+		}
+		size, err := strconv.ParseFloat(p.Size, 64)
+		if err != nil || math.IsNaN(size) || math.IsInf(size, 0) || size < 0 {
+			return nil, fmt.Errorf("invalid position size")
+		}
+		for name, raw := range map[string]string{"takeProfit": p.TakeProfit, "stopLoss": p.StopLoss, "avgPrice": p.AvgPrice} {
+			if raw == "" {
+				continue
+			}
+			value, err := strconv.ParseFloat(raw, 64)
+			if err != nil || value < 0 || math.IsNaN(value) || math.IsInf(value, 0) {
+				return nil, fmt.Errorf("invalid position %s", name)
+			}
+		}
 	}
 
 	return r.Result.List, nil
@@ -378,25 +344,15 @@ func (c *RESTClient) GetOpenOrders(symbol string) ([]OpenOrder, error) {
 	q := url.Values{}
 	q.Set("category", "linear")
 	q.Set("symbol", symbol)
-	ts := fmt.Sprintf("%d", time.Now().UnixMilli())
 
 	if c.Logger != nil {
 		c.Logger.Info("Sending GET request to exchange: %s?%s", path, q.Encode())
 	}
 
-	req, _ := http.NewRequest("GET", c.Config.DemoRESTHost+path+"?"+q.Encode(), nil)
-	req.Header.Set("X-BAPI-API-KEY", c.Config.APIKey)
-	req.Header.Set("X-BAPI-TIMESTAMP", ts)
-	req.Header.Set("X-BAPI-RECV-WINDOW", c.Config.RecvWindow)
-	req.Header.Set("X-BAPI-SIGN-TYPE", "2")
-	req.Header.Set("X-BAPI-SIGN", c.SignREST(c.Config.APISecret, ts, c.Config.APIKey, c.Config.RecvWindow, q.Encode()))
-
-	resp, err := http.DefaultClient.Do(req)
+	body, err := c.DoJSON(c.Context, "GET", path, q.Encode(), nil)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
 
 	var r struct {
 		RetCode int `json:"retCode"`
@@ -463,25 +419,15 @@ func (c *RESTClient) GetExecutionsPage(symbol, cursor string, limit int) ([]Exec
 	if strings.TrimSpace(cursor) != "" {
 		q.Set("cursor", strings.TrimSpace(cursor))
 	}
-	ts := fmt.Sprintf("%d", time.Now().UnixMilli())
 
 	if c.Logger != nil {
 		c.Logger.Info("Sending GET request to exchange: %s?%s", path, q.Encode())
 	}
 
-	req, _ := http.NewRequest("GET", c.Config.DemoRESTHost+path+"?"+q.Encode(), nil)
-	req.Header.Set("X-BAPI-API-KEY", c.Config.APIKey)
-	req.Header.Set("X-BAPI-TIMESTAMP", ts)
-	req.Header.Set("X-BAPI-RECV-WINDOW", c.Config.RecvWindow)
-	req.Header.Set("X-BAPI-SIGN-TYPE", "2")
-	req.Header.Set("X-BAPI-SIGN", c.SignREST(c.Config.APISecret, ts, c.Config.APIKey, c.Config.RecvWindow, q.Encode()))
-
-	resp, err := http.DefaultClient.Do(req)
+	body, err := c.DoJSON(c.Context, "GET", path, q.Encode(), nil)
 	if err != nil {
 		return nil, "", false, err
 	}
-	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
 
 	var r struct {
 		RetCode int `json:"retCode"`

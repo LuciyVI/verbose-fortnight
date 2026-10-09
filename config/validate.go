@@ -13,6 +13,13 @@ func Validate(cfg *Config) error {
 		return fmt.Errorf("config is nil")
 	}
 
+	if cfg.RESTTimeoutMs < 0 || cfg.RESTMaxResponseBytes < 0 || cfg.OrderReconcileTimeoutMs < 0 {
+		return fmt.Errorf("REST timeout, response limit and reconciliation timeout must be nonnegative (zero uses bounded defaults)")
+	}
+	if cfg.StartupReconcileTimeoutMs < 0 {
+		return fmt.Errorf("startup reconciliation timeout must be nonnegative")
+	}
+
 	var errs []string
 	addErr := func(format string, args ...interface{}) {
 		errs = append(errs, fmt.Sprintf(format, args...))

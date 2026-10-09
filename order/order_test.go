@@ -38,7 +38,7 @@ func TestPlaceOrderMarketPayload(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		gotBody = body
-		_, _ = w.Write([]byte(`{"retCode":0,"retMsg":"OK"}`))
+		_, _ = w.Write([]byte(`{"retCode":0,"retMsg":"OK","result":{"orderId":"test-order"}}`))
 	}))
 	defer srv.Close()
 

@@ -4,6 +4,7 @@ trading_bot*.log.gz
 report.csv
 go-trade
 go-trade.pid
+state/
 anal/
 docs/
 /PandL

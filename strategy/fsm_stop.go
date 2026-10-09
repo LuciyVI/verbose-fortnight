@@ -1,6 +1,7 @@
 package strategy
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"verbose-fortnight/internal/prices"
 	"verbose-fortnight/models"
 	"verbose-fortnight/pnl"
 )
@@ -69,6 +71,9 @@ func (t *Trader) transitionFSM(to models.PositionFSMState, trigger, tradeID stri
 	if from != to {
 		t.Logger.Info("FSM transition: from=%s to=%s trade_id=%s trigger=%s", from, to, tradeID, trigger)
 	}
+	if to == models.PositionStateClosing || to == models.PositionStateFlat {
+		t.State.CancelStopRequestLocked()
+	}
 	t.State.PositionState = to
 	switch to {
 	case models.PositionStateOpening:
@@ -77,7 +82,7 @@ func (t *Trader) transitionFSM(to models.PositionFSMState, trigger, tradeID stri
 	case models.PositionStateFlat:
 		t.State.OpeningExecAck = false
 		t.State.OpeningPosAck = false
-		t.State.ActiveTradeID = ""
+		t.State.SetActiveTradeLocked("")
 	}
 	return true
 }
@@ -95,6 +100,9 @@ func (t *Trader) forceFSM(to models.PositionFSMState, trigger, tradeID string) {
 	if from != to {
 		t.Logger.Warning("FSM force sync: from=%s to=%s trade_id=%s trigger=%s", from, to, tradeID, trigger)
 	}
+	if to == models.PositionStateClosing || to == models.PositionStateFlat {
+		t.State.CancelStopRequestLocked()
+	}
 	t.State.PositionState = to
 	switch to {
 	case models.PositionStateFlat:
@@ -102,7 +110,7 @@ func (t *Trader) forceFSM(to models.PositionFSMState, trigger, tradeID string) {
 		t.State.OrderQty = 0
 		t.State.OpeningExecAck = false
 		t.State.OpeningPosAck = false
-		t.State.ActiveTradeID = ""
+		t.State.SetActiveTradeLocked("")
 	case models.PositionStateOpen:
 		t.State.OpeningExecAck = true
 		t.State.OpeningPosAck = true
@@ -123,7 +131,7 @@ func (t *Trader) ActiveTradeID() string {
 func (t *Trader) setActiveTradeID(tradeID string) {
 	t.State.Lock()
 	defer t.State.Unlock()
-	t.State.ActiveTradeID = tradeID
+	t.State.SetActiveTradeLocked(tradeID)
 }
 
 func (t *Trader) bindOrderTradeID(orderID, tradeID string) {
@@ -210,7 +218,7 @@ func (t *Trader) resolveExecutionTradeIDLegacy(orderID, fallback string) string 
 	}
 
 	tradeID := newTradeID()
-	t.State.ActiveTradeID = tradeID
+	t.State.SetActiveTradeLocked(tradeID)
 	if fallback != "" {
 		if t.State.ExecTradeIDs == nil {
 			t.State.ExecTradeIDs = make(map[string]string)
@@ -260,6 +268,9 @@ func (t *Trader) SetTradingBlocked(reason models.TradingBlockReason, message str
 func (t *Trader) ClearTradingBlock(reason models.TradingBlockReason, trigger string) bool {
 	t.State.Lock()
 	defer t.State.Unlock()
+	if t.State.RecoveryRequired || (t.State.OperationStore != nil && t.State.OperationStore.CanTrade() != nil) || t.State.OrderReconciliationPending || len(t.State.PendingOrders) != 0 {
+		return false
+	}
 	if !t.State.TradingBlocked {
 		return true
 	}
@@ -281,6 +292,14 @@ func (t *Trader) ClearTradingBlockManual(trigger string) bool {
 func (t *Trader) isTradingBlocked() (bool, models.TradingBlockReason, string) {
 	t.State.RLock()
 	defer t.State.RUnlock()
+	if t.State.OperationStore != nil {
+		if err := t.State.OperationStore.CanTrade(); err != nil {
+			return true, models.BlockedReasonFatalAPI, err.Error()
+		}
+	}
+	if t.State.RecoveryRequired {
+		return true, models.BlockedReasonFatalAPI, t.State.RecoveryError
+	}
 	return t.State.TradingBlocked, t.State.BlockReason, t.State.BlockMessage
 }
 
@@ -318,8 +337,14 @@ func (t *Trader) syncFSMFromPositionSnapshot(exists bool, side string, size floa
 		t.State.PositionState = models.PositionStateFlat
 	}
 	prev := t.State.PositionState
+	if t.State.TradingBlocked && t.State.BlockReason == models.BlockedReasonFatalAPI {
+		return
+	}
 
 	if exists && size > 0 {
+		if t.State.ActiveTradeID == "" || (t.State.PosSide != "" && t.State.PosSide != side) {
+			t.State.SetActiveTradeLocked(newTradeID())
+		}
 		t.State.PosSide = side
 		t.State.OrderQty = size
 		switch t.State.PositionState {
@@ -342,7 +367,7 @@ func (t *Trader) syncFSMFromPositionSnapshot(exists bool, side string, size floa
 			t.State.PositionState = models.PositionStateFlat
 			t.State.OpeningExecAck = false
 			t.State.OpeningPosAck = false
-			t.State.ActiveTradeID = ""
+			t.State.SetActiveTradeLocked("")
 		}
 	}
 
@@ -352,71 +377,59 @@ func (t *Trader) syncFSMFromPositionSnapshot(exists bool, side string, size floa
 }
 
 func validateStopInvariants(side string, entry, tp, sl float64, breakeven bool) error {
-	if entry <= 0 {
-		return fmt.Errorf("invalid entry %.8f", entry)
-	}
-	if tp <= 0 || sl <= 0 {
-		return fmt.Errorf("tp/sl must be positive: tp=%.8f sl=%.8f", tp, sl)
-	}
-	switch side {
-	case "LONG":
-		if tp <= entry {
-			return fmt.Errorf("LONG invariant violated: tp(%.8f) <= entry(%.8f)", tp, entry)
-		}
-		if sl > entry && !breakeven {
-			return fmt.Errorf("LONG invariant violated: sl(%.8f) > entry(%.8f)", sl, entry)
-		}
-		if sl == entry && !breakeven {
-			return fmt.Errorf("LONG invariant violated: sl equals entry without breakeven")
-		}
-	case "SHORT":
-		if tp >= entry {
-			return fmt.Errorf("SHORT invariant violated: tp(%.8f) >= entry(%.8f)", tp, entry)
-		}
-		if sl < entry && !breakeven {
-			return fmt.Errorf("SHORT invariant violated: sl(%.8f) < entry(%.8f)", sl, entry)
-		}
-		if sl == entry && !breakeven {
-			return fmt.Errorf("SHORT invariant violated: sl equals entry without breakeven")
-		}
-	default:
-		return fmt.Errorf("unknown side %q", side)
-	}
-	return nil
+	return prices.ValidateStops(side, entry, tp, sl, breakeven)
 }
 
-func (t *Trader) enqueueStopIntent(intent models.StopIntent) {
-	if t.currentFSMState() == models.PositionStateClosing {
-		t.Logger.Warning("Stop intent ignored while CLOSING: trade_id=%s reason=%s", intent.TradeID, intent.Reason)
-		return
-	}
-	if intent.Side != "" {
-		intent.Side = t.PositionManager.NormalizeSide(intent.Side)
+// captureStopIntent runs at creation, before a delayed job can outlive its trade.
+func (t *Trader) captureStopIntent(intent models.StopIntent) models.StopIntent {
+	if intent.TradeID == "" && intent.LifecycleID != "" {
+		intent.TradeID = intent.LifecycleID
 	}
 	if intent.TradeID == "" {
 		intent.TradeID = t.activeTradeID()
 	}
-	if intent.TradeID == "" {
-		intent.TradeID = newTradeID()
-	}
-	if intent.LifecycleID == "" && t.Config != nil && t.Config.EnableLifecycleID {
+	if intent.LifecycleID == "" {
 		intent.LifecycleID = intent.TradeID
+	}
+	intent.Side = t.PositionManager.NormalizeSide(intent.Side)
+	return intent
+}
+func (t *Trader) enqueueStopIntent(intent models.StopIntent) {
+	t.deliverStopIntent(t.captureStopIntent(intent))
+}
+func (t *Trader) deliverStopIntent(intent models.StopIntent) {
+	if intent.TradeID == "" {
+		return
 	}
 	select {
 	case t.State.StopIntentChan <- intent:
 	default:
-		t.Logger.Error("Stop intent channel overflow: trade_id=%s reason=%s", intent.TradeID, intent.Reason)
 		t.SetTradingBlocked(models.BlockedReasonFatalAPI, "stop intent channel overflow")
 	}
 }
-
 func (t *Trader) enqueueDelayedStopIntent(intent models.StopIntent, delay time.Duration) {
+	intent = t.captureStopIntent(intent)
 	go func() {
-		if delay > 0 {
-			time.Sleep(delay)
+		ctx := context.Background()
+		if t.APIClient != nil && t.APIClient.Context != nil {
+			ctx = t.APIClient.Context
 		}
-		t.enqueueStopIntent(intent)
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			t.deliverStopIntent(intent)
+		case <-ctx.Done():
+		}
 	}()
+}
+
+// stopIntentCurrentLocked requires the state lock and rejects anonymous/stale jobs.
+func (t *Trader) stopIntentCurrentLocked(intent models.StopIntent) bool {
+	return !t.State.TradingBlocked && intent.TradeID != "" && t.State.ActiveTradeID == intent.TradeID &&
+		(intent.LifecycleID == "" || intent.LifecycleID == t.State.ActiveTradeID) &&
+		(t.State.PosSide == "" || t.PositionManager.NormalizeSide(t.State.PosSide) == t.PositionManager.NormalizeSide(intent.Side)) &&
+		(t.State.PositionState == models.PositionStateOpen || t.State.PositionState == models.PositionStateOpening)
 }
 
 func (t *Trader) stopsEqual(aTP, aSL, bTP, bSL float64) bool {
@@ -440,15 +453,31 @@ func (t *Trader) StartStopController() {
 			t.Logger.Warning("StopController dropped intent in CLOSING: trade_id=%s reason=%s", intent.TradeID, intent.Reason)
 			continue
 		}
+		t.State.RLock()
+		current := t.stopIntentCurrentLocked(intent)
+		t.State.RUnlock()
+		if !current {
+			continue
+		}
+		exists, posSide, _, _, _ := t.PositionManager.HasOpenPosition()
+		side := t.PositionManager.NormalizeSide(intent.Side)
+		if !exists || side == "" || t.PositionManager.NormalizeSide(posSide) != side {
+			continue
+		}
 		if strings.EqualFold(intent.Kind, "MoveSLToBE") {
 			t.Logger.Info("stop_intent move_sl_to_be trade_id=%s lifecycle_id=%s side=%s entry=%.2f sl=%.2f qty_left=%.4f fee_est=%.6f reason=%s",
 				intent.TradeID, intent.LifecycleID, intent.Side, intent.Entry, intent.SL, intent.QtyLeft, intent.FeeEstimate, intent.Reason)
 		}
 
-		side := t.PositionManager.NormalizeSide(intent.Side)
 		entry := intent.Entry
 		if entry <= 0 {
 			entry = t.PositionManager.GetLastEntryPrice()
+		}
+		t.State.RLock()
+		current = t.stopIntentCurrentLocked(intent)
+		t.State.RUnlock()
+		if !current {
+			continue
 		}
 		if err := validateStopInvariants(side, entry, intent.TP, intent.SL, intent.Breakeven); err != nil {
 			t.Logger.Error("TP/SL invariant violation: trade_id=%s side=%s entry=%.8f tp=%.8f sl=%.8f reason=%s err=%v",
@@ -457,15 +486,14 @@ func (t *Trader) StartStopController() {
 			continue
 		}
 
-		t.State.Lock()
-		ctrl := t.State.StopCtrl
-		ctrl.DesiredTP = intent.TP
-		ctrl.DesiredSL = intent.SL
-		ctrl.TradeID = intent.TradeID
-		ctrl.Reason = intent.Reason
-		ctrl.UpdatedAt = time.Now()
-		t.State.StopCtrl = ctrl
-		t.State.Unlock()
+		t.State.RLock()
+		tick := t.State.Instr.TickSize
+		t.State.RUnlock()
+		levels, quantizeErr := prices.Stops(side, entry, intent.TP, intent.SL, tick, intent.Breakeven)
+		if quantizeErr != nil {
+			t.Logger.Error("StopController rejected price payload: trade_id=%s err=%v", intent.TradeID, quantizeErr)
+			continue
+		}
 
 		t.logTradeEvent("tpsl_intent", tradeEventLog{
 			TradeID:        intent.TradeID,
@@ -483,35 +511,57 @@ func (t *Trader) StartStopController() {
 			MaxSLPct:       intent.MaxSLPct,
 		})
 
-		t.State.RLock()
-		appliedTP := t.State.StopCtrl.AppliedTP
-		appliedSL := t.State.StopCtrl.AppliedSL
-		t.State.RUnlock()
-
-		if t.stopsEqual(appliedTP, appliedSL, intent.TP, intent.SL) {
-			continue
-		}
-
-		exists, posSide, _, _, _ := t.PositionManager.HasOpenPosition()
-		posSide = t.PositionManager.NormalizeSide(posSide)
-		if !exists || posSide == "" {
-			t.Logger.Warning("StopController deferred update: no open position (trade_id=%s)", intent.TradeID)
-			continue
-		}
-		if posSide != side {
-			t.Logger.Warning("StopController deferred update: side mismatch intent=%s pos=%s trade_id=%s", side, posSide, intent.TradeID)
-			continue
-		}
-
-		if err := t.PositionManager.UpdatePositionTPSL(t.Config.Symbol, intent.TP, intent.SL); err != nil {
-			t.Logger.Error("StopController apply failed: trade_id=%s tp=%.8f sl=%.8f err=%v", intent.TradeID, intent.TP, intent.SL, err)
-			continue
-		}
-
 		t.State.Lock()
+		if !t.stopIntentCurrentLocked(intent) {
+			t.State.Unlock()
+			continue
+		}
+		ctrl := t.State.StopCtrl
+		if ctrl.AppliedTradeID == intent.TradeID && ctrl.AppliedTP == levels.TP && ctrl.AppliedSL == levels.SL {
+			t.State.Unlock()
+			continue
+		}
+		parent := context.Background()
+		if t.APIClient != nil && t.APIClient.Context != nil {
+			parent = t.APIClient.Context
+		}
+		ctx, cancel := context.WithCancel(parent)
+		t.State.StopRequestCancel = cancel
+		t.State.Unlock()
+
+		var err error
+		if pm, ok := t.PositionManager.(interface {
+			ApplyStopIntent(context.Context, string, models.StopIntent) (prices.StopLevels, error)
+		}); ok {
+			levels, err = pm.ApplyStopIntent(ctx, t.Config.Symbol, intent)
+		} else if pm, ok := t.PositionManager.(interface {
+			UpdatePositionTPSLContext(context.Context, string, float64, float64, string) error
+		}); ok {
+			err = pm.UpdatePositionTPSLContext(ctx, t.Config.Symbol, levels.TP, levels.SL, intent.TradeID)
+		} else {
+			err = t.PositionManager.UpdatePositionTPSL(t.Config.Symbol, levels.TP, levels.SL)
+		}
+
+		cancel()
+		t.State.Lock()
+		if !t.stopIntentCurrentLocked(intent) {
+			t.State.Unlock()
+			continue
+		}
+		t.State.StopRequestCancel = nil
+		if err != nil {
+			t.State.Unlock()
+			t.Logger.Error("StopController apply failed: trade_id=%s err=%v", intent.TradeID, err)
+			continue
+		}
 		ctrl = t.State.StopCtrl
-		ctrl.AppliedTP = intent.TP
-		ctrl.AppliedSL = intent.SL
+		ctrl.DesiredTP = levels.TP
+		ctrl.DesiredSL = levels.SL
+		ctrl.TradeID = intent.TradeID
+		ctrl.Reason = intent.Reason
+		ctrl.AppliedTP = levels.TP
+		ctrl.AppliedSL = levels.SL
+		ctrl.AppliedTradeID = intent.TradeID
 		ctrl.UpdatedAt = time.Now()
 		t.State.StopCtrl = ctrl
 		t.State.Unlock()
@@ -521,8 +571,8 @@ func (t *Trader) StartStopController() {
 			LifecycleID:    intent.LifecycleID,
 			Side:           side,
 			Entry:          entry,
-			TP:             intent.TP,
-			SL:             intent.SL,
+			TP:             levels.TP,
+			SL:             levels.SL,
 			SLPolicy:       intent.SLPolicy,
 			LastWinMovePct: intent.LastWinMovePct,
 			DesiredSLPct:   intent.DesiredSLPct,

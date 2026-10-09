@@ -137,6 +137,11 @@ func TestGetPositionList(t *testing.T) {
 func TestUpdatePositionTradingStop(t *testing.T) {
 	var gotBody []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v5/market/instruments-info" {
+			fmt.Fprint(w, `{"retCode":0,"result":{"list":[{"lotSizeFilter":{"qtyStep":"0.001","minOrderQty":"0.001","minNotionalValue":"0"},"priceFilter":{"tickSize":"0.01"}}]}}`)
+			return
+		}
+
 		if r.URL.Path == "/v5/position/list" {
 			_, _ = w.Write([]byte(`{"retCode":0,"result":{"list":[{"side":"Buy","size":"0.01","takeProfit":"","stopLoss":"","avgPrice":"100"}]}}`))
 			return
@@ -170,6 +175,15 @@ func TestUpdatePositionTradingStop(t *testing.T) {
 func TestUpdatePositionTradingStopNotModified34040(t *testing.T) {
 	stopCalls := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v5/market/instruments-info" {
+			fmt.Fprint(w, `{"retCode":0,"result":{"list":[{"lotSizeFilter":{"qtyStep":"0.001","minOrderQty":"0.001","minNotionalValue":"0"},"priceFilter":{"tickSize":"0.01"}}]}}`)
+			return
+		}
+		if r.URL.Path == "/v5/position/list" {
+			fmt.Fprint(w, `{"retCode":0,"result":{"list":[{"symbol":"BTCUSDT","positionIdx":0,"side":"Buy","size":"1","avgPrice":"100"}]}}`)
+			return
+		}
+
 		if r.URL.Path != "/v5/position/trading-stop" {
 			t.Fatalf("unexpected path: %s", r.URL.Path)
 		}

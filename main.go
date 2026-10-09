@@ -767,6 +767,9 @@ func applyPositionItem(state *models.State, item positionItem) {
 
 	if size > 0 {
 		state.Lock()
+		if state.PosSide != "" && state.PosSide != side {
+			state.SetActiveTradeLocked("")
+		}
 		state.PosSide = side
 		state.OrderQty = size
 		if state.PositionState == "" {
@@ -796,7 +799,7 @@ func applyPositionItem(state *models.State, item positionItem) {
 			state.PositionState = models.PositionStateFlat
 			state.OpeningExecAck = false
 			state.OpeningPosAck = false
-			state.ActiveTradeID = ""
+			state.SetActiveTradeLocked("")
 		}
 		state.Unlock()
 		logInfo("Position closed")
@@ -816,6 +819,18 @@ func parseFloat(raw string) float64 {
 
 func resyncPrivateState(apiClient *api.RESTClient, trader *strategy.Trader, state *models.State, symbol string) error {
 	logInfo("Private WS resync started")
+	if apiClient.Operations != nil {
+		observation, err := apiClient.ReconcileStartup(apiClient.Context)
+		if err != nil {
+			state.Lock()
+			state.RecoveryRequired = true
+			state.RecoveryError = err.Error()
+			state.Unlock()
+			return fmt.Errorf("durable resync: %w", err)
+		}
+		applyStartupRecovery(state, observation)
+	}
+	observedTradeID := trader.ActiveTradeID()
 
 	positions, err := apiClient.GetPositionList(symbol)
 	if err != nil {
@@ -825,10 +840,7 @@ func resyncPrivateState(apiClient *api.RESTClient, trader *strategy.Trader, stat
 	if err != nil {
 		return fmt.Errorf("resync getOpenOrders: %w", err)
 	}
-	tp, sl, err := apiClient.GetTradingStop(symbol)
-	if err != nil {
-		return fmt.Errorf("resync getTradingStop: %w", err)
-	}
+	tp, sl := 0.0, 0.0
 
 	side := ""
 	size := 0.0
@@ -850,6 +862,12 @@ func resyncPrivateState(apiClient *api.RESTClient, trader *strategy.Trader, stat
 		break
 	}
 
+	if trader.ActiveTradeID() != observedTradeID {
+		return fmt.Errorf("lifecycle changed during resync")
+	}
+	if size > 0 && observedTradeID == "" {
+		observedTradeID = trader.ResolveExecutionTradeID("", "resync-"+strconv.FormatInt(time.Now().UnixNano(), 10))
+	}
 	now := time.Now()
 	state.StatusLock.Lock()
 	state.LastPosition = models.PositionSnapshot{
@@ -862,29 +880,32 @@ func resyncPrivateState(apiClient *api.RESTClient, trader *strategy.Trader, stat
 	}
 	state.StatusLock.Unlock()
 
+	state.Lock()
+	if state.ActiveTradeID != observedTradeID {
+		state.Unlock()
+		return fmt.Errorf("lifecycle changed during resync")
+	}
 	if size > 0 {
-		state.Lock()
+		if state.PosSide != "" && state.PosSide != side {
+			state.SetActiveTradeLocked("")
+			state.Unlock()
+			return fmt.Errorf("position direction changed during resync; lifecycle invalidated")
+		}
 		state.PosSide = side
 		state.OrderQty = size
 		state.PositionState = models.PositionStateOpen
 		state.OpeningExecAck = true
 		state.OpeningPosAck = true
-		state.Unlock()
-		if trader.ActiveTradeID() == "" {
-			trader.ResolveExecutionTradeID("", "resync-"+strconv.FormatInt(now.UnixNano(), 10))
-		}
 	} else {
-		state.Lock()
 		state.PosSide = ""
 		state.OrderQty = 0
 		state.PositionState = models.PositionStateFlat
 		state.OpeningExecAck = false
 		state.OpeningPosAck = false
-		state.ActiveTradeID = ""
-		state.Unlock()
+		state.SetActiveTradeLocked("")
 	}
-
-	state.Lock()
+	state.StopCtrl.TradeID = state.ActiveTradeID
+	state.StopCtrl.AppliedTradeID = state.ActiveTradeID
 	state.StopCtrl.AppliedTP = tp
 	state.StopCtrl.AppliedSL = sl
 	state.StopCtrl.DesiredTP = tp
@@ -912,6 +933,7 @@ func main() {
 	daemonStop := flag.Bool("stop-daemon", false, "Stop the daemon process")
 	daemonRestart := flag.Bool("restart-daemon", false, "Restart the daemon process")
 	versionFlag := flag.Bool("version", false, "Print build/version info and exit")
+	reconcileOnly := flag.Bool("reconcile-only", false, "Reconcile durable operations and exchange state without starting trading")
 
 	debugLevel := flag.Int("debug", cfg.LogLevel, "set log level (0=DEBUG, 1=INFO, 2=WARNING, 3=ERROR)")
 	flag.Parse()
@@ -974,24 +996,29 @@ func main() {
 
 	// Initialize state early so status endpoint is available even when startup network checks fail.
 	state := &models.State{
-		Debug:           cfg.Debug,
-		DynamicTP:       cfg.DynamicTP,
-		SlPerc:          cfg.SlPerc,
-		TrailPerc:       cfg.TrailPerc,
-		SmaLen:          cfg.SmaLen,
-		PositionState:   models.PositionStateFlat,
-		BidsMap:         make(map[string]float64),
-		AsksMap:         make(map[string]float64),
-		TPChan:          make(chan models.TPJob, 8),
-		StopIntentChan:  make(chan models.StopIntent, 128),
-		SigChan:         make(chan models.Signal, 128),
-		MarketRegime:    "range", // default
-		RegimeCandidate: "range",
-		OrderTradeIDs:   make(map[string]string),
-		ExecTradeIDs:    make(map[string]string),
-		ProcessedExec:   make(map[string]time.Time),
-		ExecDedupMax:    5000,
-		ExecDedupTTL:    24 * time.Hour,
+		RecoveryRequired: !cfg.EnableDryRun,
+		RecoveryError:    "startup reconciliation required",
+		TradingBlocked:   !cfg.EnableDryRun,
+		BlockReason:      models.BlockedReasonFatalAPI,
+		BlockMessage:     "startup reconciliation required",
+		Debug:            cfg.Debug,
+		DynamicTP:        cfg.DynamicTP,
+		SlPerc:           cfg.SlPerc,
+		TrailPerc:        cfg.TrailPerc,
+		SmaLen:           cfg.SmaLen,
+		PositionState:    models.PositionStateFlat,
+		BidsMap:          make(map[string]float64),
+		AsksMap:          make(map[string]float64),
+		TPChan:           make(chan models.TPJob, 8),
+		StopIntentChan:   make(chan models.StopIntent, 128),
+		SigChan:          make(chan models.Signal, 128),
+		MarketRegime:     "range", // default
+		RegimeCandidate:  "range",
+		OrderTradeIDs:    make(map[string]string),
+		ExecTradeIDs:     make(map[string]string),
+		ProcessedExec:    make(map[string]time.Time),
+		ExecDedupMax:     5000,
+		ExecDedupTTL:     24 * time.Hour,
 	}
 
 	applyRuntimeFeatures(state, cfg)
@@ -1005,13 +1032,26 @@ func main() {
 		return
 	}
 
-	// Create API client
+	// Install cancellation before startup REST calls as well as runtime requests.
+	runtimeCtx, runtimeCancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer runtimeCancel()
 	apiClient := api.NewRESTClient(cfg, logger)
+	apiClient.Context = runtimeCtx
+	store, storeErr := attachOperationStore(cfg, state, apiClient)
+	if storeErr != nil {
+		waitRecoveryBlocked(runtimeCtx, state, statusServer, storeErr, *reconcileOnly)
+		return
+	}
+	defer store.Close()
 
 	// Test API connection to ensure credentials are valid
 	if _, err := apiClient.GetBalance("USDT"); err != nil {
 		logError("API authentication failed: %v", err)
-		logFatal("Please check your API credentials")
+		if runtimeCtx.Err() != nil {
+			logFatal("Startup REST cancelled: %v", err)
+		}
+		waitRecoveryBlocked(runtimeCtx, state, statusServer, err, *reconcileOnly)
+		return
 	}
 
 	logInfo("API connection established successfully")
@@ -1020,7 +1060,8 @@ func main() {
 	var err error
 	state.Instr, err = apiClient.GetInstrumentInfo(cfg.Symbol)
 	if err != nil {
-		logFatal("Instrument info: %v", err)
+		waitRecoveryBlocked(runtimeCtx, state, statusServer, err, *reconcileOnly)
+		return
 	}
 	if state.Instr.TickSize <= 0 {
 		state.Instr.TickSize = 0.1
@@ -1032,6 +1073,16 @@ func main() {
 	}
 	logInfo("Symbol %s — TickSize %.6f  MinQty %.6f  QtyStep %.6f",
 		cfg.Symbol, state.Instr.TickSize, state.Instr.MinQty, state.Instr.QtyStep)
+	observation, recoveryErr := apiClient.ReconcileStartup(runtimeCtx)
+	if recoveryErr != nil {
+		waitRecoveryBlocked(runtimeCtx, state, statusServer, recoveryErr, *reconcileOnly)
+		return
+	}
+	applyStartupRecovery(state, observation)
+	if *reconcileOnly {
+		printRecoveryResult(store)
+		return
+	}
 
 	// Connect to private WebSocket
 	privConn, err := connectPrivateWS(apiClient, state)
@@ -1110,8 +1161,6 @@ func main() {
 	walletChan := make(chan []byte, 16)
 	walletDone := make(chan struct{})
 	go walletListener(privConn, walletChan, walletDone, state, cfg.Symbol)
-	runtimeCtx, runtimeCancel := context.WithCancel(context.Background())
-	defer runtimeCancel()
 	startKPIMonitorWorker(runtimeCtx, state, cfg)
 
 	// Start indicator and trading goroutines

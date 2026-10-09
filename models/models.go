@@ -1,6 +1,8 @@
 package models
 
 import (
+	"context"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -8,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"verbose-fortnight/internal/operations"
 )
 
 // InstrumentInfo holds instrument metadata
@@ -160,13 +163,14 @@ type StopIntent struct {
 
 // StopController keeps desired/applied TP/SL levels for idempotent writes.
 type StopController struct {
-	DesiredTP float64
-	DesiredSL float64
-	AppliedTP float64
-	AppliedSL float64
-	TradeID   string
-	Reason    string
-	UpdatedAt time.Time
+	DesiredTP      float64
+	DesiredSL      float64
+	AppliedTP      float64
+	AppliedSL      float64
+	AppliedTradeID string
+	TradeID        string
+	Reason         string
+	UpdatedAt      time.Time
 }
 
 // ExecutionEvent is a normalized execution payload used by strategy/FSM logic.
@@ -290,8 +294,36 @@ func (k KlineData) LowFloat() float64 {
 	return f
 }
 
+// PendingOrder identifies one uncertainty registration, including reused IDs.
+type PendingOrder struct {
+	OrderID     string `json:"orderId"`
+	OrderLinkID string `json:"orderLinkId"`
+	Generation  uint64 `json:"generation"`
+}
+
+func (s *State) PendingOrdersSnapshot() []PendingOrder {
+	s.RLock()
+	defer s.RUnlock()
+	rows := make([]PendingOrder, 0, len(s.PendingOrders))
+	for _, row := range s.PendingOrders {
+		rows = append(rows, row)
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Generation < rows[j].Generation })
+	return rows
+}
+
 // State represents the application state
 type State struct {
+	OperationStore             *operations.Store
+	RecoveryRequired           bool
+	RecoveryError              string
+	StopRequestCancel          context.CancelFunc
+	PendingOrderID             string
+	PendingOrderLinkID         string
+	OrderReconciliationPending bool
+	PendingOrderGeneration     uint64
+	PendingOrderSequence       uint64
+	PendingOrders              map[uint64]PendingOrder
 	// Global variables
 	Debug     bool
 	DynamicTP bool
@@ -776,4 +808,21 @@ func (s *State) RuntimeFeaturesSnapshot() RuntimeFeatures {
 	s.RLock()
 	defer s.RUnlock()
 	return s.RuntimeFeatures
+}
+
+// CancelStopRequestLocked requires the state lock. Network work never holds this lock.
+func (s *State) CancelStopRequestLocked() {
+	if s.StopRequestCancel != nil {
+		s.StopRequestCancel()
+		s.StopRequestCancel = nil
+	}
+}
+
+// SetActiveTradeLocked invalidates both cached levels and in-flight stop requests.
+func (s *State) SetActiveTradeLocked(id string) {
+	if s.ActiveTradeID != id {
+		s.CancelStopRequestLocked()
+		s.StopCtrl = StopController{}
+		s.ActiveTradeID = id
+	}
 }

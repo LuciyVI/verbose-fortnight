@@ -1,10 +1,12 @@
 package strategy
 
 import (
+	"context"
 	"math"
 	"sync"
 	"testing"
 	"time"
+	"verbose-fortnight/api"
 
 	"verbose-fortnight/config"
 	"verbose-fortnight/models"
@@ -18,6 +20,9 @@ type makerPolicyOrderManagerStub struct {
 
 	marketOrderID string
 	limitOrderID  string
+	requested     float64
+	executed      float64
+	canceled      bool
 }
 
 type makerOrderCall struct {
@@ -51,11 +56,31 @@ func (s *makerPolicyOrderManagerStub) PlaceOrderMarketWithLinkID(side string, qt
 func (s *makerPolicyOrderManagerStub) PlaceOrderLimitPostOnlyWithLinkID(side string, qty, price float64, reduceOnly bool, orderLinkID string) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.requested = qty
 	s.limitCalls = append(s.limitCalls, makerOrderCall{side: side, qty: qty, reduceOnly: reduceOnly, linkID: orderLinkID, price: price})
 	if s.limitOrderID == "" {
 		s.limitOrderID = "lim-1"
 	}
 	return s.limitOrderID, nil
+}
+
+func (s *makerPolicyOrderManagerStub) QueryOrder(_ context.Context, id, link string) (api.OrderState, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	status := "New"
+	if s.executed > 0 {
+		status = "PartiallyFilled"
+	}
+	if s.canceled {
+		status = "Cancelled"
+	}
+	return api.OrderState{OrderID: id, OrderLinkID: link, Status: status, Qty: s.requested, CumExecQty: s.executed}, nil
+}
+func (s *makerPolicyOrderManagerStub) CancelOrder(_ context.Context, id, link string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.canceled = true
+	return nil
 }
 
 func (s *makerPolicyOrderManagerStub) PlaceTakeProfitOrder(side string, qty, price float64) error {
@@ -207,13 +232,14 @@ func TestMakerFirstTimeoutFallback(t *testing.T) {
 	if om.marketCount() != 1 {
 		t.Fatalf("market calls = %d want 1", om.marketCount())
 	}
-	if pm.cancelCount() == 0 {
-		t.Fatalf("expected cancel-all on timeout")
+	if !om.canceled {
+		t.Fatalf("expected single-order cancel on timeout")
 	}
 }
 
 func TestMakerFirstPartialFill(t *testing.T) {
 	tr, om, pm := newMakerPolicyTrader()
+	om.executed = 0.4
 	pm.snapshots = []positionSnapshot{
 		{exists: true, side: "LONG", qty: 1.0}, // before
 		{exists: true, side: "LONG", qty: 0.6}, // immediate check => partial 0.4

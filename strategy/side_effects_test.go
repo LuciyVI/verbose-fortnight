@@ -256,6 +256,7 @@ func TestStopControllerSingleWriterAppliesUpdates(t *testing.T) {
 
 	posSpy.setOpen("LONG", 1, 100, 0, 0)
 	tr.State.PositionState = models.PositionStateOpen
+	tr.State.ActiveTradeID = "trade-1"
 	intent := models.StopIntent{TradeID: "trade-1", Side: "LONG", Entry: 100, TP: 101, SL: 99, Reason: "test"}
 	tr.enqueueStopIntent(intent)
 
@@ -327,6 +328,7 @@ func TestInvariantBlockPersistsUntilManualClear(t *testing.T) {
 
 	posSpy.setOpen("LONG", 1, 100, 0, 0)
 	tr.State.PositionState = models.PositionStateOpen
+	tr.State.ActiveTradeID = "trade-1"
 
 	done := make(chan struct{})
 	go func() {

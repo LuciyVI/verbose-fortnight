@@ -1,16 +1,9 @@
 package order
 
 import (
-	"bytes"
-	"encoding/json"
-	"fmt"
-	"io"
 	"math"
-	"net/http"
 	"sort"
 	"strconv"
-	"strings"
-	"time"
 
 	"verbose-fortnight/api"
 	"verbose-fortnight/config"
@@ -37,316 +30,42 @@ func NewOrderManager(apiClient *api.RESTClient, cfg *config.Config, state *model
 	}
 }
 
-// FormatQty formats quantity according to instrument step
+// FormatQty returns an empty string for invalid inputs and rounds down to the
+// instrument step using decimal arithmetic (including non-power-of-ten steps).
 func (om *OrderManager) FormatQty(qty, step float64) string {
-	dec := 0
-	tempStep := step
-	for tempStep < 1 {
-		tempStep *= 10
-		dec++
-	}
-	return strconv.FormatFloat(qty, 'f', dec, 64)
+	return formatQty(qty, step)
 }
 
-// PlaceOrderMarket places a market order.
 func (om *OrderManager) PlaceOrderMarket(side string, qty float64, reduceOnly bool) error {
 	_, err := om.PlaceOrderMarketWithID(side, qty, reduceOnly)
 	return err
 }
-
-// PlaceOrderMarketWithID places a market order and returns exchange order id.
 func (om *OrderManager) PlaceOrderMarketWithID(side string, qty float64, reduceOnly bool) (string, error) {
 	return om.PlaceOrderMarketWithLinkID(side, qty, reduceOnly, "")
 }
-
-// PlaceOrderMarketWithLinkID places a market order and optionally sets orderLinkId.
-func (om *OrderManager) PlaceOrderMarketWithLinkID(side string, qty float64, reduceOnly bool, orderLinkID string) (string, error) {
-	if side == "" {
-		return "", fmt.Errorf("invalid side: empty")
-	}
-	const path = "/v5/order/create"
-	body := map[string]interface{}{
-		"category":    "linear",
-		"symbol":      om.Config.Symbol,
-		"side":        side,
-		"orderType":   "Market",
-		"qty":         om.FormatQty(qty, om.State.Instr.QtyStep),
-		"timeInForce": "IOC",
-		"positionIdx": 0,
-	}
-	if reduceOnly {
-		body["reduceOnly"] = true
-	}
-	if strings.TrimSpace(orderLinkID) != "" {
-		body["orderLinkId"] = strings.TrimSpace(orderLinkID)
-	}
-
-	raw, _ := json.Marshal(body)
-	ts := fmt.Sprintf("%d", time.Now().UnixMilli())
-
-	// Log outgoing request
-	om.Logger.Info("Sending POST request to exchange: %s, Body: %s", path, string(raw))
-
-	req, _ := http.NewRequest("POST", om.Config.DemoRESTHost+path, bytes.NewReader(raw))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-BAPI-API-KEY", om.Config.APIKey)
-	req.Header.Set("X-BAPI-TIMESTAMP", ts)
-	req.Header.Set("X-BAPI-RECV-WINDOW", om.Config.RecvWindow)
-	req.Header.Set("X-BAPI-SIGN-TYPE", "2")
-	req.Header.Set("X-BAPI-SIGN", om.APIClient.SignREST(om.Config.APISecret, ts, om.Config.APIKey, om.Config.RecvWindow, string(raw)))
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		om.Logger.Error("Failed to send POST request to exchange: %v", err)
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	reply, _ := io.ReadAll(resp.Body)
-
-	// Log incoming response
-	om.Logger.Info("Received response from exchange for %s: Status %d, Body: %s", path, resp.StatusCode, string(reply))
-
-	var r struct {
-		RetCode int    `json:"retCode"`
-		RetMsg  string `json:"retMsg"`
-		Result  struct {
-			OrderID string `json:"orderId"`
-		} `json:"result"`
-	}
-	if json.Unmarshal(reply, &r) != nil || r.RetCode != 0 {
-		om.Logger.Error("Error in market order response: %d: %s", r.RetCode, r.RetMsg)
-		return "", fmt.Errorf("error placing market order: %d: %s", r.RetCode, r.RetMsg)
-	}
-	if r.Result.OrderID != "" {
-		om.State.Lock()
-		om.State.LastOrderID = r.Result.OrderID
-		om.State.Unlock()
-		om.Logger.Info("Market order id: %s", r.Result.OrderID)
-	}
-	om.Logger.Info("Market %s %.4f OK", side, qty)
-	return r.Result.OrderID, nil
+func (om *OrderManager) PlaceOrderMarketWithLinkID(side string, qty float64, reduceOnly bool, link string) (string, error) {
+	return om.placeOrder(side, qty, 0, reduceOnly, link, "Market", "IOC", false, false)
 }
-
-// PlaceOrderLimitPostOnlyWithLinkID places a post-only limit order and optionally sets orderLinkId.
-func (om *OrderManager) PlaceOrderLimitPostOnlyWithLinkID(side string, qty, price float64, reduceOnly bool, orderLinkID string) (string, error) {
-	if side == "" {
-		return "", fmt.Errorf("invalid side: empty")
-	}
-	if price <= 0 {
-		return "", fmt.Errorf("invalid price: %.8f", price)
-	}
-	const path = "/v5/order/create"
-	body := map[string]interface{}{
-		"category":    "linear",
-		"symbol":      om.Config.Symbol,
-		"side":        side,
-		"orderType":   "Limit",
-		"price":       fmt.Sprintf("%.2f", price),
-		"qty":         om.FormatQty(qty, om.State.Instr.QtyStep),
-		"timeInForce": "PostOnly",
-		"positionIdx": 0,
-	}
-	if reduceOnly {
-		body["reduceOnly"] = true
-	}
-	if strings.TrimSpace(orderLinkID) != "" {
-		body["orderLinkId"] = strings.TrimSpace(orderLinkID)
-	}
-
-	raw, _ := json.Marshal(body)
-	ts := fmt.Sprintf("%d", time.Now().UnixMilli())
-
-	om.Logger.Info("Sending POST request to exchange: %s, Body: %s", path, string(raw))
-
-	req, _ := http.NewRequest("POST", om.Config.DemoRESTHost+path, bytes.NewReader(raw))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-BAPI-API-KEY", om.Config.APIKey)
-	req.Header.Set("X-BAPI-TIMESTAMP", ts)
-	req.Header.Set("X-BAPI-RECV-WINDOW", om.Config.RecvWindow)
-	req.Header.Set("X-BAPI-SIGN-TYPE", "2")
-	req.Header.Set("X-BAPI-SIGN", om.APIClient.SignREST(om.Config.APISecret, ts, om.Config.APIKey, om.Config.RecvWindow, string(raw)))
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		om.Logger.Error("Failed to send POST request to exchange: %v", err)
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	reply, _ := io.ReadAll(resp.Body)
-	om.Logger.Info("Received response from exchange for %s: Status %d, Body: %s", path, resp.StatusCode, string(reply))
-
-	var r struct {
-		RetCode int    `json:"retCode"`
-		RetMsg  string `json:"retMsg"`
-		Result  struct {
-			OrderID string `json:"orderId"`
-		} `json:"result"`
-	}
-	if json.Unmarshal(reply, &r) != nil || r.RetCode != 0 {
-		om.Logger.Error("Error in post-only limit order response: %d: %s", r.RetCode, r.RetMsg)
-		return "", fmt.Errorf("error placing post-only order: %d: %s", r.RetCode, r.RetMsg)
-	}
-	if r.Result.OrderID != "" {
-		om.State.Lock()
-		om.State.LastOrderID = r.Result.OrderID
-		om.State.Unlock()
-		om.Logger.Info("Post-only order id: %s", r.Result.OrderID)
-	}
-	om.Logger.Info("Post-only %s %.4f @ %.2f OK", side, qty, price)
-	return r.Result.OrderID, nil
+func (om *OrderManager) PlaceOrderLimitPostOnlyWithLinkID(side string, qty, price float64, reduceOnly bool, link string) (string, error) {
+	return om.placeOrder(side, qty, price, reduceOnly, link, "Limit", "PostOnly", false, side == "Sell")
 }
-
-// PlaceTakeProfitOrder places a take profit order
 func (om *OrderManager) PlaceTakeProfitOrder(side string, qty, price float64) error {
 	return om.PlaceTakeProfitOrderWithLink(side, qty, price, "")
 }
-
-// PlaceTakeProfitOrderWithLink places a take profit order and optionally sets orderLinkId.
-func (om *OrderManager) PlaceTakeProfitOrderWithLink(side string, qty, price float64, orderLinkID string) error {
-	const path = "/v5/order/create"
-	body := map[string]interface{}{
-		"category":    "linear",
-		"symbol":      om.Config.Symbol,
-		"side":        side,
-		"orderType":   "Limit",
-		"price":       fmt.Sprintf("%.2f", price),
-		"qty":         om.FormatQty(qty, om.State.Instr.QtyStep),
-		"timeInForce": "GTC",
-		"reduceOnly":  true,
-		"positionIdx": 0,
-	}
-	if strings.TrimSpace(orderLinkID) != "" {
-		body["orderLinkId"] = strings.TrimSpace(orderLinkID)
-	}
-
-	raw, _ := json.Marshal(body)
-	ts := fmt.Sprintf("%d", time.Now().UnixMilli())
-
-	// Log outgoing request
-	om.Logger.Info("Sending POST request to exchange: %s, Body: %s", path, string(raw))
-
-	req, _ := http.NewRequest("POST", om.Config.DemoRESTHost+path, bytes.NewReader(raw))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-BAPI-API-KEY", om.Config.APIKey)
-	req.Header.Set("X-BAPI-TIMESTAMP", ts)
-	req.Header.Set("X-BAPI-RECV-WINDOW", om.Config.RecvWindow)
-	req.Header.Set("X-BAPI-SIGN-TYPE", "2")
-	req.Header.Set("X-BAPI-SIGN", om.APIClient.SignREST(om.Config.APISecret, ts, om.Config.APIKey, om.Config.RecvWindow, string(raw)))
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		om.Logger.Error("Failed to send POST request to exchange: %v", err)
-		return err
-	}
-	defer resp.Body.Close()
-
-	reply, _ := io.ReadAll(resp.Body)
-
-	// Log incoming response
-	om.Logger.Info("Received response from exchange for %s: Status %d, Body: %s", path, resp.StatusCode, string(reply))
-
-	om.Logger.Info("TP set @ %.2f (%s, qty %.4f)", price, side, qty)
-	return nil
+func (om *OrderManager) PlaceTakeProfitOrderWithLink(side string, qty, price float64, link string) error {
+	_, err := om.placeOrder(side, qty, price, true, link, "Limit", "GTC", false, side == "Buy")
+	return err
 }
-
-// PlaceStopLossOrder places a stop loss order
 func (om *OrderManager) PlaceStopLossOrder(side string, qty, price float64) error {
 	return om.PlaceStopLossOrderWithLink(side, qty, price, "")
 }
-
-// PlaceStopLossOrderWithLink places a stop loss order and optionally sets orderLinkId.
-func (om *OrderManager) PlaceStopLossOrderWithLink(side string, qty, price float64, orderLinkID string) error {
-	const path = "/v5/order/create"
-	body := map[string]interface{}{
-		"category":    "linear",
-		"symbol":      om.Config.Symbol,
-		"side":        side,
-		"orderType":   "Limit",
-		"price":       fmt.Sprintf("%.2f", price),
-		"qty":         om.FormatQty(qty, om.State.Instr.QtyStep),
-		"timeInForce": "GTC",
-		"reduceOnly":  true,
-		"positionIdx": 0,
-	}
-	if strings.TrimSpace(orderLinkID) != "" {
-		body["orderLinkId"] = strings.TrimSpace(orderLinkID)
-	}
-
-	raw, _ := json.Marshal(body)
-	ts := fmt.Sprintf("%d", time.Now().UnixMilli())
-
-	// Log outgoing request
-	om.Logger.Info("Sending POST request to exchange: %s, Body: %s", path, string(raw))
-
-	req, _ := http.NewRequest("POST", om.Config.DemoRESTHost+path, bytes.NewReader(raw))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-BAPI-API-KEY", om.Config.APIKey)
-	req.Header.Set("X-BAPI-TIMESTAMP", ts)
-	req.Header.Set("X-BAPI-RECV-WINDOW", om.Config.RecvWindow)
-	req.Header.Set("X-BAPI-SIGN-TYPE", "2")
-	req.Header.Set("X-BAPI-SIGN", om.APIClient.SignREST(om.Config.APISecret, ts, om.Config.APIKey, om.Config.RecvWindow, string(raw)))
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		om.Logger.Error("Failed to send POST request to exchange: %v", err)
-		return err
-	}
-	defer resp.Body.Close()
-
-	reply, _ := io.ReadAll(resp.Body)
-
-	// Log incoming response
-	om.Logger.Info("Received response from exchange for %s: Status %d, Body: %s", path, resp.StatusCode, string(reply))
-
-	om.Logger.Info("SL set @ %.2f (%s, qty %.4f)", price, side, qty)
-	return nil
+func (om *OrderManager) PlaceStopLossOrderWithLink(side string, qty, price float64, link string) error {
+	_, err := om.placeOrder(side, qty, price, true, link, "Limit", "GTC", false, side == "Sell")
+	return err
 }
-
-// PlaceStopLoss places a stop loss using stopLossPrice parameter
 func (om *OrderManager) PlaceStopLoss(side string, qty, price float64) error {
-	const path = "/v5/order/create"
-	body := map[string]interface{}{
-		"category":      "linear",
-		"symbol":        om.Config.Symbol,
-		"side":          side,
-		"orderType":     "Market", // or "Limit" - depends on strategy
-		"qty":           om.FormatQty(qty, om.State.Instr.QtyStep),
-		"stopLossPrice": fmt.Sprintf("%.2f", price),
-		"timeInForce":   "GTC",
-		"reduceOnly":    true,
-		"positionIdx":   0,
-	}
-
-	raw, _ := json.Marshal(body)
-	ts := fmt.Sprintf("%d", time.Now().UnixMilli())
-
-	// Log outgoing request
-	om.Logger.Info("Sending POST request to exchange: %s, Body: %s", path, string(raw))
-
-	req, _ := http.NewRequest("POST", om.Config.DemoRESTHost+path, bytes.NewReader(raw))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-BAPI-API-KEY", om.Config.APIKey)
-	req.Header.Set("X-BAPI-TIMESTAMP", ts)
-	req.Header.Set("X-BAPI-RECV-WINDOW", om.Config.RecvWindow)
-	req.Header.Set("X-BAPI-SIGN-TYPE", "2")
-	req.Header.Set("X-BAPI-SIGN", om.APIClient.SignREST(om.Config.APISecret, ts, om.Config.APIKey, om.Config.RecvWindow, string(raw)))
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		om.Logger.Error("Failed to send POST request to exchange: %v", err)
-		return err
-	}
-	defer resp.Body.Close()
-
-	reply, _ := io.ReadAll(resp.Body)
-
-	// Log incoming response
-	om.Logger.Info("Received response from exchange for %s: Status %d, Body: %s", path, resp.StatusCode, string(reply))
-
-	om.Logger.Info("SL set @ %.2f (%s, qty %.4f)", price, side, qty)
-	return nil
+	_, err := om.placeOrder(side, qty, price, true, "", "Market", "GTC", true, side == "Sell")
+	return err
 }
 
 // CalculateTakeProfitATR calculates take profit based on ATR

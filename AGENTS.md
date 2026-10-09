@@ -7,8 +7,8 @@
 - Configuration defaults live in `config/config.go` and are driven by environment variables (see Security below).
 
 ## Build, Test, and Development Commands
-- Build: `go build -o go-trade ./...` produces the CLI binary.
-- Run in debug: `go run main.go -debug` (or execute `./go-trade -debug` after building).
+- Build: `go build -o go-trade .` produces the CLI binary.
+- Run in debug: `go run . -debug=0` (or execute `./go-trade -debug=0` after building).
 - Tests: `go test ./...` for the full suite; `go test ./indicators` to scope to a package; coverage via `go test -cover ./...`.
 - Dependencies: `go mod tidy` to sync modules when adding imports.
 

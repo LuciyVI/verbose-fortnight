@@ -1,18 +1,18 @@
 package position
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"math"
-	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"verbose-fortnight/api"
 	"verbose-fortnight/config"
+	"verbose-fortnight/internal/operations"
+	"verbose-fortnight/internal/prices"
 	"verbose-fortnight/logging"
 	"verbose-fortnight/models"
 	"verbose-fortnight/pnl"
@@ -54,11 +54,25 @@ func (pm *PositionManager) HasOpenPosition() (bool, string, float64, float64, fl
 	positions, err := pm.APIClient.GetPositionList(pm.Config.Symbol)
 	if err != nil {
 		pm.Logger.Error("Failed to fetch position list: %v", err)
-		return false, "", 0, 0, 0
+		pm.State.Lock()
+		pm.State.TradingBlocked = true
+		pm.State.BlockReason = models.BlockedReasonFatalAPI
+		pm.State.BlockMessage = "position observation failed: " + err.Error()
+		pm.State.BlockSetAt = time.Now()
+		pm.State.Unlock()
+		// A failed observation is not a confirmed flat position. Retain the last
+		// snapshot and block new orders until an explicit resync/operator recovery.
+		pm.State.StatusLock.RLock()
+		last := pm.State.LastPosition
+		pm.State.StatusLock.RUnlock()
+		return last.Size > 0, last.Side, last.Size, last.TakeProfit, last.StopLoss
 	}
 
 	pm.Logger.Info("Received position list from exchange: %d positions", len(positions))
 	for _, res := range positions {
+		if res.Symbol != pm.Config.Symbol || res.PositionIdx != 0 {
+			continue
+		}
 		size, _ := strconv.ParseFloat(res.Size, 64)
 		if size > 0 {
 			// Handle empty TP/SL values
@@ -108,6 +122,9 @@ func (pm *PositionManager) GetLastEntryPrice() float64 {
 	}
 
 	for _, res := range positions {
+		if res.Symbol != pm.Config.Symbol || res.PositionIdx != 0 {
+			continue
+		}
 		ep, _ := strconv.ParseFloat(res.AvgPrice, 64)
 		if ep > 0 {
 			return ep
@@ -116,94 +133,70 @@ func (pm *PositionManager) GetLastEntryPrice() float64 {
 	return 0
 }
 
-// UpdatePositionTPSL updates the TP/SL for a position
+// UpdatePositionTPSL captures the local lifecycle before observing the exchange.
 func (pm *PositionManager) UpdatePositionTPSL(symbol string, tp, sl float64) error {
-	exists, _, _, _, _ := pm.HasOpenPosition()
-	if !exists {
-		return fmt.Errorf("no open position to update TP/SL")
+	return pm.UpdatePositionTPSLContext(pm.APIClient.Context, symbol, tp, sl, "")
+}
+func (pm *PositionManager) UpdatePositionTPSLContext(ctx context.Context, symbol string, tp, sl float64, lifecycle string) error {
+	pm.State.RLock()
+	if lifecycle == "" {
+		lifecycle = pm.State.ActiveTradeID
 	}
-
-	const path = "/v5/position/trading-stop"
-	body := map[string]interface{}{
-		"category":    "linear",
-		"symbol":      symbol,
-		"takeProfit":  fmt.Sprintf("%.2f", tp),
-		"stopLoss":    fmt.Sprintf("%.2f", sl),
-		"positionIdx": 0,
-		"tpslMode":    "Full",
-	}
-
-	raw, _ := json.Marshal(body)
-	ts := fmt.Sprintf("%d", time.Now().UnixMilli())
-
-	// Log outgoing request
-	pm.Logger.Info("Sending POST request to exchange: %s, Body: %s", path, string(raw))
-
-	req, _ := http.NewRequest("POST", pm.Config.DemoRESTHost+path, bytes.NewReader(raw))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-BAPI-API-KEY", pm.Config.APIKey)
-	req.Header.Set("X-BAPI-TIMESTAMP", ts)
-	req.Header.Set("X-BAPI-RECV-WINDOW", pm.Config.RecvWindow)
-	req.Header.Set("X-BAPI-SIGN-TYPE", "2")
-	req.Header.Set("X-BAPI-SIGN", pm.APIClient.SignREST(pm.Config.APISecret, ts, pm.Config.APIKey, pm.Config.RecvWindow, string(raw)))
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		pm.Logger.Error("Failed to send POST request to exchange: %v", err)
-		return err
-	}
-	defer resp.Body.Close()
-
-	reply, _ := io.ReadAll(resp.Body)
-
-	// Log incoming response
-	pm.Logger.Info("Received response from exchange for %s: Status %d, Body: %s", path, resp.StatusCode, string(reply))
-
-	var r struct {
-		RetCode int    `json:"retCode"`
-		RetMsg  string `json:"retMsg"`
-	}
-	if json.Unmarshal(reply, &r) != nil {
-		pm.Logger.Error("Error in TP/SL update response: decode failed")
-		return fmt.Errorf("error updating TP/SL: decode failed")
-	}
-	if r.RetCode == 34040 {
-		pm.Logger.Info("TP/SL update noop (retCode=34040): %s", r.RetMsg)
-		return nil
-	}
-	if r.RetCode != 0 {
-		pm.Logger.Error("Error in TP/SL update response: %d: %s", r.RetCode, r.RetMsg)
-		return fmt.Errorf("error updating TP/SL: %d: %s", r.RetCode, r.RetMsg)
-	}
-
-	return nil
+	side := pm.State.PosSide
+	pm.State.RUnlock()
+	_, err := pm.ApplyStopIntent(ctx, symbol, models.StopIntent{TradeID: lifecycle, LifecycleID: lifecycle, Side: side, TP: tp, SL: sl})
+	return err
 }
 
-// CancelAllOrders cancels all active orders for a symbol
-func (pm *PositionManager) CancelAllOrders(symbol string) {
-	const path = "/v5/order/cancel-all"
-	body := map[string]interface{}{
-		"category": "linear",
-		"symbol":   symbol,
+// ApplyStopIntent performs the final observation and validates the actual JSON
+// prices before POST. The state lock is never held during either request.
+// Exchange close/reopen can still race the interval from this GET to the POST.
+func (pm *PositionManager) ApplyStopIntent(ctx context.Context, symbol string, intent models.StopIntent) (prices.StopLevels, error) {
+	var levels prices.StopLevels
+	side := prices.NormalizeSide(intent.Side)
+	if symbol != pm.Config.Symbol || side == "" || intent.TradeID == "" || (intent.LifecycleID != "" && intent.LifecycleID != intent.TradeID) {
+		return levels, fmt.Errorf("invalid stop target or lifecycle")
 	}
+	row, err := pm.APIClient.ObservePosition(ctx, symbol, 0, side)
+	if err != nil {
+		return levels, err
+	}
+	entry, err := strconv.ParseFloat(row.AvgPrice, 64)
+	if err != nil {
+		return levels, fmt.Errorf("invalid observed entry: %w", err)
+	}
+	pm.State.RLock()
+	tick := pm.State.Instr.TickSize
+	current := !pm.State.TradingBlocked && pm.State.ActiveTradeID == intent.TradeID &&
+		(pm.State.PosSide == "" || prices.NormalizeSide(pm.State.PosSide) == side) &&
+		(pm.State.PositionState == models.PositionStateOpen || pm.State.PositionState == models.PositionStateOpening)
+	pm.State.RUnlock()
+	if !current {
+		return levels, fmt.Errorf("stale stop lifecycle or direction")
+	}
+	levels, err = prices.Stops(side, entry, intent.TP, intent.SL, tick, intent.Breakeven)
+	if err != nil {
+		return levels, err
+	}
+	raw, err := json.Marshal(map[string]any{"category": "linear", "symbol": row.Symbol, "positionIdx": row.PositionIdx, "takeProfit": levels.TPText, "stopLoss": levels.SLText, "tpslMode": "Full"})
+	if err != nil {
+		return levels, err
+	}
+	ctx = operations.WithOwner(ctx, operations.Owner{Lifecycle: intent.TradeID, Side: side})
+	_, err = pm.APIClient.DoJSON(ctx, "POST", "/v5/position/trading-stop", "", raw)
+	return levels, err
+}
 
-	raw, _ := json.Marshal(body)
-	ts := fmt.Sprintf("%d", time.Now().UnixMilli())
-	req, _ := http.NewRequest("POST", pm.Config.DemoRESTHost+path, bytes.NewReader(raw))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-BAPI-API-KEY", pm.Config.APIKey)
-	req.Header.Set("X-BAPI-TIMESTAMP", ts)
-	req.Header.Set("X-BAPI-RECV-WINDOW", pm.Config.RecvWindow)
-	req.Header.Set("X-BAPI-SIGN-TYPE", "2")
-	req.Header.Set("X-BAPI-SIGN", pm.APIClient.SignREST(pm.Config.APISecret, ts, pm.Config.APIKey, pm.Config.RecvWindow, string(raw)))
-
-	resp, err := http.DefaultClient.Do(req)
+func (pm *PositionManager) CancelAllOrders(symbol string) {
+	raw, err := json.Marshal(map[string]any{"category": "linear", "symbol": symbol})
+	if err == nil {
+		_, err = pm.APIClient.DoJSON(pm.APIClient.Context, "POST", "/v5/order/cancel-all", "", raw)
+	}
 	if err != nil {
 		pm.Logger.Error("Failed to cancel orders: %v", err)
 		return
 	}
-	defer resp.Body.Close()
-	pm.Logger.Info("Cancelled all active orders for %s", symbol)
+	pm.Logger.Info("Cancel-all acknowledged for %s; terminal order state still requires reconciliation", symbol)
 }
 
 // GetLastBidPrice returns the last bid price from orderbook

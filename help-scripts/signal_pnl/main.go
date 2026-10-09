@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"compress/gzip"
+	"context"
 	"encoding/csv"
 	"encoding/json"
 	"errors"
@@ -274,7 +275,12 @@ func fetchKlines(host, symbol, interval string, start, end time.Time) ([]kline, 
 			reqEnd = endMs
 		}
 
-		req, _ := http.NewRequest("GET", host+path, nil)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		req, err := http.NewRequestWithContext(ctx, "GET", host+path, nil)
+		if err != nil {
+			cancel()
+			return nil, err
+		}
 		q := req.URL.Query()
 		q.Set("category", "linear")
 		q.Set("symbol", symbol)
@@ -286,23 +292,36 @@ func fetchKlines(host, symbol, interval string, start, end time.Time) ([]kline, 
 
 		resp, err := client.Do(req)
 		if err != nil {
+			cancel()
 			return nil, err
 		}
+		raw, readErr := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
+		resp.Body.Close()
+		cancel()
+		if readErr != nil {
+			return nil, readErr
+		}
+		if len(raw) > 1<<20 {
+			return nil, fmt.Errorf("kline response too large")
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return nil, fmt.Errorf("kline HTTP %d", resp.StatusCode)
+		}
 		var payload struct {
-			RetCode int    `json:"retCode"`
+			RetCode *int   `json:"retCode"`
 			RetMsg  string `json:"retMsg"`
 			Result  struct {
 				List [][]string `json:"list"`
 			} `json:"result"`
 		}
-		if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-			resp.Body.Close()
+		if err := json.Unmarshal(raw, &payload); err != nil {
 			return nil, err
 		}
-		resp.Body.Close()
-
-		if payload.RetCode != 0 {
-			return nil, fmt.Errorf("kline error %d: %s", payload.RetCode, payload.RetMsg)
+		if payload.RetCode == nil {
+			return nil, fmt.Errorf("missing kline retCode")
+		}
+		if *payload.RetCode != 0 {
+			return nil, fmt.Errorf("kline error %d: %s", *payload.RetCode, payload.RetMsg)
 		}
 		if len(payload.Result.List) == 0 {
 			break

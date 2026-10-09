@@ -49,7 +49,7 @@ The application is organized into the following logical packages:
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/verbose-fortnight.git
+git clone https://github.com/LuciyVI/verbose-fortnight.git
 cd verbose-fortnight
 ```
 
@@ -69,15 +69,33 @@ export BYBIT_API_SECRET="your_api_secret"
 # Optional configuration (with defaults shown):
 export BYBIT_DEMO_REST_HOST="https://api-demo.bybit.com"
 export BYBIT_DEMO_WS_PRIVATE="wss://stream-demo.bybit.com/v5/private"
-export BYBIT_DEMO_WS_PUBLIC="wss://stream.bybit.com/v5/public/linear"
-export ORDER_BALANCE_PCT="0.01" # 1% of USDT balance per order (0 = min size)
+export BYBIT_DEMO_WS_PUBLIC="wss://stream-demo.bybit.com/v5/public/linear"
+export ORDER_BALANCE_PCT="1.0" # actual default: 100% of available USDT balance (0 = min size)
 
 # Dynamic TP parameters (percent units, e.g. 0.4 = 0.4%)
 export DYNAMIC_TP_K="1.0"
 export DYNAMIC_TP_VOLATILITY_FACTOR="6.0"
-export DYNAMIC_TP_MIN_PERC="0.4"
-export DYNAMIC_TP_MAX_PERC="1.8"
+export DYNAMIC_TP_MIN_PERC="0.7"
+export DYNAMIC_TP_MAX_PERC="0.7"
 ```
+
+Position size is a notional allocation, not an allowed loss: `ORDER_BALANCE_PCT=1.0` targets a position notional equal to the available balance, subject to instrument minimums and step rounding. Loss depends on the SL distance, executions, fees and slippage. This change preserves the sizing default and strategy parameters.
+
+REST defaults are `REST_TIMEOUT_MS=5000`, `REST_MAX_RESPONSE_BYTES=1048576` and `ORDER_RECONCILE_TIMEOUT_MS=3000`. Zero uses these bounded defaults; negative settings are invalid. Responses have a hard maximum of 16 MiB.
+
+A placement timeout can hide an accepted order. The bot looks up the original `orderLinkId` and never blindly repeats order creation. Maker fallback waits for a terminal order snapshot and uses its final cumulative fill to calculate the remainder. If acceptance or cancellation cannot be reconciled, new trading is blocked pending recovery. See [the recovery runbook](docs/runbook.md#order-reconciliation-and-stop-lifecycles).
+
+Every REST mutation is recorded before sending in `OPERATION_STATE_PATH` (default `state/operations.json`, relative to the working directory). The snapshot includes operation ID, monotonically increasing generation, lifecycle, stable orderLinkId, exact payload and result. It contains no API keys or secrets. File fsync, atomic rename and parent-directory fsync commit each update; an exclusive lock permits one process per store. Use a persistent local filesystem and a distinct path for each account/symbol. State is ignored by Git.
+
+Startup and private-stream resync reconcile the durable operations, all active orders, executions, current position and actual TP/SL before permitting trading. This also runs when the file did not exist. Missing/ambiguous order results, executable remainders, conflicting executions, unknown position ownership and invalid stops keep trading blocked. No mutation is replayed during recovery. Interrupted partial fills are observed; recovery does not place their unfilled remainder automatically. Manual clear cannot bypass the recovery gate.
+
+`/status.recovery` exposes readiness, the state path, errors and operations; `tradingBlocked` and `blockMessage` show the overall gate. `STARTUP_RECONCILE_TIMEOUT_MS=30000` bounds the full scan (zero uses the default). `go run . -reconcile-only -debug=0` runs the same read-only reconciliation, persists its conclusions and exits 0 on recovery or 1 while blocked, without starting WS or strategy workers. `ENABLE_DRY_RUN=1` bypasses exchange access and the operation store, so it does not verify recovery.
+
+Corrupt, incomplete, unsupported or locked state, including a missing snapshot with an existing lock file, fails closed and is never silently replaced. Preserve the file, `.lock` and `.tmp-*` evidence; follow [the recovery runbook](docs/runbook.md#order-reconciliation-and-stop-lifecycles) before repair. REST history/pagination limits and truncated execution boundaries also block recovery.
+
+TP/SL wire prices use the instrument tick with decimal arithmetic. Rounding moves toward entry: LONG TP down/SL up, SHORT TP up/SL down. Quantized values that violate invariants are rejected; explicit breakeven intents may retain SL equal to entry. Applied levels are the actual payload values after a successful REST acknowledgement. A final position observation checks target and direction; exchange close/reopen can still race the interval between observation and application. Context cancellation cannot roll back a mutation already accepted remotely.
+
+`ENABLE_DRY_RUN=1` starts diagnostics and health workers without exchange REST/WS connections. It does not simulate signals, orders, fills, TP/SL or strategy profitability.
 
 ## Usage
 
@@ -85,18 +103,18 @@ export DYNAMIC_TP_MAX_PERC="1.8"
 
 ```bash
 # Build the application
-go build -o go-trade
+go build -o go-trade .
 
 # Run with debug logging
-./go-trade -debug
+./go-trade -debug=0
 
 # Or run directly with debug
-go run main.go -debug
+go run . -debug=0
 ```
 
 ### Command Line Options
 
-- `-debug`: Enable debug logging with colored output
+- `-debug=0`: numeric log level: 0=DEBUG, 1=INFO, 2=WARNING, 3=ERROR.
 
 ## Project Structure
 

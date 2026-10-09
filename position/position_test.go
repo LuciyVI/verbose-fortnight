@@ -124,6 +124,10 @@ func TestUpdatePositionTPSLUsesPositionIdxZero(t *testing.T) {
 	buf := &bytes.Buffer{}
 	pm, srv := newTestPM(t, list, buf)
 	defer srv.Close()
+	pm.State.ActiveTradeID = "current"
+	pm.State.PosSide = "SHORT"
+	pm.State.PositionState = models.PositionStateOpen
+	pm.State.Instr.TickSize = 0.01
 
 	if err := pm.UpdatePositionTPSL("BTCUSDT", 90.0, 110.0); err != nil {
 		t.Fatalf("UpdatePositionTPSL error: %v", err)
@@ -145,7 +149,7 @@ func TestUpdatePositionTPSLNotModified34040IsNoop(t *testing.T) {
 	stopCalls := 0
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v5/position/list", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"retCode":0,"retMsg":"OK","result":{"list":[{"side":"Buy","size":"0.01","takeProfit":"100.0","stopLoss":"99.0","avgPrice":"100.0"}]}}`))
+		_, _ = w.Write([]byte(`{"retCode":0,"retMsg":"OK","result":{"list":[{"side":"Buy","size":"0.01","takeProfit":"101.0","stopLoss":"99.0","avgPrice":"100.0"}]}}`))
 	})
 	mux.HandleFunc("/v5/position/trading-stop", func(w http.ResponseWriter, r *http.Request) {
 		stopCalls++
@@ -160,9 +164,9 @@ func TestUpdatePositionTPSLNotModified34040IsNoop(t *testing.T) {
 	cfg.APIKey = "k"
 	cfg.APISecret = "s"
 	client := api.NewRESTClient(cfg, nopLogger{})
-	pm := NewPositionManager(client, cfg, &models.State{}, nopLogger{})
+	pm := NewPositionManager(client, cfg, &models.State{ActiveTradeID: "current", PosSide: "LONG", PositionState: models.PositionStateOpen, Instr: models.InstrumentInfo{TickSize: 0.01}}, nopLogger{})
 
-	if err := pm.UpdatePositionTPSL("BTCUSDT", 100, 99); err != nil {
+	if err := pm.UpdatePositionTPSL("BTCUSDT", 101, 99); err != nil {
 		t.Fatalf("expected 34040 to be treated as noop, got err: %v", err)
 	}
 	if stopCalls != 1 {

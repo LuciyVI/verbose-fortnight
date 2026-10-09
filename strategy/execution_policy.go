@@ -1,6 +1,9 @@
 package strategy
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
 
 // ExecutionPolicy encapsulates entry/reduce order placement behavior.
 type ExecutionPolicy interface {
@@ -66,8 +69,14 @@ func (t *Trader) executionPolicy() ExecutionPolicy {
 
 func (t *Trader) placeOrderWithExecutionPolicy(side string, qty float64, reduceOnly bool, lifecycleID, leg string) (orderID, orderLinkID string, err error) {
 	policy := t.executionPolicy()
-	if reduceOnly {
-		return policy.PlaceReduce(side, qty, lifecycleID, leg)
+	if blocked, reason, message := t.isTradingBlocked(); blocked {
+		return "", "", fmt.Errorf("trading blocked: %s %s", reason, message)
 	}
-	return policy.PlaceEntry(side, qty, lifecycleID)
+	if reduceOnly {
+		orderID, orderLinkID, err = policy.PlaceReduce(side, qty, lifecycleID, leg)
+	} else {
+		orderID, orderLinkID, err = policy.PlaceEntry(side, qty, lifecycleID)
+	}
+	t.noteUncertainOrder(orderID, orderLinkID, err)
+	return
 }

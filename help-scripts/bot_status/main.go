@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -78,17 +79,32 @@ func main() {
 	}
 	url = strings.TrimRight(url, "/") + "/status"
 
+	if *timeout <= 0 {
+		fmt.Fprintln(os.Stderr, "timeout must be positive")
+		os.Exit(1)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 	client := &http.Client{Timeout: *timeout}
-	resp, err := client.Get(url)
+	resp, err := client.Do(req)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "status request failed: %v\n", err)
 		os.Exit(1)
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to read response: %v\n", err)
+		os.Exit(1)
+	}
+	if len(body) > 1<<20 {
+		fmt.Fprintln(os.Stderr, "status response too large")
 		os.Exit(1)
 	}
 	if resp.StatusCode != http.StatusOK {

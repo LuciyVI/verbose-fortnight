@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -638,21 +637,10 @@ func fetchClosedPnlPageWithOptions(client *api.RESTClient, symbol string, start,
 		q.Set("cursor", cursor)
 	}
 
-	ts := fmt.Sprintf("%d", time.Now().UnixMilli())
-	sig := client.SignREST(client.Config.APISecret, ts, client.Config.APIKey, client.Config.RecvWindow, q.Encode())
-
-	req, _ := http.NewRequest("GET", client.Config.DemoRESTHost+path+"?"+q.Encode(), nil)
-	req.Header.Set("X-BAPI-API-KEY", client.Config.APIKey)
-	req.Header.Set("X-BAPI-TIMESTAMP", ts)
-	req.Header.Set("X-BAPI-RECV-WINDOW", client.Config.RecvWindow)
-	req.Header.Set("X-BAPI-SIGN-TYPE", "2")
-	req.Header.Set("X-BAPI-SIGN", sig)
-
-	resp, err := http.DefaultClient.Do(req)
+	raw, err := client.DoJSON(client.Context, "GET", path, q.Encode(), nil)
 	if err != nil {
 		return nil, "", err
 	}
-	defer resp.Body.Close()
 
 	var r struct {
 		RetCode int    `json:"retCode"`
@@ -662,7 +650,7 @@ func fetchClosedPnlPageWithOptions(client *api.RESTClient, symbol string, start,
 			NextPageCursor string          `json:"nextPageCursor"`
 		} `json:"result"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+	if err := json.Unmarshal(raw, &r); err != nil {
 		return nil, "", err
 	}
 	if r.RetCode != 0 {
@@ -754,7 +742,7 @@ func main() {
 	logTZ := flag.String("log-tz", "", "IANA timezone for log timestamps (e.g., Europe/Moscow); defaults to local")
 	logOffsetSec := flag.Int("log-time-offset", 0, "apply fixed offset (seconds) to log timestamps before join")
 	debug := flag.Bool("debug", false, "enable verbose log-join diagnostics")
-	httpTimeoutSec := flag.Int("http-timeout", 30, "HTTP timeout in seconds for API calls (0 disables)")
+	httpTimeoutSec := flag.Int("http-timeout", 30, "HTTP timeout in seconds for API calls (0 uses REST_TIMEOUT_MS/default)")
 	flag.Parse()
 
 	debugf := func(format string, args ...any) {
@@ -763,9 +751,6 @@ func main() {
 		}
 	}
 
-	if *httpTimeoutSec > 0 {
-		http.DefaultClient.Timeout = time.Duration(*httpTimeoutSec) * time.Second
-	}
 	if *lastN < 0 {
 		fmt.Fprintln(os.Stderr, "-last must be >= 0")
 		os.Exit(1)
@@ -789,6 +774,13 @@ func main() {
 		cfg.Symbol = *symbolFlag
 	}
 
+	if *httpTimeoutSec < 0 {
+		fmt.Fprintln(os.Stderr, "http-timeout must be nonnegative")
+		os.Exit(1)
+	}
+	if *httpTimeoutSec > 0 {
+		cfg.RESTTimeoutMs = *httpTimeoutSec * 1000
+	}
 	client := api.NewRESTClient(cfg, nil)
 
 	now := time.Now()

@@ -2,6 +2,7 @@ package strategy
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -1272,6 +1273,9 @@ func (t *Trader) handleDirectionalSignal(targetSide string, closePrice float64) 
 
 	targetSide = t.PositionManager.NormalizeSide(targetSide)
 	exists, side, _, _, _ := t.PositionManager.HasOpenPosition()
+	if blocked, _, _ := t.isTradingBlocked(); blocked {
+		return
+	}
 	side = t.PositionManager.NormalizeSide(side)
 	fsm := t.currentFSMState()
 
@@ -1315,7 +1319,9 @@ func (t *Trader) handleDirectionalSignal(targetSide string, closePrice float64) 
 		})
 		if err := t.openPosition(targetSide, closePrice, tradeID); err != nil {
 			t.Logger.Error("Open position failed after accepted signal: %v", err)
-			t.forceFSM(models.PositionStateFlat, "open_failed", tradeID)
+			if !errors.Is(err, order.ErrOrderUncertain) {
+				t.forceFSM(models.PositionStateFlat, "open_failed", tradeID)
+			}
 		}
 	case models.PositionStateOpen:
 		if !exists || side == "" {
@@ -1383,11 +1389,13 @@ func (t *Trader) placeMarketOrderWithLifecycle(side string, qty float64, reduceO
 		orderLinkID = lifecycleOrderLinkID(lifecycleID, leg)
 		if om, ok := t.OrderManager.(orderManagerWithLink); ok {
 			orderID, err = om.PlaceOrderMarketWithLinkID(side, qty, reduceOnly, orderLinkID)
+			t.noteUncertainOrder(orderID, orderLinkID, err)
 			return orderID, orderLinkID, err
 		}
 		t.Logger.Warning("Lifecycle enabled but order manager does not support orderLinkId; fallback to plain order/create")
 	}
 	orderID, err = t.OrderManager.PlaceOrderMarketWithID(side, qty, reduceOnly)
+	t.noteUncertainOrder(orderID, "", err)
 	return orderID, "", err
 }
 
@@ -1457,155 +1465,19 @@ func (t *Trader) logMakerFirstEvent(event string, payload map[string]interface{}
 	t.Logger.Info("%s %s", event, string(raw))
 }
 
-func (t *Trader) makerFirstFillProgress(reduceOnly bool, beforeExists bool, beforeQty, requestedQty float64) (bool, float64) {
-	const eps = 1e-9
-	exists, _, nowQty, _, _ := t.PositionManager.HasOpenPosition()
-	if !reduceOnly {
-		if !beforeExists {
-			if exists && nowQty > eps {
-				return true, 0
-			}
-			return false, requestedQty
-		}
-		if nowQty > beforeQty+eps {
-			return true, 0
-		}
-		return false, requestedQty
-	}
-
-	if !beforeExists {
-		return false, requestedQty
-	}
-	if !exists || nowQty <= eps {
-		return true, 0
-	}
-	closedQty := beforeQty - nowQty
-	if closedQty <= eps {
-		return false, requestedQty
-	}
-	remaining := requestedQty - closedQty
-	if remaining <= eps {
-		return true, 0
-	}
-	return false, remaining
-}
-
-func (t *Trader) placeMakerFirstOrderWithFallback(side string, qty float64, reduceOnly bool, lifecycleID, leg string) (orderID, orderLinkID string, err error) {
-	if t == nil || t.Config == nil {
-		return t.placeMarketOrderWithLifecycle(side, qty, reduceOnly, lifecycleID, leg)
-	}
-	om, ok := t.OrderManager.(orderManagerWithPostOnlyLink)
-	if !ok {
-		t.Logger.Warning("Maker-first enabled but order manager has no post-only support; fallback to market")
-		return t.placeMarketOrderWithLifecycle(side, qty, reduceOnly, lifecycleID, leg)
-	}
-	beforeExists, _, beforeQty, _, _ := t.PositionManager.HasOpenPosition()
-	limitPrice := t.makerFirstLimitPrice(side)
-	if limitPrice <= 0 {
-		t.Logger.Warning("Maker-first skipped due to missing best bid/ask; fallback to market")
-		return t.placeMarketOrderWithLifecycle(side, qty, reduceOnly, lifecycleID, leg)
-	}
-	bestBid := t.PositionManager.GetLastBidPrice()
-	bestAsk := t.PositionManager.GetLastAskPrice()
-	if t.Config.EdgeGuardSpreadThreshold > 0 && bestBid > 0 && bestAsk > bestBid {
-		mid := (bestAsk + bestBid) / 2
-		if mid > 0 {
-			spreadPct := (bestAsk - bestBid) / mid
-			if spreadPct > t.Config.EdgeGuardSpreadThreshold {
-				t.Logger.Warning("maker_first_wide_spread side=%s spread_pct=%.6f threshold=%.6f best_bid=%.2f best_ask=%.2f",
-					side, spreadPct, t.Config.EdgeGuardSpreadThreshold, bestBid, bestAsk)
-			}
-		}
-	}
-	makerLeg := leg + "l"
-	orderLinkID = lifecycleOrderLinkID(lifecycleID, makerLeg)
-	t.logMakerFirstEvent("maker_first_attempt", map[string]interface{}{
-		"side":       side,
-		"qty":        qty,
-		"reduceOnly": reduceOnly,
-		"price":      limitPrice,
-		"timeout_ms": t.makerFirstTimeout().Milliseconds(),
-		"lifecycle":  lifecycleID,
-		"leg":        leg,
-	})
-	orderID, err = om.PlaceOrderLimitPostOnlyWithLinkID(side, qty, limitPrice, reduceOnly, orderLinkID)
-	if err != nil {
-		t.Logger.Warning("Maker-first post-only place failed: side=%s qty=%.6f reduceOnly=%t err=%v; fallback to market",
-			side, qty, reduceOnly, err)
-		return t.placeMarketOrderWithLifecycle(side, qty, reduceOnly, lifecycleID, leg)
-	}
-	timeout := t.makerFirstTimeout()
-	t.Logger.Info("Maker-first order placed: side=%s qty=%.6f price=%.2f reduceOnly=%t orderId=%s timeout=%s",
-		side, qty, limitPrice, reduceOnly, orderID, timeout)
-
-	deadline := time.Now().Add(timeout)
-	remainingQty := qty
-	filled, remaining := t.makerFirstFillProgress(reduceOnly, beforeExists, beforeQty, qty)
-	remainingQty = remaining
-	if filled {
-		return orderID, orderLinkID, nil
-	}
-
-	ticker := time.NewTicker(50 * time.Millisecond)
-	defer ticker.Stop()
-	for time.Now().Before(deadline) {
-		<-ticker.C
-		filled, remaining := t.makerFirstFillProgress(reduceOnly, beforeExists, beforeQty, qty)
-		if filled {
-			return orderID, orderLinkID, nil
-		}
-		remainingQty = remaining
-	}
-
-	t.State.RecordMakerTimeout()
-	t.logMakerFirstEvent("maker_first_timeout", map[string]interface{}{
-		"side":             side,
-		"qty":              qty,
-		"reduceOnly":       reduceOnly,
-		"order_id":         orderID,
-		"partial_fill_qty": math.Max(qty-remainingQty, 0),
-		"remaining_qty":    remainingQty,
-		"timeout_ms":       timeout.Milliseconds(),
-	})
-	t.Logger.Warning("Maker-first timeout: side=%s qty=%.6f reduceOnly=%t orderId=%s remaining=%.6f; fallback market",
-		side, qty, reduceOnly, orderID, remainingQty)
-	if t.PositionManager != nil && t.Config != nil {
-		t.PositionManager.CancelAllOrders(t.Config.Symbol)
-	}
-	if reduceOnly && remainingQty > 0 && remainingQty < qty {
-		qty = remainingQty
-	}
-	marketLeg := leg + "m"
-	fallbackOrderID, fallbackOrderLinkID, fallbackErr := t.placeMarketOrderWithLifecycle(side, qty, reduceOnly, lifecycleID, marketLeg)
-	if fallbackErr == nil {
-		t.State.RecordMakerFallback()
-		slippagePct := t.calcMakerFallbackSlippagePct(side, limitPrice)
-		if t.Config.MakerMaxSlippagePct > 0 && slippagePct > t.Config.MakerMaxSlippagePct {
-			t.Logger.Warning("maker_first_slippage_warn side=%s slippage_pct=%.6f threshold=%.6f order_id=%s",
-				side, slippagePct, t.Config.MakerMaxSlippagePct, fallbackOrderID)
-		}
-		t.logMakerFirstEvent("maker_first_fallback_market", map[string]interface{}{
-			"side":             side,
-			"qty":              qty,
-			"reduceOnly":       reduceOnly,
-			"partial_fill_qty": math.Max(qty-remainingQty, 0),
-			"remaining_qty":    remainingQty,
-			"slippage_pct":     slippagePct,
-			"order_id":         fallbackOrderID,
-		})
-	}
-	return fallbackOrderID, fallbackOrderLinkID, fallbackErr
-}
-
 func (t *Trader) placeTakeProfitOrderWithLifecycle(side string, qty, price float64, lifecycleID string) error {
 	if t.Config != nil && t.Config.EnableLifecycleID && lifecycleID != "" {
 		orderLinkID := lifecycleOrderLinkID(lifecycleID, "tp")
 		if om, ok := t.OrderManager.(orderManagerWithTPSLLink); ok {
-			return om.PlaceTakeProfitOrderWithLink(side, qty, price, orderLinkID)
+			err := om.PlaceTakeProfitOrderWithLink(side, qty, price, orderLinkID)
+			t.noteUncertainOrder("", orderLinkID, err)
+			return err
 		}
 		t.Logger.Warning("Lifecycle enabled but order manager does not support TP orderLinkId; fallback to plain order/create")
 	}
-	return t.OrderManager.PlaceTakeProfitOrder(side, qty, price)
+	err := t.OrderManager.PlaceTakeProfitOrder(side, qty, price)
+	t.noteUncertainOrder("", "", err)
+	return err
 }
 
 // openPosition opens a new position from FLAT->OPENING lifecycle only.
@@ -1631,10 +1503,7 @@ func (t *Trader) openPosition(newSide string, price float64, tradeID string) err
 	t.Logger.Info("Current balance: %.2f USDT", bal)
 
 	step := t.State.Instr.QtyStep
-	if step <= 0 {
-		step = t.State.Instr.MinQty
-	}
-	if step <= 0 {
+	if step <= 0 || math.IsNaN(step) || math.IsInf(step, 0) {
 		t.Logger.Error("Invalid instrument step size: %.8f", step)
 		return fmt.Errorf("invalid instrument step size")
 	}
@@ -1656,6 +1525,9 @@ func (t *Trader) openPosition(newSide string, price float64, tradeID string) err
 		if qty < minRequired {
 			qty = minRequired
 		}
+	}
+	if price <= 0 || math.IsNaN(price) || math.IsInf(price, 0) || qty <= 0 || math.IsNaN(qty) || math.IsInf(qty, 0) {
+		return fmt.Errorf("invalid order size or price")
 	}
 	if bal < price*qty {
 		t.Logger.Error("Insufficient balance: %.2f USDT", bal)
@@ -2360,6 +2232,10 @@ func (t *Trader) calculateTPBasedOn15MinProjection(entryPrice float64, positionS
 
 // adjustTPSL adjusts TP/SL for long positions with 2:1 ratio
 func (t *Trader) adjustTPSL(closePrice float64) {
+	sourceTradeID := t.activeTradeID()
+	if sourceTradeID == "" {
+		return
+	}
 	t.Logger.Info("Adjusting TP/SL for LONG position, current price: %.2f", closePrice)
 
 	exists, side, _, curTP, _ := t.PositionManager.HasOpenPosition()
@@ -2379,7 +2255,7 @@ func (t *Trader) adjustTPSL(closePrice float64) {
 	}
 
 	t.enqueueStopIntent(models.StopIntent{
-		TradeID:        t.activeTradeID(),
+		TradeID:        sourceTradeID,
 		Side:           "LONG",
 		Entry:          entry,
 		TP:             newTP,
@@ -2397,6 +2273,10 @@ func (t *Trader) adjustTPSL(closePrice float64) {
 
 // adjustTPSLForShort adjusts TP/SL for short positions with 2:1 ratio
 func (t *Trader) adjustTPSLForShort(closePrice float64) {
+	sourceTradeID := t.activeTradeID()
+	if sourceTradeID == "" {
+		return
+	}
 	t.Logger.Info("Adjusting TP/SL for SHORT position, current price: %.2f", closePrice)
 
 	exists, side, _, curTP, _ := t.PositionManager.HasOpenPosition()
@@ -2416,7 +2296,7 @@ func (t *Trader) adjustTPSLForShort(closePrice float64) {
 	}
 
 	t.enqueueStopIntent(models.StopIntent{
-		TradeID:        t.activeTradeID(),
+		TradeID:        sourceTradeID,
 		Side:           "SHORT",
 		Entry:          entry,
 		TP:             newTP,
@@ -2732,6 +2612,9 @@ func (t *Trader) HandleExecutionFill(evt models.ExecutionEvent) {
 
 	exists, posSide, posQty, curTP, curSL := t.PositionManager.HasOpenPosition()
 	posSide = t.PositionManager.NormalizeSide(posSide)
+	if blocked, _, _ := t.isTradingBlocked(); blocked {
+		return
+	}
 	t.syncFSMFromPositionSnapshot(exists, posSide, posQty)
 	if exists && t.currentFSMState() == models.PositionStateOpening {
 		t.State.Lock()
@@ -3057,6 +2940,7 @@ func (t *Trader) SyncPositionRealTime() {
 	var lastTPSLAttempt time.Time
 
 	for range ticker.C {
+		sourceTradeID := t.activeTradeID()
 		exists, side, qty, tp, sl := t.PositionManager.HasOpenPosition()
 		side = t.PositionManager.NormalizeSide(side)
 
@@ -3076,12 +2960,14 @@ func (t *Trader) SyncPositionRealTime() {
 				t.setActiveTradeID(nextTradeID)
 				if err := t.openPosition(nextSide, nextPrice, nextTradeID); err != nil {
 					t.Logger.Error("Pending reverse open failed: %v", err)
-					t.forceFSM(models.PositionStateFlat, "pending_reverse_open_failed", nextTradeID)
+					if !errors.Is(err, order.ErrOrderUncertain) {
+						t.forceFSM(models.PositionStateFlat, "pending_reverse_open_failed", nextTradeID)
+					}
 				}
 			}
 			continue
 		}
-		if side == "" {
+		if side == "" || sourceTradeID == "" {
 			continue
 		}
 
@@ -3123,7 +3009,7 @@ func (t *Trader) SyncPositionRealTime() {
 				BreakevenProgress: t.Config.BreakevenProgress,
 			})
 			t.enqueueStopIntent(models.StopIntent{
-				TradeID:        t.activeTradeID(),
+				TradeID:        sourceTradeID,
 				Side:           side,
 				Entry:          entry,
 				TP:             tpNew,
@@ -3149,7 +3035,7 @@ func (t *Trader) SyncPositionRealTime() {
 		if policySL > 0 && math.Abs(sl-policySL) >= tick/2 {
 			t.Logger.Info("SL policy sync: resetting SL for %s from %.2f to %.2f (policy=%s)", side, sl, policySL, calcDetails.slPolicy)
 			t.enqueueStopIntent(models.StopIntent{
-				TradeID:        t.activeTradeID(),
+				TradeID:        sourceTradeID,
 				Side:           side,
 				Entry:          entry,
 				TP:             tp,
@@ -3211,7 +3097,7 @@ func (t *Trader) SyncPositionRealTime() {
 					if remainingQty > 0 {
 						tpNew, slNew, calcDetails := t.calculateInitialTPSLWithDetails(entry, side)
 						t.enqueueStopIntent(models.StopIntent{
-							TradeID:        t.activeTradeID(),
+							TradeID:        sourceTradeID,
 							Side:           side,
 							Entry:          entry,
 							TP:             tpNew,
